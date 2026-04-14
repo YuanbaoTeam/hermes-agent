@@ -1493,6 +1493,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not self._resolve_command_auth(source):
                 return "仅 Bot Owner 可以执行 /upgrade 命令"
             return await self._cmd_upgrade(args)
+        elif cmd == "/issue-log":
+            if not self._resolve_command_auth(source):
+                return "仅 Bot Owner 可以执行 /issue-log 命令"
+            return await self._cmd_issue_log(args)
         else:
             return None  # 未知命令，交给 AI 处理
 
@@ -1560,7 +1564,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             "/status - 查看 Bot 状态\n"
             "/help - 显示帮助\n"
             "/ping - 连通性测试\n"
-            "/upgrade [version] - 升级 Bot（仅 Owner）"
+            "/upgrade [version] - 升级 Bot（仅 Owner）\n"
+            "/issue-log - 导出诊断日志（仅 Owner）"
         )
 
     async def _cmd_upgrade(self, args: str) -> str:
@@ -1572,6 +1577,37 @@ class YuanbaoAdapter(BasePlatformAdapter):
         logger.info("[%s] /upgrade requested: version=%s", self.name, version)
         # TODO: Implement actual upgrade trigger via hermes CLI
         return f"升级请求已收到，目标版本: {version}\n请通过服务器终端执行: hermes update {version}"
+
+    async def _cmd_issue_log(self, args: str) -> str:
+        """
+        执行 /issue-log 命令（Owner 限制）。
+
+        收集最近日志信息，方便诊断问题。
+        """
+        import io
+        lines = []
+        lines.append("=== Issue Log ===")
+        lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Connection status
+        status = self.get_status()
+        lines.append(f"Connected: {status.get('connected')}")
+        lines.append(f"Bot ID: {status.get('bot_id', 'N/A')}")
+        lines.append(f"Connect ID: {status.get('connect_id', 'N/A')}")
+        lines.append(f"Reconnect Attempts: {status.get('reconnect_attempts', 0)}")
+
+        # Heartbeat state
+        lines.append(f"Active Reply Heartbeats: {len(self._reply_heartbeat_tasks)}")
+        lines.append(f"Consecutive HB Timeouts: {self._consecutive_hb_timeouts}")
+
+        # Queue state
+        lines.append(f"Outbound Queues: {len(self._outbound_queues)}")
+        lines.append(f"Pending ACKs: {len(self._pending_acks)}")
+
+        # Group history
+        lines.append(f"Group History Chats: {len(self._group_history)}")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # DM 主动私聊 + 访问控制
