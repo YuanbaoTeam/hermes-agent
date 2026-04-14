@@ -475,6 +475,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
             source=source,
             token=token,
             msg_id=msg_id,
+            app_version="hermes-agent/0.8.0",
+            operation_system="linux",
+            bot_version="hermes-agent",
             route_env=route_env,
         )
         await self._ws.send(auth_bytes)
