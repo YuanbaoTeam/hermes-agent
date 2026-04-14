@@ -1574,6 +1574,64 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return f"升级请求已收到，目标版本: {version}\n请通过服务器终端执行: hermes update {version}"
 
     # ------------------------------------------------------------------
+    # DM 主动私聊 + 访问控制
+    # ------------------------------------------------------------------
+
+    DM_MAX_CHARS = 10000  # DM 文本上限
+
+    async def send_dm(self, user_id: str, text: str) -> SendResult:
+        """
+        主动发起 C2C 私聊消息。
+
+        Args:
+            user_id: 目标用户 ID
+            text: 消息文本（上限 10000 字符）
+
+        Returns:
+            SendResult
+        """
+        if not self._resolve_dm_access(user_id):
+            return SendResult(success=False, error="DM access denied for this user")
+        if len(text) > self.DM_MAX_CHARS:
+            text = text[:self.DM_MAX_CHARS] + "\n...(已截断)"
+        chat_id = f"direct:{user_id}"
+        return await self.send(chat_id, text)
+
+    def _resolve_dm_access(self, user_id: str) -> bool:
+        """
+        DM 访问控制。
+
+        策略（从配置/环境变量读取）：
+        - 'open': 允许所有用户
+        - 'allowlist': 仅白名单用户
+        - 'disabled': 禁止所有 DM
+
+        配置项：
+        - yuanbao_dm_policy / YUANBAO_DM_POLICY（默认 'open'）
+        - yuanbao_dm_allow_from / YUANBAO_DM_ALLOW_FROM（逗号分隔的用户 ID 列表）
+        """
+        policy = (
+            getattr(self._config, 'yuanbao_dm_policy', None)
+            or os.getenv("YUANBAO_DM_POLICY", "open")
+        ).strip().lower()
+
+        if policy == "disabled":
+            return False
+        if policy == "open":
+            return True
+        if policy == "allowlist":
+            allow_from_str = (
+                getattr(self._config, 'yuanbao_dm_allow_from', None)
+                or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
+            )
+            if isinstance(allow_from_str, list):
+                allow_list = allow_from_str
+            else:
+                allow_list = [x.strip() for x in str(allow_from_str).split(",") if x.strip()]
+            return user_id in allow_list
+        return True  # 未知策略默认放行
+
+    # ------------------------------------------------------------------
     # Agent 工具方法（可注册为 AI toolset）
     # ------------------------------------------------------------------
 
