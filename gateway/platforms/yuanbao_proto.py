@@ -98,6 +98,10 @@ BIZ_SERVICES = {
 # openclaw instance_id（固定值 16）
 OPENCLAW_INSTANCE_ID = 16
 
+# Reply Heartbeat 状态常量
+WS_HEARTBEAT_RUNNING = 1
+WS_HEARTBEAT_FINISH = 2
+
 # ============================================================
 # 序列号生成
 # ============================================================
@@ -1062,5 +1066,211 @@ def decode_directed_push(data: bytes) -> Optional[dict]:
         if not push_type and not content:
             return None
         return {"type": push_type, "content": content}
+    except Exception:
+        return None
+
+
+# ============================================================
+# Heartbeat 编码
+# ============================================================
+
+def encode_send_private_heartbeat(
+    from_account: str,
+    to_account: str,
+    heartbeat: int = WS_HEARTBEAT_RUNNING,
+) -> bytes:
+    """
+    编码 SendPrivateHeartbeatReq，返回完整 ConnMsg bytes。
+
+    SendPrivateHeartbeatReq fields:
+      1: from_account (string)
+      2: to_account   (string)
+      3: heartbeat    (varint: RUNNING=1, FINISH=2)
+    """
+    buf = (
+        _encode_field(1, WT_LEN, _encode_string(from_account))
+        + _encode_field(2, WT_LEN, _encode_string(to_account))
+        + _encode_field(3, WT_VARINT, _encode_varint(heartbeat))
+    )
+    req_id = f"hb_priv_{next_seq_no()}"
+    return encode_biz_msg(
+        service=_BIZ_PKG,
+        method="send_private_heartbeat",
+        req_id=req_id,
+        body=buf,
+    )
+
+
+def encode_send_group_heartbeat(
+    from_account: str,
+    group_code: str,
+    heartbeat: int = WS_HEARTBEAT_RUNNING,
+    send_time: int = 0,
+) -> bytes:
+    """
+    编码 SendGroupHeartbeatReq，返回完整 ConnMsg bytes。
+
+    SendGroupHeartbeatReq fields:
+      1: from_account (string)
+      2: to_account   (string)  — 群场景留空
+      3: group_code   (string)
+      4: send_time    (int64, ms timestamp)
+      5: heartbeat    (varint: RUNNING=1, FINISH=2)
+    """
+    import time as _time
+    ts = send_time or int(_time.time() * 1000)
+    buf = (
+        _encode_field(1, WT_LEN, _encode_string(from_account))
+        + _encode_field(2, WT_LEN, _encode_string(""))  # to_account empty for group
+        + _encode_field(3, WT_LEN, _encode_string(group_code))
+        + _encode_field(4, WT_VARINT, _encode_varint(ts))
+        + _encode_field(5, WT_VARINT, _encode_varint(heartbeat))
+    )
+    req_id = f"hb_grp_{next_seq_no()}"
+    return encode_biz_msg(
+        service=_BIZ_PKG,
+        method="send_group_heartbeat",
+        req_id=req_id,
+        body=buf,
+    )
+
+
+# ============================================================
+# 群信息查询
+# ============================================================
+
+def encode_query_group_info(group_code: str) -> bytes:
+    """
+    编码 QueryGroupInfoReq，返回完整 ConnMsg bytes。
+
+    QueryGroupInfoReq fields:
+      1: group_code (string)
+    """
+    buf = _encode_field(1, WT_LEN, _encode_string(group_code))
+    req_id = f"qgi_{next_seq_no()}"
+    return encode_biz_msg(
+        service=_BIZ_PKG,
+        method="query_group_info",
+        req_id=req_id,
+        body=buf,
+    )
+
+
+def decode_query_group_info_rsp(data: bytes) -> Optional[dict]:
+    """
+    解码 QueryGroupInfoRsp biz payload。
+
+    QueryGroupInfoRsp fields:
+      1: code         (int32)
+      2: message      (string)
+      3: group_code   (string)
+      4: group_name   (string)
+      5: owner_id     (string)
+      6: member_count (uint32)
+      7: max_member   (uint32)
+      8: create_time  (uint32)
+
+    Returns:
+        解码后的 dict，或 None（解析失败）
+    """
+    try:
+        fdict = _fields_to_dict(_parse_fields(data))
+        code = _get_varint(fdict, 1, 0)
+        result = {
+            "code": code,
+            "message": _get_string(fdict, 2),
+            "group_code": _get_string(fdict, 3),
+            "group_name": _get_string(fdict, 4),
+            "owner_id": _get_string(fdict, 5),
+            "member_count": _get_varint(fdict, 6),
+            "max_member": _get_varint(fdict, 7),
+            "create_time": _get_varint(fdict, 8),
+        }
+        return {k: v for k, v in result.items() if v or k in ("code", "member_count")}
+    except Exception:
+        return None
+
+
+# ============================================================
+# 群成员列表查询
+# ============================================================
+
+def encode_get_group_member_list(
+    group_code: str,
+    offset: int = 0,
+    limit: int = 200,
+) -> bytes:
+    """
+    编码 GetGroupMemberListReq，返回完整 ConnMsg bytes。
+
+    GetGroupMemberListReq fields:
+      1: group_code (string)
+      2: offset     (uint32)
+      3: limit      (uint32)
+    """
+    buf = _encode_field(1, WT_LEN, _encode_string(group_code))
+    if offset:
+        buf += _encode_field(2, WT_VARINT, _encode_varint(offset))
+    buf += _encode_field(3, WT_VARINT, _encode_varint(limit))
+    req_id = f"gml_{next_seq_no()}"
+    return encode_biz_msg(
+        service=_BIZ_PKG,
+        method="get_group_member_list",
+        req_id=req_id,
+        body=buf,
+    )
+
+
+def decode_get_group_member_list_rsp(data: bytes) -> Optional[dict]:
+    """
+    解码 GetGroupMemberListRsp biz payload。
+
+    GetGroupMemberListRsp fields:
+      1: code         (int32)
+      2: message      (string)
+      3: members      (repeated message MemberInfo)
+      4: next_offset  (uint32)
+      5: is_complete  (bool/varint)
+
+    MemberInfo fields:
+      1: user_id      (string)
+      2: nickname     (string)
+      3: role         (uint32)  — 0=member, 1=admin, 2=owner
+      4: join_time    (uint32)
+      5: name_card    (string)  — 群昵称
+
+    Returns:
+        {
+          "code": int,
+          "message": str,
+          "members": [{"user_id": str, "nickname": str, "role": int, ...}, ...],
+          "next_offset": int,
+          "is_complete": bool,
+        }
+        或 None（解析失败）
+    """
+    try:
+        fdict = _fields_to_dict(_parse_fields(data))
+        code = _get_varint(fdict, 1, 0)
+
+        members = []
+        for member_bytes in _get_repeated_bytes(fdict, 3):
+            mdict = _fields_to_dict(_parse_fields(member_bytes))
+            member = {
+                "user_id": _get_string(mdict, 1),
+                "nickname": _get_string(mdict, 2),
+                "role": _get_varint(mdict, 3),
+                "join_time": _get_varint(mdict, 4),
+                "name_card": _get_string(mdict, 5),
+            }
+            members.append({k: v for k, v in member.items() if v or k == "role"})
+
+        return {
+            "code": code,
+            "message": _get_string(fdict, 2),
+            "members": members,
+            "next_offset": _get_varint(fdict, 4),
+            "is_complete": bool(_get_varint(fdict, 5)),
+        }
     except Exception:
         return None
