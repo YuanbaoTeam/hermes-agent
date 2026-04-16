@@ -238,7 +238,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
-    MAX_TEXT_CHUNK: int = 5000  # 元宝单条消息字符上限
+    MAX_TEXT_CHUNK: int = 4000  # 元宝单条消息字符上限 (临时调小验证分块)
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
@@ -527,7 +527,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         chunks: List[str] = []
         current_parts: List[str] = []
-        current_len = 0
+        current_len = 0  # tracks actual merged length including separators
 
         def _flush() -> None:
             if current_parts:
@@ -546,6 +546,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 _flush()
                 current_parts = []
                 current_len = 0
+                sep_len = 0
 
             if not current_parts and atom_len > max_length:
                 if _is_table_atom(atom):
@@ -555,9 +556,21 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 continue
 
             current_parts.append(atom)
-            current_len += atom_len
+            current_len += sep_len + atom_len
 
         _flush()
+
+        # Merge small trailing/leading chunks with their neighbours
+        if len(chunks) > 1:
+            merged_chunks: List[str] = [chunks[0]]
+            for chunk in chunks[1:]:
+                prev = merged_chunks[-1]
+                combined = prev + '\n\n' + chunk
+                if _len(combined) <= max_length:
+                    merged_chunks[-1] = combined
+                else:
+                    merged_chunks.append(chunk)
+            chunks = merged_chunks
 
         return chunks if chunks else [content]
 
@@ -587,6 +600,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         lock = self._get_chat_lock(chat_id)
         async with lock:
             chunks = self.truncate_message(content, self.MAX_TEXT_CHUNK)
+            logger.info(
+                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
+                self.name, len(content), self.MAX_TEXT_CHUNK,
+                len(chunks), [len(c) for c in chunks],
+            )
             for i, chunk in enumerate(chunks):
                 r_to = reply_to if i == 0 else None
                 result = await self._send_text_chunk(chat_id, chunk, r_to)
@@ -2760,7 +2778,7 @@ def _split_into_atoms(text: str) -> list[str]:
     return atoms
 
 
-def chunk_markdown_text(text: str, max_chars: int = 3000) -> list[str]:
+def chunk_markdown_text(text: str, max_chars: int = 4000) -> list[str]:
     """
     将 Markdown 文本按 max_chars 切割为多个片段。
 
@@ -2772,7 +2790,7 @@ def chunk_markdown_text(text: str, max_chars: int = 3000) -> list[str]:
 
     Args:
         text: 待切割的 Markdown 文本
-        max_chars: 每片段最大字符数，默认 3000
+        max_chars: 每片段最大字符数，默认 4000
 
     Returns:
         切割后的文本片段列表（非空）
