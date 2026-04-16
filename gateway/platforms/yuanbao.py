@@ -18,6 +18,7 @@ Configuration in config.yaml (or via env vars):
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import hmac
 import json
@@ -192,15 +193,19 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._ws = None                          # websockets connection
         self._connect_id: Optional[str] = None  # received from BIND_ACK
         self._pending_acks: Dict[str, asyncio.Future] = {}  # req_id (str) -> Future
-        self._chat_locks: Dict[str, asyncio.Lock] = {}  # per-chat-id 锁（懒初始化，上限 _CHAT_DICT_MAX_SIZE）
+        self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
         self._send_lock: asyncio.Lock = asyncio.Lock()  # guards concurrent WS sends
 
         # Background tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._recv_task: Optional[asyncio.Task] = None
 
+        # Inbound dispatch tasks — tracked so disconnect() can cancel them
+        self._inbound_tasks: set[asyncio.Task] = set()
+
         # Reconnection state
         self._reconnect_attempts: int = 0
+        self._reconnecting: bool = False         # guards against concurrent reconnects
         self._consecutive_hb_timeouts: int = 0  # heartbeat timeout counter
         self._pending_pong: Optional[asyncio.Future] = None  # current in-flight ping future
 
@@ -296,6 +301,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Acquire platform-scoped lock to prevent duplicate connections
+        if not self._acquire_platform_lock(
+            'yuanbao-app-key', self._app_key, 'Yuanbao app key'
+        ):
+            return False
+
         try:
             # Step 1: Get sign token
             logger.info("[%s] Fetching sign token from %s", self.name, self._sign_token_url)
@@ -349,10 +360,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             logger.error("[%s] Connection timed out", self.name)
             await self._cleanup_ws()
+            self._release_platform_lock()
             return False
         except Exception as exc:
             logger.error("[%s] connect() failed: %s", self.name, exc, exc_info=True)
             await self._cleanup_ws()
+            self._release_platform_lock()
             return False
 
     async def disconnect(self) -> None:
@@ -363,6 +376,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         self._running = False
         self._mark_disconnected()
+        self._release_platform_lock()
 
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -399,16 +413,33 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 task.cancel()
         self._slow_response_tasks.clear()
 
+        # Cancel all in-flight inbound dispatch tasks
+        for task in list(self._inbound_tasks):
+            if not task.done():
+                task.cancel()
+        self._inbound_tasks.clear()
+
         await self._cleanup_ws()
         logger.info("[%s] Disconnected", self.name)
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """获取或创建指定 chat_id 的锁（懒初始化，上限 _CHAT_DICT_MAX_SIZE）。"""
-        if chat_id not in self._chat_locks:
-            if len(self._chat_locks) >= _CHAT_DICT_MAX_SIZE:
-                # Evict the oldest entry (insertion-order guaranteed in Python 3.7+)
+        """Return (or create) a per-chat-id lock with safe LRU eviction."""
+        if chat_id in self._chat_locks:
+            # Move to end (most-recently-used) so LRU eviction targets idle keys
+            self._chat_locks.move_to_end(chat_id)
+            return self._chat_locks[chat_id]
+        if len(self._chat_locks) >= _CHAT_DICT_MAX_SIZE:
+            # Evict the oldest *unlocked* entry to avoid breaking in-flight sends
+            evicted = False
+            for key in list(self._chat_locks):
+                if not self._chat_locks[key].locked():
+                    self._chat_locks.pop(key)
+                    evicted = True
+                    break
+            if not evicted:
+                # All locks are held — pop the oldest anyway as a last resort
                 self._chat_locks.pop(next(iter(self._chat_locks)))
-            self._chat_locks[chat_id] = asyncio.Lock()
+        self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
 
     def _should_attach_reply_ref(self, inbound_msg_id: str) -> bool:
@@ -659,7 +690,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     @staticmethod
     def truncate_message(
         content: str,
-        max_length: int = 5000,
+        max_length: int = 4000,
         len_fn: Optional[Callable[[str], int]] = None,
     ) -> List[str]:
         """
@@ -1116,8 +1147,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                         )
                         if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
                             logger.warning("[%s] Heartbeat threshold exceeded, triggering reconnect", self.name)
-                            if self._running:
-                                asyncio.create_task(self._reconnect_with_backoff())
+                            self._schedule_reconnect()
                             return
                     finally:
                         self._pending_acks.pop(msg_id, None)
@@ -1159,13 +1189,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     self.name, close_code,
                 )
                 self._mark_disconnected()
-            elif self._running:
-                asyncio.create_task(self._reconnect_with_backoff())
+            else:
+                self._schedule_reconnect()
         except Exception as exc:
             logger.warning("[%s] receive_loop exited: %s", self.name, exc)
-            if self._running:
-                logger.info("[%s] Attempting reconnect after receive_loop error", self.name)
-                asyncio.create_task(self._reconnect_with_backoff())
+            self._schedule_reconnect()
 
     async def _handle_frame(self, raw: bytes) -> None:
         """处理单个 WebSocket 帧。"""
@@ -1803,7 +1831,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             )
             await self.handle_message(event)
 
-        asyncio.create_task(_dispatch_inbound_event())
+        task = asyncio.create_task(
+            _dispatch_inbound_event(),
+            name=f"yuanbao-inbound-{msg_id_field or 'unknown'}",
+        )
+        self._inbound_tasks.add(task)
+        task.add_done_callback(self._inbound_tasks.discard)
 
     def _extract_text(self, msg_body: list) -> str:
         """
@@ -2580,6 +2613,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
             route_env=self._route_env,
         )
 
+    def _schedule_reconnect(self) -> None:
+        """Schedule a reconnect only if running and not already reconnecting."""
+        if self._running and not self._reconnecting:
+            asyncio.create_task(self._reconnect_with_backoff())
+
     async def _reconnect_with_backoff(self) -> bool:
         """
         Reconnect with exponential backoff.
@@ -2588,6 +2626,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
         On each attempt, force-refreshes the sign token (old token may be expired).
         Returns True on successful reconnect, False after max attempts.
         """
+        if self._reconnecting:
+            logger.debug("[%s] Reconnect already in progress, skipping", self.name)
+            return False
+        self._reconnecting = True
+        try:
+            return await self._do_reconnect()
+        finally:
+            self._reconnecting = False
+
+    async def _do_reconnect(self) -> bool:
+        """Internal reconnect loop, called under the _reconnecting guard."""
         for attempt in range(MAX_RECONNECT_ATTEMPTS):
             self._reconnect_attempts = attempt + 1
             wait = min(2 ** attempt, 60)
