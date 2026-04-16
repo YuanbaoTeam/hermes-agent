@@ -284,6 +284,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
             config.yuanbao_sign_token_url
             or os.getenv("YUANBAO_SIGN_TOKEN_URL", DEFAULT_SIGN_TOKEN_URL)
         ).strip()
+        self._route_env: str = (
+            config.yuanbao_route_env
+            or os.getenv("YUANBAO_ROUTE_ENV", "")
+        ).strip()
 
         # Runtime state
         self._ws = None                          # websockets connection
@@ -376,7 +380,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Step 1: Get sign token
             logger.info("[%s] Fetching sign token from %s", self.name, self._sign_token_url)
             token_data = await get_sign_token(
-                self._app_key, self._app_secret, self._sign_token_url
+                self._app_key, self._app_secret, self._sign_token_url,
+                route_env=self._route_env,
             )
 
             # Update bot_id if returned by sign-token API
@@ -858,7 +863,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         token = token_data.get("token", "")
         uid = self._bot_id or token_data.get("bot_id", "")
         source = token_data.get("source") or "bot"  # use API-returned source; default to 'bot' (not 'web') to receive inbound pushes
-        route_env = token_data.get("route_env", "") or ""
+        route_env = self._route_env or token_data.get("route_env", "") or ""
 
         msg_id = str(uuid.uuid4())
 
@@ -2001,6 +2006,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2098,6 +2104,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2196,6 +2203,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2349,6 +2357,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2437,7 +2446,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         获取当前有效的签票 token（走模块级缓存）。
         """
         return await get_sign_token(
-            self._app_key, self._app_secret, self._sign_token_url
+            self._app_key, self._app_secret, self._sign_token_url,
+            route_env=self._route_env,
         )
 
     async def _reconnect_with_backoff(self) -> bool:
@@ -2463,7 +2473,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             try:
                 # Force-refresh token to avoid using a stale one
                 token_data = await force_refresh_sign_token(
-                    self._app_key, self._app_secret, self._sign_token_url
+                    self._app_key, self._app_secret, self._sign_token_url,
+                    route_env=self._route_env,
                 )
                 if token_data.get("bot_id"):
                     self._bot_id = str(token_data["bot_id"])
@@ -3106,6 +3117,7 @@ async def _do_fetch_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     发起签票 HTTP 请求，支持自动重试（最多 SIGN_MAX_RETRIES 次）。
@@ -3130,6 +3142,8 @@ async def _do_fetch_sign_token(
                 "X-Instance-Id": "16",
                 "X-Bot-Version": "hermes-agent",
             }
+            if route_env:
+                headers["X-Route-Env"] = route_env
 
             logger.info(
                 "签票请求: url=%s%s",
@@ -3177,6 +3191,7 @@ async def get_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     获取 WS 鉴权 token（带缓存）。
@@ -3194,7 +3209,7 @@ async def get_sign_token(
         if cached and _is_cache_valid(cached):
             return dict(cached)
 
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
@@ -3215,6 +3230,7 @@ async def force_refresh_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     强制刷新 token（清除缓存后重新签票）。
@@ -3222,7 +3238,7 @@ async def force_refresh_sign_token(
     logger.warning("[force-refresh] 清除缓存并重新签票: app_key=****%s", app_key[-4:])
     async with _get_refresh_lock(app_key):
         _token_cache.pop(app_key, None)
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
