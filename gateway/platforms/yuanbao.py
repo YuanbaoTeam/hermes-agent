@@ -29,7 +29,8 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -1555,14 +1556,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             user_name=sender_nickname or None,
         )
 
-        # ---- Command handling ----
-        # Check synchronously if text looks like a command, then dispatch async
-        rewritten = self._rewrite_slash_command(text)
-        if rewritten.startswith('/'):
-            asyncio.create_task(
-                self._dispatch_command(rewritten, chat_id, source, msg_id_field)
-            )
-            return
+        # Normalize full-width slash (Chinese input) before forwarding
+        text = self._rewrite_slash_command(text)
 
         event = MessageEvent(
             text=text,
@@ -1616,174 +1611,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         return " ".join(parts) if parts else ""
 
-    # ------------------------------------------------------------------
-    # 命令框架
-    # ------------------------------------------------------------------
-
-    # 群聊中允许执行的公开命令（不需要 Owner 身份）
-    GROUP_PUBLIC_COMMANDS = frozenset({"/status", "/help", "/ping"})
-
-    async def _dispatch_command(
-        self, text: str, chat_id: str, source: Any, reply_to_msg_id: str
-    ) -> None:
-        """Dispatch command and send reply. Called as a task from _push_to_inbound."""
-        try:
-            reply = await self._handle_command(text, chat_id, source)
-            if reply is not None:
-                await self.send(chat_id, reply, reply_to=reply_to_msg_id or None)
-        except Exception as exc:
-            logger.error("[%s] _dispatch_command failed: %s", self.name, exc)
-
-    async def _handle_command(self, text: str, chat_id: str, source: Any) -> Optional[str]:
-        """
-        命令路由入口。如果 text 是斜杠命令则处理并返回回复文本，否则返回 None。
-
-        Args:
-            text: 用户输入文本
-            chat_id: 聊天 ID
-            source: SessionSource
-
-        Returns:
-            命令回复文本（str），或 None（非命令）
-        """
-        text = self._rewrite_slash_command(text)
-        if not text.startswith('/'):
-            return None
-
-        parts = text.strip().split(None, 1)
-        cmd = parts[0].lower()
-        args = parts[1] if len(parts) > 1 else ""
-
-        # 群聊中非公开命令 → 引导私聊
-        chat_type = "group" if chat_id.startswith("group:") else "dm"
-        if chat_type == "group" and cmd not in self.GROUP_PUBLIC_COMMANDS:
-            return f"该命令请私聊我执行: {cmd}"
-
-        if cmd == "/status":
-            return self._cmd_status()
-        elif cmd == "/help":
-            return self._cmd_help()
-        elif cmd == "/ping":
-            return "pong"
-        elif cmd == "/upgrade":
-            if not self._resolve_command_auth(source):
-                return "仅 Bot Owner 可以执行 /upgrade 命令"
-            return await self._cmd_upgrade(args)
-        elif cmd == "/issue-log":
-            if not self._resolve_command_auth(source):
-                return "仅 Bot Owner 可以执行 /issue-log 命令"
-            return await self._cmd_issue_log(args)
-        else:
-            return None  # 未知命令，交给 AI 处理
-
-    def _resolve_command_auth(self, source: Any) -> bool:
-        """
-        检查是否为 Bot Owner（命令鉴权）。
-
-        支持配置 bot_owner_id 或 allow_from 列表。
-        """
-        user_id = getattr(source, 'user_id', None) or ""
-        if not user_id:
-            return False
-
-        # Check bot_owner_id from config
-        owner_id = getattr(self._config, 'yuanbao_bot_owner_id', None) or os.getenv("YUANBAO_BOT_OWNER_ID", "")
-        if owner_id and user_id == owner_id.strip():
-            return True
-
-        # Check allow_from list
-        allow_from = getattr(self._config, 'allow_from', None) or []
-        if user_id in allow_from:
-            return True
-
-        return False
-
     @staticmethod
     def _rewrite_slash_command(text: str) -> str:
         """
-        斜杠命令预处理：标准化命令格式。
-
-        - 去除前后空白
-        - 中文全角斜杠 → 半角
+        Normalize input text: strip whitespace and convert full-width slash (Chinese
+        input method) to ASCII slash so commands are recognized correctly.
         """
         text = text.strip()
         if text.startswith('\uff0f'):  # 全角斜杠
             text = '/' + text[1:]
         return text
-
-    def _cmd_status(self) -> str:
-        """执行 /status 命令，返回 bot 状态信息。"""
-        try:
-            from hermes_cli import __version__ as hermes_version
-        except ImportError:
-            hermes_version = "unknown"
-
-        status = self.get_status()
-        connected = "已连接" if status.get("connected") else "未连接"
-        bot_id = status.get("bot_id", "N/A")
-        connect_id = status.get("connect_id", "N/A")
-        reconnects = status.get("reconnect_attempts", 0)
-
-        return (
-            f"hermes-agent({hermes_version})\n"
-            f"状态: {connected}\n"
-            f"Bot ID: {bot_id}\n"
-            f"Connect ID: {connect_id}\n"
-            f"重连次数: {reconnects}"
-        )
-
-    @staticmethod
-    def _cmd_help() -> str:
-        """执行 /help 命令。"""
-        return (
-            "可用命令:\n"
-            "/status - 查看 Bot 状态\n"
-            "/help - 显示帮助\n"
-            "/ping - 连通性测试\n"
-            "/upgrade [version] - 升级 Bot（仅 Owner）\n"
-            "/issue-log - 导出诊断日志（仅 Owner）"
-        )
-
-    async def _cmd_upgrade(self, args: str) -> str:
-        """
-        执行 /upgrade 命令（Owner 限制）。
-        触发 hermes-agent 自身升级流程。
-        """
-        version = args.strip() if args else "latest"
-        logger.info("[%s] /upgrade requested: version=%s", self.name, version)
-        # TODO: Implement actual upgrade trigger via hermes CLI
-        return f"升级请求已收到，目标版本: {version}\n请通过服务器终端执行: hermes update {version}"
-
-    async def _cmd_issue_log(self, args: str) -> str:
-        """
-        执行 /issue-log 命令（Owner 限制）。
-
-        收集最近日志信息，方便诊断问题。
-        """
-        import io
-        lines = []
-        lines.append("=== Issue Log ===")
-        lines.append(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-        # Connection status
-        status = self.get_status()
-        lines.append(f"Connected: {status.get('connected')}")
-        lines.append(f"Bot ID: {status.get('bot_id', 'N/A')}")
-        lines.append(f"Connect ID: {status.get('connect_id', 'N/A')}")
-        lines.append(f"Reconnect Attempts: {status.get('reconnect_attempts', 0)}")
-
-        # Heartbeat state
-        lines.append(f"Active Reply Heartbeats: {len(self._reply_heartbeat_tasks)}")
-        lines.append(f"Consecutive HB Timeouts: {self._consecutive_hb_timeouts}")
-
-        # Queue state
-        lines.append(f"Outbound Queues: {len(self._outbound_queues)}")
-        lines.append(f"Pending ACKs: {len(self._pending_acks)}")
-
-        # Group history
-        lines.append(f"Group History Chats: {len(self._group_history)}")
-
-        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # DM 主动私聊 + 访问控制
@@ -2116,6 +1953,101 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         except Exception as exc:
             logger.error("[%s] send_image() failed: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """
+        发送本地图片文件。
+
+        与 send_image() 类似，但接收本地路径而非 URL，直接读取文件字节，
+        跳过 HTTP 下载步骤，直接走 COS 上传 → TIMImageElem 流程。
+        参考 send_document() 的本地文件读取逻辑。
+        """
+        if self._ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        try:
+            # 0. Drain text buffer before sending media
+            await self._drain_text_before_media(chat_id)
+
+            # 1. 读取本地文件
+            if not os.path.isfile(image_path):
+                return SendResult(success=False, error=f"File not found: {image_path}")
+
+            logger.info("[%s] send_image_file: reading local file %s", self.name, image_path)
+            with open(image_path, "rb") as f:
+                file_bytes = f.read()
+
+            if not file_bytes:
+                return SendResult(success=False, error=f"File is empty: {image_path}")
+
+            filename = os.path.basename(image_path) or "image.jpg"
+            content_type = guess_mime_type(filename) or "image/jpeg"
+            file_uuid = md5_hex(file_bytes)
+
+            # 2. 获取 COS 上传凭证
+            token_data = await self._get_cached_token()
+            token: str = token_data.get("token", "")
+            bot_id: str = token_data.get("bot_id", "") or self._bot_id or ""
+
+            credentials = await get_cos_credentials(
+                app_key=self._app_key,
+                sign_token_url=self._sign_token_url,
+                token=token,
+                filename=filename,
+                bot_id=bot_id,
+            )
+
+            # 3. 上传到 COS
+            upload_result = await upload_to_cos(
+                file_bytes=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                credentials=credentials,
+                bucket=credentials["bucketName"],
+                region=credentials["region"],
+            )
+
+            # 4. 构造 TIMImageElem 消息体
+            msg_body = build_image_msg_body(
+                url=upload_result["url"],
+                uuid=file_uuid,
+                filename=filename,
+                size=upload_result["size"],
+                width=upload_result.get("width", 0),
+                height=upload_result.get("height", 0),
+                mime_type=content_type,
+            )
+
+            # 5. 若有 caption，追加文字消息体
+            if caption:
+                msg_body.append(
+                    {"msg_type": "TIMTextElem", "msg_content": {"text": caption}}
+                )
+
+            # 6. 发送
+            async with self._send_lock:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    result = await self._send_group_msg_body(group_code, msg_body, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    result = await self._send_c2c_msg_body(to_account, msg_body)
+
+            if result.get("success"):
+                return SendResult(success=True, message_id=result.get("msg_key"))
+            return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+        except Exception as exc:
+            logger.error("[%s] send_image_file() failed: %s", self.name, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def send_file(
@@ -3205,3 +3137,53 @@ async def force_refresh_sign_token(
         }
 
     return dict(_token_cache[app_key])
+
+
+# ---------------------------------------------------------------------------
+# Module-level send helper (used by send_message tool)
+# ---------------------------------------------------------------------------
+
+_YUANBAO_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+async def send_yuanbao_direct(
+    adapter: "YuanbaoAdapter",
+    chat_id: str,
+    message: str,
+    media_files: Optional[List[Tuple[str, bool]]] = None,
+) -> Dict[str, Any]:
+    """
+    Send helper for the ``send_message`` tool — text + media via Yuanbao.
+
+    Unlike Weixin which creates a fresh adapter per call, Yuanbao reuses the
+    running gateway adapter (persistent WebSocket). Logic mirrors
+    send_weixin_direct: send text first, then iterate media_files by extension.
+    """
+    last_result: Optional[SendResult] = None
+
+    # 1. 发送文本
+    if message.strip():
+        last_result = await adapter.send(chat_id, message)
+        if not last_result.success:
+            return {"error": f"Yuanbao send failed: {last_result.error}"}
+
+    # 2. 遍历 media_files，按扩展名分发
+    for media_path, _is_voice in media_files or []:
+        ext = Path(media_path).suffix.lower()
+        if ext in _YUANBAO_IMAGE_EXTS:
+            last_result = await adapter.send_image_file(chat_id, media_path)
+        else:
+            last_result = await adapter.send_document(chat_id, media_path)
+
+        if not last_result.success:
+            return {"error": f"Yuanbao media send failed: {last_result.error}"}
+
+    if last_result is None:
+        return {"error": "No deliverable text or media remained after processing"}
+
+    return {
+        "success": True,
+        "platform": "yuanbao",
+        "chat_id": chat_id,
+        "message_id": last_result.message_id if last_result else None,
+    }
