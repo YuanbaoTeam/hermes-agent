@@ -156,12 +156,11 @@ class PlatformConfig:
     reply_to_mode: str = "first"
     
     # Yuanbao (元宝 IM Bot) platform-specific settings
-    yuanbao_app_id: Optional[str] = None          # App ID（推荐），用于签票接口鉴权
-    yuanbao_app_key: Optional[str] = None         # App Key（兼容旧配置，等同 App ID）
+    yuanbao_app_id: Optional[str] = None          # App ID, used for sign-token API auth
     yuanbao_app_secret: Optional[str] = None      # App Secret，用于 HMAC 签名
     yuanbao_bot_id: Optional[str] = None          # Bot 账号 ID（可选，sign-token 接口会返回）
-    yuanbao_ws_gateway_url: Optional[str] = None  # WS 网关地址（如 wss://xxx）
-    yuanbao_sign_token_url: Optional[str] = None  # 签票接口地址（HTTP）
+    yuanbao_ws_url: Optional[str] = None           # WebSocket URL (e.g. wss://...)
+    yuanbao_api_domain: Optional[str] = None       # API domain (e.g. https://bot.yuanbao.tencent.com)
     yuanbao_route_env: Optional[str] = None       # 内部路由环境标识（如测试/预发/生产）
     yuanbao_dm_policy: Optional[str] = None       # DM 策略: open | allowlist | disabled
     yuanbao_dm_allow_from: Optional[str] = None    # DM 白名单（逗号分隔 user_id）
@@ -185,16 +184,14 @@ class PlatformConfig:
             result["home_channel"] = self.home_channel.to_dict()
         if self.yuanbao_app_id:
             result["yuanbao_app_id"] = self.yuanbao_app_id
-        if self.yuanbao_app_key:
-            result["yuanbao_app_key"] = self.yuanbao_app_key
         if self.yuanbao_app_secret:
             result["yuanbao_app_secret"] = self.yuanbao_app_secret
         if self.yuanbao_bot_id:
             result["yuanbao_bot_id"] = self.yuanbao_bot_id
-        if self.yuanbao_ws_gateway_url:
-            result["yuanbao_ws_gateway_url"] = self.yuanbao_ws_gateway_url
-        if self.yuanbao_sign_token_url:
-            result["yuanbao_sign_token_url"] = self.yuanbao_sign_token_url
+        if self.yuanbao_ws_url:
+            result["yuanbao_ws_url"] = self.yuanbao_ws_url
+        if self.yuanbao_api_domain:
+            result["yuanbao_api_domain"] = self.yuanbao_api_domain
         if self.yuanbao_route_env:
             result["yuanbao_route_env"] = self.yuanbao_route_env
         if self.yuanbao_dm_policy:
@@ -221,11 +218,10 @@ class PlatformConfig:
             reply_to_mode=data.get("reply_to_mode", "first"),
             extra=data.get("extra", {}),
             yuanbao_app_id=data.get("yuanbao_app_id"),
-            yuanbao_app_key=data.get("yuanbao_app_key"),
             yuanbao_app_secret=data.get("yuanbao_app_secret"),
             yuanbao_bot_id=data.get("yuanbao_bot_id"),
-            yuanbao_ws_gateway_url=data.get("yuanbao_ws_gateway_url"),
-            yuanbao_sign_token_url=data.get("yuanbao_sign_token_url"),
+            yuanbao_ws_url=data.get("yuanbao_ws_url"),
+            yuanbao_api_domain=data.get("yuanbao_api_domain"),
             yuanbao_route_env=data.get("yuanbao_route_env"),
             yuanbao_dm_policy=data.get("yuanbao_dm_policy"),
             yuanbao_dm_allow_from=data.get("yuanbao_dm_allow_from"),
@@ -355,7 +351,7 @@ class GatewayConfig:
             elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
                 connected.append(platform)
             # Yuanbao uses dedicated fields for app credentials
-            elif platform == Platform.YUANBAO and config.yuanbao_app_key and config.yuanbao_app_secret:
+            elif platform == Platform.YUANBAO and config.yuanbao_app_id and config.yuanbao_app_secret:
                 connected.append(platform)
         return connected
     
@@ -1209,8 +1205,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 name=os.getenv("QQ_HOME_CHANNEL_NAME", "Home"),
             )
 
-    # Yuanbao (元宝 IM Bot)
-    # 优先读取 YUANBAO_APP_ID，兼容旧的 YUANBAO_APP_KEY
+    # Yuanbao — YUANBAO_APP_ID preferred
     yuanbao_app_id = os.getenv("YUANBAO_APP_ID") or os.getenv("YUANBAO_APP_KEY")
     yuanbao_app_secret = os.getenv("YUANBAO_APP_SECRET")
     if yuanbao_app_id and yuanbao_app_secret:
@@ -1218,18 +1213,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.YUANBAO] = PlatformConfig()
         config.platforms[Platform.YUANBAO].enabled = True
         config.platforms[Platform.YUANBAO].yuanbao_app_id = yuanbao_app_id
-        # 同时保留 app_key 以便兼容
-        config.platforms[Platform.YUANBAO].yuanbao_app_key = yuanbao_app_id
         config.platforms[Platform.YUANBAO].yuanbao_app_secret = yuanbao_app_secret
         yuanbao_bot_id = os.getenv("YUANBAO_BOT_ID")
         if yuanbao_bot_id:
             config.platforms[Platform.YUANBAO].yuanbao_bot_id = yuanbao_bot_id
-        yuanbao_ws_url = os.getenv("YUANBAO_WS_GATEWAY_URL")
+        yuanbao_ws_url = os.getenv("YUANBAO_WS_URL")
         if yuanbao_ws_url:
-            config.platforms[Platform.YUANBAO].yuanbao_ws_gateway_url = yuanbao_ws_url
-        yuanbao_sign_token_url = os.getenv("YUANBAO_SIGN_TOKEN_URL")
-        if yuanbao_sign_token_url:
-            config.platforms[Platform.YUANBAO].yuanbao_sign_token_url = yuanbao_sign_token_url
+            config.platforms[Platform.YUANBAO].yuanbao_ws_url = yuanbao_ws_url
+        yuanbao_api_domain = os.getenv("YUANBAO_API_DOMAIN")
+        if yuanbao_api_domain:
+            config.platforms[Platform.YUANBAO].yuanbao_api_domain = yuanbao_api_domain
         yuanbao_route_env = os.getenv("YUANBAO_ROUTE_ENV")
         if yuanbao_route_env:
             config.platforms[Platform.YUANBAO].yuanbao_route_env = yuanbao_route_env

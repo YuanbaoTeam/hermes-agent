@@ -117,14 +117,6 @@ def generate_file_id() -> str:
     return secrets.token_hex(16)
 
 
-def _extract_base_url(sign_token_url: str) -> str:
-    """
-    从签票 URL 提取 API 基础 URL。
-    例：https://yuanbao.tencent.com/api/sign-token → https://yuanbao.tencent.com
-    """
-    parsed = urllib.parse.urlparse(sign_token_url)
-    return f"{parsed.scheme}://{parsed.netloc}"
-
 
 # ============ 图片尺寸解析（纯 Python，无需 Pillow） ============
 
@@ -348,7 +340,7 @@ def _cos_sign(
 
 async def get_cos_credentials(
     app_key: str,
-    sign_token_url: str,
+    api_domain: str,
     token: str,
     filename: str = "file",
     file_id: Optional[str] = None,
@@ -360,7 +352,7 @@ async def get_cos_credentials(
 
     Args:
         app_key:        应用 Key（用于 X-ID 头）
-        sign_token_url: 签票接口地址，用于提取 API 基础域名
+        api_domain:     API 域名（如 https://bot.yuanbao.tencent.com）
         token:          当前有效的签票 token（X-Token 头）
         filename:       待上传的文件名（含扩展名）
         file_id:        客户端生成的唯一文件 ID（不传则自动生成）
@@ -385,8 +377,7 @@ async def get_cos_credentials(
     if file_id is None:
         file_id = generate_file_id()
 
-    base_url = _extract_base_url(sign_token_url)
-    upload_url = f"{base_url}{UPLOAD_INFO_PATH}"
+    upload_url = f"{api_domain.rstrip('/')}{UPLOAD_INFO_PATH}"
 
     headers = {
         "Content-Type": "application/json",

@@ -900,8 +900,8 @@ display:
 #   YUANBAO_APP_ID          - App ID for sign-token API authentication
 #   YUANBAO_APP_SECRET      - App Secret for HMAC signing
 #   YUANBAO_BOT_ID          - Bot account ID (optional, returned by sign-token)
-#   YUANBAO_WS_GATEWAY_URL  - WebSocket gateway URL (e.g. wss://your-ws-gateway)
-#   YUANBAO_SIGN_TOKEN_URL  - Sign-token HTTP API URL
+#   YUANBAO_WS_URL          - WebSocket URL (e.g. wss://your-ws-gateway)
+#   YUANBAO_API_DOMAIN      - API domain (e.g. https://bot.yuanbao.tencent.com)
 #   YUANBAO_HOME_CHANNEL    - Default home channel chat ID
 #
 # platforms:
@@ -910,8 +910,8 @@ display:
 #     yuanbao_app_id: "your-app-id"              # App ID，用于签票接口鉴权
 #     yuanbao_app_secret: "your-app-secret"     # App Secret，用于 HMAC 签名
 #     yuanbao_bot_id: "your-bot-id"             # Bot 账号 ID（可选，sign-token 接口会返回）
-#     yuanbao_ws_gateway_url: "wss://your-ws-gateway"  # WS 网关地址
-#     yuanbao_sign_token_url: "https://your-sign-token-url"  # 签票接口地址（HTTP）
+#     yuanbao_ws_url: "wss://your-ws-gateway"           # WebSocket URL
+#     yuanbao_api_domain: "https://bot.yuanbao.tencent.com"  # API domain
 #     # home_channel:
 #     #   platform: yuanbao
 #     #   chat_id: "your-home-chat-id"

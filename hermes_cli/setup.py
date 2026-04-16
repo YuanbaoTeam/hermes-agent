@@ -2466,6 +2466,8 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
             platforms.append("Weixin")
         if get_env_value("BLUEBUBBLES_SERVER_URL"):
             platforms.append("BlueBubbles")
+        if get_env_value("YUANBAO_APP_ID"):
+            platforms.append("Yuanbao")
         if get_env_value("WEBHOOK_ENABLED"):
             platforms.append("Webhooks")
         if platforms:

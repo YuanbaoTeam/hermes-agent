@@ -11,8 +11,8 @@ Configuration in config.yaml (or via env vars):
         yuanbao_app_id: "..."         # or YUANBAO_APP_ID
         yuanbao_app_secret: "..."     # or YUANBAO_APP_SECRET
         yuanbao_bot_id: "..."         # or YUANBAO_BOT_ID  (optional, returned by sign-token)
-        yuanbao_ws_gateway_url: "wss://..." # or YUANBAO_WS_GATEWAY_URL
-        yuanbao_sign_token_url: "https://..." # or YUANBAO_SIGN_TOKEN_URL
+        yuanbao_ws_url: "wss://..."          # or YUANBAO_WS_URL
+        yuanbao_api_domain: "https://..."      # or YUANBAO_API_DOMAIN
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ def get_active_adapter() -> Optional["YuanbaoAdapter"]:
 
 
 DEFAULT_WS_GATEWAY_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection"
-DEFAULT_SIGN_TOKEN_URL = "https://bot.yuanbao.tencent.com/api/v5/robotLogic/sign-token"
+DEFAULT_API_DOMAIN = "https://bot.yuanbao.tencent.com"
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
@@ -183,32 +183,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
 
-        # Credentials / endpoints from config or environment
-        # 优先使用 app_id（推荐），兼容旧的 app_key
-        self._app_key: str = (
-            config.yuanbao_app_id
-            or config.yuanbao_app_key
-            or os.getenv("YUANBAO_APP_ID", "")
-            or os.getenv("YUANBAO_APP_KEY", "")
-        ).strip()
-        self._app_secret: str = (
-            config.yuanbao_app_secret or os.getenv("YUANBAO_APP_SECRET", "")
-        ).strip()
-        self._bot_id: Optional[str] = (
-            config.yuanbao_bot_id or os.getenv("YUANBAO_BOT_ID", "") or None
-        )
-        self._ws_gateway_url: str = (
-            config.yuanbao_ws_gateway_url
-            or os.getenv("YUANBAO_WS_GATEWAY_URL", DEFAULT_WS_GATEWAY_URL)
-        ).strip()
-        self._sign_token_url: str = (
-            config.yuanbao_sign_token_url
-            or os.getenv("YUANBAO_SIGN_TOKEN_URL", DEFAULT_SIGN_TOKEN_URL)
-        ).strip()
-        self._route_env: str = (
-            config.yuanbao_route_env
-            or os.getenv("YUANBAO_ROUTE_ENV", "")
-        ).strip()
+        # Credentials / endpoints from config (populated by config.py from env/yaml)
+        self._app_key: str = (config.yuanbao_app_id or "").strip()
+        self._app_secret: str = (config.yuanbao_app_secret or "").strip()
+        self._bot_id: Optional[str] = config.yuanbao_bot_id or None
+        self._ws_url: str = (config.yuanbao_ws_url or DEFAULT_WS_GATEWAY_URL).strip()
+        self._api_domain: str = (config.yuanbao_api_domain or DEFAULT_API_DOMAIN).rstrip("/")
+        self._route_env: str = (config.yuanbao_route_env or "").strip()
 
         # Runtime state
         self._ws = None                          # websockets connection
@@ -321,7 +302,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if not self._app_key or not self._app_secret:
             msg = (
                 "Yuanbao startup failed: "
-                "YUANBAO_APP_ID (or YUANBAO_APP_KEY) and YUANBAO_APP_SECRET are required"
+                "YUANBAO_APP_ID and YUANBAO_APP_SECRET are required"
             )
             self._set_fatal_error("yuanbao_missing_credentials", msg, retryable=False)
             logger.error("[%s] %s", self.name, msg)
@@ -346,9 +327,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         try:
             # Step 1: Get sign token
-            logger.info("[%s] Fetching sign token from %s", self.name, self._sign_token_url)
+            logger.info("[%s] Fetching sign token from %s", self.name, self._api_domain)
             token_data = await get_sign_token(
-                self._app_key, self._app_secret, self._sign_token_url,
+                self._app_key, self._app_secret, self._api_domain,
                 route_env=self._route_env,
             )
 
@@ -357,10 +338,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 self._bot_id = str(token_data["bot_id"])
 
             # Step 2: Open WebSocket connection (disable built-in ping/pong)
-            logger.info("[%s] Connecting to %s", self.name, self._ws_gateway_url)
+            logger.info("[%s] Connecting to %s", self.name, self._ws_url)
             self._ws = await asyncio.wait_for(
                 websockets.connect(  # type: ignore[attr-defined]
-                    self._ws_gateway_url,
+                    self._ws_url,
                     ping_interval=None,   # we manage heartbeat ourselves
                     ping_timeout=None,
                     close_timeout=5,
@@ -685,9 +666,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if not token or not bot_id:
             return url
 
-        sign_base = urllib.parse.urlparse(self._sign_token_url)
-        api_base = f"{sign_base.scheme}://{sign_base.netloc}"
-        api_url = f"{api_base}/api/resource/v1/download"
+        api_url = f"{self._api_domain}/api/resource/v1/download"
 
         headers = {
             "Content-Type": "application/json",
@@ -701,7 +680,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
                 if resp.status_code == 401 and attempt == 0:
                     # token 过期时强制刷新一次后重试
-                    token_data = await force_refresh_sign_token(self._app_key, self._app_secret, self._sign_token_url)
+                    token_data = await force_refresh_sign_token(self._app_key, self._app_secret, self._api_domain)
                     token = str(token_data.get("token") or "").strip()
                     source = str(token_data.get("source") or source or "web").strip() or "web"
                     bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
@@ -2211,7 +2190,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             credentials = await get_cos_credentials(
                 app_key=self._app_key,
-                sign_token_url=self._sign_token_url,
+                api_domain=self._api_domain,
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
@@ -2308,7 +2287,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             credentials = await get_cos_credentials(
                 app_key=self._app_key,
-                sign_token_url=self._sign_token_url,
+                api_domain=self._api_domain,
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
@@ -2407,7 +2386,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             credentials = await get_cos_credentials(
                 app_key=self._app_key,
-                sign_token_url=self._sign_token_url,
+                api_domain=self._api_domain,
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
@@ -2559,7 +2538,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             credentials = await get_cos_credentials(
                 app_key=self._app_key,
-                sign_token_url=self._sign_token_url,
+                api_domain=self._api_domain,
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
@@ -2652,7 +2631,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         获取当前有效的签票 token（走模块级缓存）。
         """
         return await get_sign_token(
-            self._app_key, self._app_secret, self._sign_token_url,
+            self._app_key, self._app_secret, self._api_domain,
             route_env=self._route_env,
         )
 
@@ -2695,7 +2674,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             try:
                 # Force-refresh token to avoid using a stale one
                 token_data = await force_refresh_sign_token(
-                    self._app_key, self._app_secret, self._sign_token_url,
+                    self._app_key, self._app_secret, self._api_domain,
                     route_env=self._route_env,
                 )
                 if token_data.get("bot_id"):
@@ -2703,7 +2682,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
                 self._ws = await asyncio.wait_for(
                     websockets.connect(  # type: ignore[attr-defined]
-                        self._ws_gateway_url,
+                        self._ws_url,
                         ping_interval=None,
                         ping_timeout=None,
                         close_timeout=5,
@@ -2785,7 +2764,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             "bot_id": self._bot_id,
             "connect_id": self._connect_id,
             "reconnect_attempts": self._reconnect_attempts,
-            "ws_gateway_url": self._ws_gateway_url,
+            "ws_url": self._ws_url,
         }
 
     def _next_seq(self) -> int:
@@ -3346,12 +3325,13 @@ def _is_cache_valid(entry: dict[str, Any]) -> bool:
 async def _do_fetch_sign_token(
     app_key: str,
     app_secret: str,
-    sign_token_url: str,
+    api_domain: str,
     route_env: str = "",
 ) -> dict[str, Any]:
     """
     发起签票 HTTP 请求，支持自动重试（最多 SIGN_MAX_RETRIES 次）。
     """
+    url = f"{api_domain.rstrip('/')}{SIGN_TOKEN_PATH}"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
         for attempt in range(SIGN_MAX_RETRIES + 1):
             nonce = secrets.token_hex(16)
@@ -3377,11 +3357,11 @@ async def _do_fetch_sign_token(
 
             logger.info(
                 "Sign token request: url=%s%s",
-                sign_token_url,
+                url,
                 f" (retry {attempt}/{SIGN_MAX_RETRIES})" if attempt > 0 else "",
             )
 
-            response = await client.post(sign_token_url, json=payload, headers=headers)
+            response = await client.post(url, json=payload, headers=headers)
 
             if response.status_code != 200:
                 body = response.text
@@ -3420,7 +3400,7 @@ async def _do_fetch_sign_token(
 async def get_sign_token(
     app_key: str,
     app_secret: str,
-    sign_token_url: str,
+    api_domain: str,
     route_env: str = "",
 ) -> dict[str, Any]:
     """
@@ -3439,7 +3419,7 @@ async def get_sign_token(
         if cached and _is_cache_valid(cached):
             return dict(cached)
 
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
+        data = await _do_fetch_sign_token(app_key, app_secret, api_domain, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
@@ -3459,7 +3439,7 @@ async def get_sign_token(
 async def force_refresh_sign_token(
     app_key: str,
     app_secret: str,
-    sign_token_url: str,
+    api_domain: str,
     route_env: str = "",
 ) -> dict[str, Any]:
     """
@@ -3468,7 +3448,7 @@ async def force_refresh_sign_token(
     logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
     async with _get_refresh_lock(app_key):
         _token_cache.pop(app_key, None)
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
+        data = await _do_fetch_sign_token(app_key, app_secret, api_domain, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600

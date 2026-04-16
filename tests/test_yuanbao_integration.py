@@ -27,10 +27,10 @@ from gateway.platforms.yuanbao import YuanbaoAdapter
 
 def make_config(**kwargs):
     return PlatformConfig(
-        yuanbao_app_key="test_key",
+        yuanbao_app_id="test_key",
         yuanbao_app_secret="test_secret",
-        yuanbao_ws_gateway_url="wss://test.example.com/ws",
-        yuanbao_sign_token_url="https://test.example.com/sign",
+        yuanbao_ws_url="wss://test.example.com/ws",
+        yuanbao_api_domain="https://test.example.com",
         **kwargs,
     )
 
@@ -64,7 +64,7 @@ class TestYuanbaoConfig:
 
     def test_config_fields(self):
         config = make_config()
-        assert config.yuanbao_app_key == "test_key"
+        assert config.yuanbao_app_id == "test_key"
         assert config.yuanbao_app_secret == "test_secret"
 
     def test_get_connected_platforms_requires_key_and_secret(self):
@@ -73,7 +73,7 @@ class TestYuanbaoConfig:
             platforms={
                 Platform.YUANBAO: PlatformConfig(
                     enabled=True,
-                    yuanbao_app_key="key",
+                    yuanbao_app_id="key",
                 )
             }
         )
@@ -85,7 +85,7 @@ class TestYuanbaoConfig:
             platforms={
                 Platform.YUANBAO: PlatformConfig(
                     enabled=True,
-                    yuanbao_app_key="key",
+                    yuanbao_app_id="key",
                     yuanbao_app_secret="secret",
                 )
             }
