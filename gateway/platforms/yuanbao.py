@@ -335,6 +335,31 @@ class YuanbaoAdapter(BasePlatformAdapter):
             or os.getenv("YUANBAO_REPLY_TO_MODE", "first")
         ).strip().lower()
 
+        # ------------------------------------------------------------------
+        # DM / Group 访问控制策略（平台层过滤，与 wecom.py 对齐）
+        # ------------------------------------------------------------------
+        self._dm_policy: str = (
+            config.yuanbao_dm_policy
+            or os.getenv("YUANBAO_DM_POLICY", "open")
+        ).strip().lower()
+
+        _dm_allow_from_raw: str = (
+            config.yuanbao_dm_allow_from
+            or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
+        )
+        self._dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
+
+        self._group_policy: str = (
+            config.yuanbao_group_policy
+            or os.getenv("YUANBAO_GROUP_POLICY", "open")
+        ).strip().lower()
+
+        _group_allow_from_raw: str = (
+            config.yuanbao_group_allow_from
+            or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
+        )
+        self._group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
+
     # ------------------------------------------------------------------
     # Abstract method implementations
     # ------------------------------------------------------------------
@@ -1613,6 +1638,22 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_type = "dm"
             chat_name = sender_nickname or from_account
 
+        # ---- 平台层访问控制过滤 ----
+        if chat_type == "dm":
+            if not self._is_dm_allowed(from_account):
+                logger.debug(
+                    "[%s] DM from %s blocked by dm_policy=%s",
+                    self.name, from_account, self._dm_policy,
+                )
+                return
+        elif chat_type == "group":
+            if not self._is_group_allowed(group_code):
+                logger.debug(
+                    "[%s] Group %s blocked by group_policy=%s",
+                    self.name, group_code, self._group_policy,
+                )
+                return
+
         # Extract raw text first (before any history enrichment)
         raw_text = self._rewrite_slash_command(self._extract_text(msg_body))
 
@@ -1768,39 +1809,25 @@ class YuanbaoAdapter(BasePlatformAdapter):
         chat_id = f"direct:{user_id}"
         return await self.send(chat_id, text)
 
-    def _resolve_dm_access(self, user_id: str) -> bool:
-        """
-        DM 访问控制。
-
-        策略（从配置/环境变量读取）：
-        - 'open': 允许所有用户
-        - 'allowlist': 仅白名单用户
-        - 'disabled': 禁止所有 DM
-
-        配置项：
-        - yuanbao_dm_policy / YUANBAO_DM_POLICY（默认 'open'）
-        - yuanbao_dm_allow_from / YUANBAO_DM_ALLOW_FROM（逗号分隔的用户 ID 列表）
-        """
-        policy = (
-            getattr(self._config, 'yuanbao_dm_policy', None)
-            or os.getenv("YUANBAO_DM_POLICY", "open")
-        ).strip().lower()
-
-        if policy == "disabled":
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """平台层 DM 入站过滤（open / allowlist / disabled）。"""
+        if self._dm_policy == "disabled":
             return False
-        if policy == "open":
-            return True
-        if policy == "allowlist":
-            allow_from_str = (
-                getattr(self._config, 'yuanbao_dm_allow_from', None)
-                or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
-            )
-            if isinstance(allow_from_str, list):
-                allow_list = allow_from_str
-            else:
-                allow_list = [x.strip() for x in str(allow_from_str).split(",") if x.strip()]
-            return user_id in allow_list
-        return True  # 未知策略默认放行
+        if self._dm_policy == "allowlist":
+            return sender_id.strip() in self._dm_allow_from
+        return True
+
+    def _is_group_allowed(self, group_code: str) -> bool:
+        """平台层群聊入站过滤（open / allowlist / disabled）。"""
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "allowlist":
+            return group_code.strip() in self._group_allow_from
+        return True
+
+    def _resolve_dm_access(self, user_id: str) -> bool:
+        """主动 DM 发送授权，复用 _is_dm_allowed()。"""
+        return self._is_dm_allowed(user_id)
 
     # ------------------------------------------------------------------
     # Agent 工具方法（可注册为 AI toolset）

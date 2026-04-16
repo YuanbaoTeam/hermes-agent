@@ -1433,6 +1433,7 @@ class GatewayRunner:
                        "WECOM_ALLOWED_USERS",
                        "WEIXIN_ALLOWED_USERS",
                        "BLUEBUBBLES_ALLOWED_USERS",
+                       "YUANBAO_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
@@ -1445,7 +1446,8 @@ class GatewayRunner:
                        "FEISHU_ALLOW_ALL_USERS",
                        "WECOM_ALLOW_ALL_USERS",
                        "WEIXIN_ALLOW_ALL_USERS",
-                       "BLUEBUBBLES_ALLOW_ALL_USERS")
+                       "BLUEBUBBLES_ALLOW_ALL_USERS",
+                       "YUANBAO_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(

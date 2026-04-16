@@ -161,6 +161,10 @@ class PlatformConfig:
     yuanbao_ws_gateway_url: Optional[str] = None  # WS 网关地址（如 wss://xxx）
     yuanbao_sign_token_url: Optional[str] = None  # 签票接口地址（HTTP）
     yuanbao_route_env: Optional[str] = None       # 内部路由环境标识（如测试/预发/生产）
+    yuanbao_dm_policy: Optional[str] = None       # DM 策略: open | allowlist | disabled
+    yuanbao_dm_allow_from: Optional[str] = None    # DM 白名单（逗号分隔 user_id）
+    yuanbao_group_policy: Optional[str] = None     # 群聊策略: open | allowlist | disabled
+    yuanbao_group_allow_from: Optional[str] = None # 群聊白名单（逗号分隔 group_code）
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -191,6 +195,14 @@ class PlatformConfig:
             result["yuanbao_sign_token_url"] = self.yuanbao_sign_token_url
         if self.yuanbao_route_env:
             result["yuanbao_route_env"] = self.yuanbao_route_env
+        if self.yuanbao_dm_policy:
+            result["yuanbao_dm_policy"] = self.yuanbao_dm_policy
+        if self.yuanbao_dm_allow_from:
+            result["yuanbao_dm_allow_from"] = self.yuanbao_dm_allow_from
+        if self.yuanbao_group_policy:
+            result["yuanbao_group_policy"] = self.yuanbao_group_policy
+        if self.yuanbao_group_allow_from:
+            result["yuanbao_group_allow_from"] = self.yuanbao_group_allow_from
         return result
     
     @classmethod
@@ -213,6 +225,10 @@ class PlatformConfig:
             yuanbao_ws_gateway_url=data.get("yuanbao_ws_gateway_url"),
             yuanbao_sign_token_url=data.get("yuanbao_sign_token_url"),
             yuanbao_route_env=data.get("yuanbao_route_env"),
+            yuanbao_dm_policy=data.get("yuanbao_dm_policy"),
+            yuanbao_dm_allow_from=data.get("yuanbao_dm_allow_from"),
+            yuanbao_group_policy=data.get("yuanbao_group_policy"),
+            yuanbao_group_allow_from=data.get("yuanbao_group_allow_from"),
         )
 
 
@@ -1113,6 +1129,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=yuanbao_home,
                 name=os.getenv("YUANBAO_HOME_CHANNEL_NAME", "Home"),
             )
+        yuanbao_dm_policy = os.getenv("YUANBAO_DM_POLICY")
+        if yuanbao_dm_policy:
+            config.platforms[Platform.YUANBAO].yuanbao_dm_policy = yuanbao_dm_policy.strip().lower()
+        yuanbao_dm_allow_from = os.getenv("YUANBAO_DM_ALLOW_FROM")
+        if yuanbao_dm_allow_from:
+            config.platforms[Platform.YUANBAO].yuanbao_dm_allow_from = yuanbao_dm_allow_from
+        yuanbao_group_policy = os.getenv("YUANBAO_GROUP_POLICY")
+        if yuanbao_group_policy:
+            config.platforms[Platform.YUANBAO].yuanbao_group_policy = yuanbao_group_policy.strip().lower()
+        yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
+        if yuanbao_group_allow_from:
+            config.platforms[Platform.YUANBAO].yuanbao_group_allow_from = yuanbao_group_allow_from
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
