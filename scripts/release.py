@@ -215,6 +215,8 @@ AUTHOR_MAP = {
     "libo1106@foxmail.com": "libo1106",
     "295367131@qq.com": "295367131",
     "295367132@qq.com": "IxAres",
+    "danieldliu@tencent.com": "danieldliu",
+    "loongzhao@tencent.com": "loongzhao",
 }
 
 
