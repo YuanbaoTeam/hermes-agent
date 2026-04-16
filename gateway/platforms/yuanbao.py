@@ -33,6 +33,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import sys
+
 import httpx
 
 try:
@@ -97,6 +99,18 @@ from gateway.platforms.yuanbao_proto import (
 from gateway.session import SessionSource, build_session_key
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Version / platform constants (used in AUTH_BIND and sign-token headers)
+# ---------------------------------------------------------------------------
+try:
+    from hermes_cli import __version__ as _HERMES_VERSION
+except ImportError:
+    _HERMES_VERSION = "0.0.0"
+
+_APP_VERSION = f"hermes-agent/{_HERMES_VERSION}"
+_BOT_VERSION = f"hermes-agent/{_HERMES_VERSION}"
+_OPERATION_SYSTEM = sys.platform
 
 # ---------------------------------------------------------------------------
 # Module-level active adapter singleton.
@@ -1043,9 +1057,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
             source=source,
             token=token,
             msg_id=msg_id,
-            app_version="hermes-agent/0.8.0",
-            operation_system="linux",
-            bot_version="hermes-agent",
+            app_version=_APP_VERSION,
+            operation_system=_OPERATION_SYSTEM,
+            bot_version=_BOT_VERSION,
             route_env=route_env,
         )
         await self._ws.send(auth_bytes)
@@ -3347,10 +3361,10 @@ async def _do_fetch_sign_token(
 
             headers = {
                 "Content-Type": "application/json",
-                "X-AppVersion": "hermes-agent/0.8.0",
-                "X-OperationSystem": "linux",
+                "X-AppVersion": _APP_VERSION,
+                "X-OperationSystem": _OPERATION_SYSTEM,
                 "X-Instance-Id": "16",
-                "X-Bot-Version": "hermes-agent",
+                "X-Bot-Version": _BOT_VERSION,
             }
             if route_env:
                 headers["X-Route-Env"] = route_env
