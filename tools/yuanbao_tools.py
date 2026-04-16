@@ -16,7 +16,15 @@ from typing import TYPE_CHECKING, Optional
 
 logger = logging.getLogger(__name__)
 
-from gateway.platforms.yuanbao import get_active_adapter
+
+def _get_active_adapter():
+    """Lazy import to avoid ImportError when gateway.platforms.yuanbao is unavailable."""
+    try:
+        from gateway.platforms.yuanbao import get_active_adapter
+        return get_active_adapter()
+    except ImportError:
+        return None
+
 
 if TYPE_CHECKING:
     from gateway.platforms.yuanbao import YuanbaoAdapter
@@ -43,7 +51,7 @@ async def get_group_info(group_code: str) -> dict:
     if not group_code:
         return {"success": False, "error": "group_code is required"}
 
-    adapter = get_active_adapter()
+    adapter = _get_active_adapter()
     if adapter is None:
         return {"success": False, "error": "Yuanbao adapter is not connected"}
 
@@ -84,7 +92,7 @@ async def query_group_members(
     if not group_code:
         return {"success": False, "error": "group_code is required"}
 
-    adapter = get_active_adapter()
+    adapter = _get_active_adapter()
     if adapter is None:
         return {"success": False, "error": "Yuanbao adapter is not connected"}
 
@@ -166,7 +174,7 @@ from tools.registry import registry, tool_result, tool_error  # noqa: E402
 
 def _check_yuanbao():
     """Toolset availability check — True when adapter is connected."""
-    return get_active_adapter() is not None
+    return _get_active_adapter() is not None
 
 
 async def _handle_yb_query_group_info(args, **kw):

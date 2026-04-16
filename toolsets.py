@@ -60,8 +60,6 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Yuanbao platform tools (gated on adapter injection via check_fn)
-    "yb_query_group_info", "yb_query_group_members",
 ]
 
 
@@ -374,13 +372,10 @@ TOOLSETS = {
     },
 
     "hermes-yuanbao": {
-        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、定时提醒",
+        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询",
         "tools": _HERMES_CORE_TOOLS + [
-            "get_group_info",
-            "get_group_member_list",
-            "get_member_info",
-            "get_group_member_info",
-            "send_reminder",
+            "yb_query_group_info",
+            "yb_query_group_members",
         ],
         "module": "tools.yuanbao_tools",
         "includes": []

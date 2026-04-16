@@ -258,17 +258,11 @@ class TestToolset:
     def test_tools_import(self):
         from tools.yuanbao_tools import (
             get_group_info,
-            get_group_member_list,
-            get_member_info,
-            get_group_member_info,
-            send_reminder,
+            query_group_members,
         )
         assert all(callable(f) for f in [
             get_group_info,
-            get_group_member_list,
-            get_member_info,
-            get_group_member_info,
-            send_reminder,
+            query_group_members,
         ])
 
 
