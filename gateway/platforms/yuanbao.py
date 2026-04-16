@@ -27,7 +27,6 @@ import re
 import secrets
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -44,6 +43,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
     download_url as media_download_url,
     get_cos_credentials,
@@ -87,7 +87,7 @@ from gateway.platforms.yuanbao_proto import (
     encode_get_group_member_list,
     next_seq_no,
 )
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ HEARTBEAT_TIMEOUT_THRESHOLD = 2
 AUTH_FAILED_CODES = {4001, 4002, 4003}      # permanent auth failure, re-sign token
 AUTH_RETRYABLE_CODES = {4010, 4011, 4099}   # transient, can retry with same token
 
-# Maximum number of distinct chat IDs tracked in _chat_locks / _group_history.
+# Maximum number of distinct chat IDs tracked in _chat_locks.
 # Oldest entry is evicted when the limit is reached to prevent unbounded growth.
 _CHAT_DICT_MAX_SIZE = 1000
 
@@ -303,16 +303,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Outbound queues: chat_id -> _OutboundQueue (session-level lifecycle)
         self._outbound_queues: Dict[str, _OutboundQueue] = {}
 
-        # Group chat history: chat_id -> deque of {sender_id, text, ts}
-        # Upper-bounded to _CHAT_DICT_MAX_SIZE entries; oldest evicted first.
-        self._group_history: Dict[str, deque] = {}
-
         # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
         self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
 
         # Member cache: group_code -> [{"user_id":..., "nickname":..., ...}, ...]
         # Populated by get_group_member_list(), used by @mention resolution.
         self._member_cache: Dict[str, list] = {}
+
+        # Inbound message deduplication (WS reconnect / network jitter)
+        self._dedup = MessageDeduplicator(ttl_seconds=300)
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # Only the first outbound message carries refMsgId for a given inbound msg.
@@ -1135,28 +1134,39 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _build_group_context(self, chat_id: str, current_sender: str, current_msg: str) -> str:
-        """
-        将该 chat_id 的群聊历史 + 当前消息拼成完整 context（Markdown 格式）。
+    # ------------------------------------------------------------------
+    # Group chat: observe messages into session transcript
+    # ------------------------------------------------------------------
 
-        格式：
-            **[历史消息]**
-            用户A: 消息1
-            用户B: 消息2
-            ...
-            **[当前消息]**
-            用户C: 当前消息内容
+    def _observe_group_message(
+        self, source: SessionSource, sender_display: str, text: str,
+    ) -> None:
+        """Write a group message into the session transcript without triggering the agent.
+
+        This allows the model to see the full group conversation when it is
+        eventually invoked via @bot.  Messages are stored with ``role: "user"``
+        and a ``[sender]`` prefix so the model can distinguish participants.
+
+        Requires ``group_sessions_per_user: false`` in the platform extra
+        config so that all participants share a single session transcript.
         """
-        history = self._group_history.get(chat_id)
-        lines: list[str] = []
-        if history:
-            lines.append("**[历史消息]**")
-            for entry in history:
-                lines.append(f"{entry['sender_id']}: {entry['text']}")
-            lines.append("")
-        lines.append("**[当前消息]**")
-        lines.append(f"{current_sender}: {current_msg}")
-        return "\n".join(lines)
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            session_entry = store.get_or_create_session(source)
+            attributed = f"[{sender_display}] {text}"
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": attributed,
+                    "timestamp": datetime.now().isoformat(),
+                    "observed": True,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to observe group message: %s", self.name, exc)
 
     # ------------------------------------------------------------------
     # Reply Heartbeat 状态机
@@ -1520,6 +1530,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         msg_body: list = push.get("msg_body", [])
         msg_id_field: str = push.get("msg_id", "")
 
+        # ---- Inbound dedup ----
+        if msg_id_field and self._dedup.is_duplicate(msg_id_field):
+            logger.debug("[%s] Duplicate message ignored: msg_id=%s", self.name, msg_id_field)
+            return
+
         # ---- Self-reference filter ----
         if self._is_self_reference(from_account, self._bot_id):
             logger.debug("[%s] Ignoring self-sent message from %s", self.name, from_account)
@@ -1535,36 +1550,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_type = "dm"
             chat_name = sender_nickname or from_account
 
-        # ---- Group chat: history recording + @Bot filter ----
-        if chat_type == "group":
-            text_for_history = self._extract_text(msg_body)
-            # Record every group message into history
-            if chat_id not in self._group_history:
-                if len(self._group_history) >= _CHAT_DICT_MAX_SIZE:
-                    self._group_history.pop(next(iter(self._group_history)))
-                self._group_history[chat_id] = deque(maxlen=50)
-            self._group_history[chat_id].append({
-                "sender_id": from_account,
-                "text": text_for_history,
-                "ts": int(time.time() * 1000),
-            })
-
-            # Only trigger AI when @Bot
-            if not self._is_at_bot(msg_body):
-                logger.info(
-                    "[%s] Group message recorded (no @bot): chat=%s from=%s",
-                    self.name, chat_id, from_account,
-                )
-                return
-
-            # Build context-enriched content
-            text = self._build_group_context(chat_id, from_account, text_for_history)
-        else:
-            text = self._extract_text(msg_body)
+        # Extract raw text first (before any history enrichment)
+        raw_text = self._rewrite_slash_command(self._extract_text(msg_body))
 
         # ---- Placeholder filter ----
-        if self._is_skippable_placeholder(text):
-            logger.debug("[%s] Skipping placeholder message: %r", self.name, text)
+        if self._is_skippable_placeholder(raw_text):
+            logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
         source = SessionSource(
@@ -1573,24 +1564,33 @@ class YuanbaoAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             chat_name=chat_name,
             user_id=from_account or None,
-            user_name=sender_nickname or None,
+            user_name=sender_nickname or from_account,
+            # For group chats, set a synthetic thread_id so
+            # build_session_key treats it like a shared thread —
+            # user_id is kept for auth but excluded from the session
+            # key, matching how Telegram/Feishu handle shared threads.
+            thread_id="main" if chat_type == "group" else None,
         )
 
-        # Normalize full-width slash (Chinese input) before forwarding
-        text = self._rewrite_slash_command(text)
+        # ---- Group chat: observe non-@bot messages, reply only on @Bot ----
+        if chat_type == "group" and not self._is_at_bot(msg_body):
+            self._observe_group_message(source, sender_nickname or from_account, raw_text)
+            logger.info(
+                "[%s] Group message observed (no @bot): chat=%s from=%s",
+                self.name, chat_id, from_account,
+            )
+            return
+
+        msg_type = self._classify_message_type(raw_text, msg_body)
 
         event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
+            text=raw_text,
+            message_type=msg_type,
             source=source,
             message_id=msg_id_field or None,
             raw_message=push,
         )
 
-        # Dispatch to base class handler (spawns background task internally).
-        # The base class _keep_typing loop will call our send_typing() to
-        # start/refresh the reply heartbeat, and stop_typing() will be called
-        # when processing finishes to send FINISH.
         asyncio.create_task(self.handle_message(event))
 
     def _extract_text(self, msg_body: list) -> str:
@@ -1625,7 +1625,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 parts.append("[视频]")
             elif elem_type == "TIMCustomElem":
                 data_val = content.get("data", "")
-                parts.append(data_val if data_val else "[自定义消息]")
+                if data_val:
+                    try:
+                        custom = json.loads(data_val)
+                        if isinstance(custom, dict) and custom.get("elem_type") == 1002:
+                            parts.append(custom.get("text", "[提及]"))
+                        else:
+                            parts.append("[当前消息暂不支持查看]")
+                    except (json.JSONDecodeError, TypeError):
+                        parts.append(data_val)
+                else:
+                    parts.append("[当前消息暂不支持查看]")
             elif elem_type == "TIMFaceElem":
                 # 贴纸/表情：从 data JSON 中提取 name
                 raw_data = content.get("data", "")
@@ -1653,6 +1663,23 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if text.startswith('\uff0f'):  # 全角斜杠
             text = '/' + text[1:]
         return text
+
+    @staticmethod
+    def _classify_message_type(text: str, msg_body: list) -> MessageType:
+        """Determine MessageType from text content and msg_body elements."""
+        if text.startswith("/"):
+            return MessageType.COMMAND
+        for elem in msg_body:
+            etype = elem.get("msg_type", "")
+            if etype == "TIMImageElem":
+                return MessageType.PHOTO
+            if etype == "TIMSoundElem":
+                return MessageType.VOICE
+            if etype == "TIMVideoFileElem":
+                return MessageType.VIDEO
+            if etype == "TIMFileElem":
+                return MessageType.DOCUMENT
+        return MessageType.TEXT
 
     # ------------------------------------------------------------------
     # DM 主动私聊 + 访问控制
