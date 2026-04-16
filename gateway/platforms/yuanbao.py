@@ -153,6 +153,27 @@ _SKIPPABLE_PLACEHOLDERS = frozenset({
     "[video]", "[视频]", "[voice]", "[语音]",
 })
 
+
+def _strip_cron_wrapper_for_yuanbao(content: str) -> str:
+    """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output."""
+    if not content.startswith("Cronjob Response: "):
+        return content
+
+    divider = "\n-------------\n\n"
+    footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+    divider_pos = content.find(divider)
+    footer_pos = content.rfind(footer_prefix)
+    if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+        return content
+
+    header = content[:divider_pos]
+    if "\n(job_id: " not in header:
+        return content
+
+    body_start = divider_pos + len(divider)
+    body = content[body_start:footer_pos].strip()
+    return body or content
+
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
@@ -809,10 +830,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         lock = self._get_chat_lock(chat_id)
         async with lock:
-            chunks = self.truncate_message(content, self.MAX_TEXT_CHUNK)
+            content_to_send = _strip_cron_wrapper_for_yuanbao(content)
+            chunks = self.truncate_message(content_to_send, self.MAX_TEXT_CHUNK)
             logger.info(
                 "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
-                self.name, len(content), self.MAX_TEXT_CHUNK,
+                self.name, len(content_to_send), self.MAX_TEXT_CHUNK,
                 len(chunks), [len(c) for c in chunks],
             )
             for i, chunk in enumerate(chunks):
