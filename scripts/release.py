@@ -219,6 +219,9 @@ AUTHOR_MAP = {
     "295367132@qq.com": "IxAres",
     "danieldliu@tencent.com": "danieldliu",
     "loongzhao@tencent.com": "loongzhao",
+    "Bartok9@users.noreply.github.com": "Bartok9",
+    "LeonSGP43@users.noreply.github.com": "LeonSGP43",
+    "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
 }
 
 
