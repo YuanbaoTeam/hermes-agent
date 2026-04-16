@@ -194,7 +194,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._connect_id: Optional[str] = None  # received from BIND_ACK
         self._pending_acks: Dict[str, asyncio.Future] = {}  # req_id (str) -> Future
         self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
-        self._send_lock: asyncio.Lock = asyncio.Lock()  # guards concurrent WS sends
 
         # Background tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -229,6 +228,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Slow-response notifier: chat_id -> asyncio.Task
         # Fires a "please wait" message if the agent takes > SLOW_RESPONSE_TIMEOUT_S
         self._slow_response_tasks: Dict[str, asyncio.Task] = {}
+
+        # Reply Heartbeat last-active timestamps: chat_id -> unix timestamp
+        self._reply_hb_last_active: Dict[str, float] = {}
 
         # replyToMode config: 'off' | 'first' | 'all' (default: 'first')
         self._reply_to_mode: str = (
@@ -1330,7 +1332,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 {
                     "role": "user",
                     "content": attributed,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "observed": True,
                 },
             )
@@ -1386,17 +1388,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None or not self._bot_id:
             return
 
-        # 如果已有任务在跑，只刷新时间戳即可
         existing = self._reply_heartbeat_tasks.get(chat_id)
         if existing and not existing.done():
-            if not hasattr(self, '_reply_hb_last_active'):
-                self._reply_hb_last_active: Dict[str, float] = {}
             self._reply_hb_last_active[chat_id] = time.time()
             return
 
-        # 启动新的 heartbeat task
-        if not hasattr(self, '_reply_hb_last_active'):
-            self._reply_hb_last_active = {}
         self._reply_hb_last_active[chat_id] = time.time()
 
         task = asyncio.create_task(
@@ -1417,8 +1413,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             while True:
                 await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
 
-                # 检查超时
-                last_active = getattr(self, '_reply_hb_last_active', {}).get(chat_id, 0)
+                last_active = self._reply_hb_last_active.get(chat_id, 0)
                 if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
                     break
 
@@ -1440,8 +1435,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             self._reply_heartbeat_tasks.pop(chat_id, None)
-            if hasattr(self, '_reply_hb_last_active'):
-                self._reply_hb_last_active.pop(chat_id, None)
+            self._reply_hb_last_active.pop(chat_id, None)
 
     async def _stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
         """
@@ -1787,8 +1781,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
-        source = SessionSource(
-            platform=self.PLATFORM,
+        source = self.build_source(
             chat_id=chat_id,
             chat_type=chat_type,
             chat_name=chat_name,
@@ -2106,9 +2099,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
     # Media validation
     # ------------------------------------------------------------------
 
+    MEDIA_MAX_SIZE_MB: int = 20  # aligned with openclaw plugin default
+
     @staticmethod
     def _validate_media_before_queue(
-        file_bytes: Optional[bytes], filename: str, max_size_mb: int = 50
+        file_bytes: Optional[bytes], filename: str, max_size_mb: int = MEDIA_MAX_SIZE_MB
     ) -> Optional[str]:
         """
         媒体前置校验：发送/上传前检查文件有效性。
@@ -2157,14 +2152,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
         try:
             # 1. 下载图片
             logger.info("[%s] send_image: downloading %s", self.name, image_url)
-            file_bytes, content_type = await media_download_url(image_url, max_size_mb=50)
+            file_bytes, content_type = await media_download_url(image_url, max_size_mb=self.MEDIA_MAX_SIZE_MB)
 
             if not content_type or content_type == "application/octet-stream":
-                # 从 URL 推断 MIME
                 path_part = image_url.split("?")[0]
                 content_type = guess_mime_type(path_part) or "image/jpeg"
 
             filename = os.path.basename(image_url.split("?")[0]) or "image.jpg"
+
+            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
+            if validation_err:
+                return SendResult(success=False, error=validation_err)
+
             file_uuid = md5_hex(file_bytes)
 
             # 2. 获取 COS 上传凭证
@@ -2209,7 +2208,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 )
 
             # 6. 发送
-            async with self._send_lock:
+            async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
                     result = await self._send_group_msg_body(group_code, msg_body, reply_to)
@@ -2255,10 +2254,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             with open(image_path, "rb") as f:
                 file_bytes = f.read()
 
-            if not file_bytes:
-                return SendResult(success=False, error=f"File is empty: {image_path}")
-
             filename = os.path.basename(image_path) or "image.jpg"
+
+            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
+            if validation_err:
+                return SendResult(success=False, error=validation_err)
+
             content_type = guess_mime_type(filename) or "image/jpeg"
             file_uuid = md5_hex(file_bytes)
 
@@ -2304,7 +2305,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 )
 
             # 6. 发送
-            async with self._send_lock:
+            async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
                     result = await self._send_group_msg_body(group_code, msg_body, reply_to)
@@ -2346,12 +2347,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
         try:
             # 1. 下载文件
             logger.info("[%s] send_file: downloading %s", self.name, file_url)
-            file_bytes, content_type = await media_download_url(file_url, max_size_mb=50)
+            file_bytes, content_type = await media_download_url(file_url, max_size_mb=self.MEDIA_MAX_SIZE_MB)
 
-            # 推断文件名
             if not filename:
                 path_part = file_url.split("?")[0]
                 filename = os.path.basename(path_part) or "file"
+
+            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
+            if validation_err:
+                return SendResult(success=False, error=validation_err)
 
             if not content_type or content_type == "application/octet-stream":
                 content_type = guess_mime_type(filename) or "application/octet-stream"
@@ -2391,7 +2395,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             )
 
             # 5. 发送
-            async with self._send_lock:
+            async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
                     result = await self._send_group_msg_body(group_code, msg_body, reply_to)
@@ -2454,7 +2458,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 sticker = get_random_sticker()
                 msg_body = build_sticker_msg_body(sticker)
 
-            async with self._send_lock:
+            async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
                     result = await self._send_group_msg_body(group_code, msg_body, reply_to)
@@ -2500,12 +2504,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
             with open(file_path, "rb") as f:
                 file_bytes = f.read()
 
-            if not file_bytes:
-                return SendResult(success=False, error=f"File is empty: {file_path}")
-
-            # 推断文件名和 MIME 类型
             if not filename:
                 filename = os.path.basename(file_path) or "document"
+
+            validation_err = self._validate_media_before_queue(file_bytes, filename, self.MEDIA_MAX_SIZE_MB)
+            if validation_err:
+                return SendResult(success=False, error=validation_err)
+
             content_type = guess_mime_type(filename) or "application/octet-stream"
             file_uuid = md5_hex(file_bytes)
 
@@ -2548,7 +2553,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 )
 
             # 6. 发送
-            async with self._send_lock:
+            async with self._get_chat_lock(chat_id):
                 if chat_id.startswith("group:"):
                     group_code = chat_id[len("group:"):]
                     result = await self._send_group_msg_body(group_code, msg_body, reply_to)
