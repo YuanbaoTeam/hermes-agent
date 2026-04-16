@@ -118,10 +118,6 @@ _CHAT_DICT_MAX_SIZE = 1000
 REPLY_HEARTBEAT_INTERVAL_S = 2.0   # 每 2 秒续发 RUNNING
 REPLY_HEARTBEAT_TIMEOUT_S = 30.0   # 30 秒无活动自动停止
 
-# Outbound Queue 配置
-OUTBOUND_MIN_CHARS = 200           # 最小缓冲门槛（字符数）才触发 flush
-OUTBOUND_FLUSH_DELAY_S = 0.5      # flush 延迟（秒），收集更多文本后再发
-
 # Reply-to 引用配置
 REPLY_REF_TTL_S = 300.0            # 引用去重 TTL（5 分钟）
 _REPLY_REF_MAX_ENTRIES = 500       # 引用去重字典最大容量
@@ -132,114 +128,11 @@ _SKIPPABLE_PLACEHOLDERS = frozenset({
     "[video]", "[视频]", "[voice]", "[语音]",
 })
 
-
-class _OutboundQueue:
-    """
-    出站文本缓冲队列（per chat_id）。
-
-    参考 feishu.py 的 FeishuBatchState 内联模式。
-    实现 merge-text 策略：fence-aware 文本缓冲 + 达到 minChars 门槛时发送。
-
-    用法：
-        q = _OutboundQueue(adapter, chat_id, reply_to)
-        q.push(text1)
-        q.push(text2)
-        await q.flush()     # fence-aware 合并后发送
-        await q.drain_now() # tool_call 前提前投递
-        q.abort()           # 丢弃缓冲
-    """
-
-    def __init__(
-        self,
-        adapter: "YuanbaoAdapter",
-        chat_id: str,
-        reply_to: Optional[str] = None,
-    ) -> None:
-        self._adapter = adapter
-        self._chat_id = chat_id
-        self._reply_to = reply_to
-        self._buffer: list[str] = []
-        self._total_chars: int = 0
-        self._first_send: bool = True  # 只有第一次 send 带 reply_to
-        self._flushed: bool = False
-
-    def push(self, text: str) -> None:
-        """将文本加入缓冲。"""
-        if not text:
-            return
-        self._buffer.append(text)
-        self._total_chars += len(text)
-
-    async def flush(self) -> SendResult:
-        """
-        将缓冲中的文本 fence-aware 合并后发送。
-
-        合并逻辑：
-        1. 拼接所有缓冲文本（使用 _infer_block_separator 推断分隔符）
-        2. 调用 _strip_outer_markdown_fence 剥除外层围栏
-        3. 调用 _sanitize_markdown_table 净化表格
-        4. 调用 truncate_message 分片（保留代码块围栏完整性）
-        5. 调用 _merge_block_streaming_fences 合并未闭合围栏
-        6. 逐片发送
-        """
-        if not self._buffer:
-            return SendResult(success=True)
-
-        # 1. 合并缓冲
-        merged = self._buffer[0]
-        for i in range(1, len(self._buffer)):
-            sep = _infer_block_separator(merged, self._buffer[i])
-            merged = merged + sep + self._buffer[i]
-        self._buffer.clear()
-        self._total_chars = 0
-        self._flushed = True
-
-        # 2. 预处理
-        merged = _strip_outer_markdown_fence(merged)
-        merged = _sanitize_markdown_table(merged)
-
-        # 3. 分片（使用 base class truncate_message 保留代码块围栏完整性）
-        chunks = self._adapter.truncate_message(merged, self._adapter.MAX_TEXT_CHUNK)
-
-        # 4. 合并未闭合围栏（处理流式输出产生的断裂围栏）
-        chunks = _merge_block_streaming_fences(chunks)
-
-        # 5. 发送
-        lock = self._adapter._get_chat_lock(self._chat_id)
-        async with lock:
-            for chunk in chunks:
-                r_to = self._reply_to if self._first_send else None
-                self._first_send = False
-                result = await self._adapter._send_text_chunk(self._chat_id, chunk, r_to)
-                if not result.success:
-                    return result
-        return SendResult(success=True)
-
-    async def drain_now(self) -> SendResult:
-        """
-        立即投递缓冲内容（tool_call 前调用，保证文本在媒体前发出）。
-        """
-        return await self.flush()
-
-    def abort(self) -> None:
-        """丢弃缓冲。"""
-        self._buffer.clear()
-        self._total_chars = 0
-
-    @property
-    def is_empty(self) -> bool:
-        return self._total_chars == 0
-
-    @property
-    def chars_buffered(self) -> int:
-        return self._total_chars
-
-
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
-    MAX_TEXT_CHUNK: int = 4000  # 元宝单条消息字符上限 (临时调小验证分块)
+    MAX_TEXT_CHUNK: int = 4000  # 元宝单条消息字符上限
 
     def __init__(self, config: PlatformConfig, **kwargs: Any) -> None:
         super().__init__(config, Platform.YUANBAO)
@@ -281,9 +174,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Internal sequence counter (separate from proto-level next_seq_no)
         self._seq: int = 0
-
-        # Outbound queues: chat_id -> _OutboundQueue (session-level lifecycle)
-        self._outbound_queues: Dict[str, _OutboundQueue] = {}
 
         # Group chat history: chat_id -> deque of {sender_id, text, ts}
         # Upper-bounded to _CHAT_DICT_MAX_SIZE entries; oldest evicted first.
@@ -1821,7 +1711,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         file_bytes: Optional[bytes], filename: str, max_size_mb: int = 50
     ) -> Optional[str]:
         """
-        媒体前置校验：在排入出站队列前检查文件有效性。
+        媒体前置校验：发送/上传前检查文件有效性。
 
         Returns:
             错误描述（str）如果校验失败，否则 None。
@@ -1833,26 +1723,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             size_mb = len(file_bytes) / 1024 / 1024
             return f"文件过大: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
         return None
-
-    # ------------------------------------------------------------------
-    # Outbound queue helpers
-    # ------------------------------------------------------------------
-
-    def _get_outbound_queue(
-        self, chat_id: str, reply_to: Optional[str] = None
-    ) -> _OutboundQueue:
-        """获取或创建指定 chat_id 的出站队列。"""
-        if chat_id not in self._outbound_queues:
-            if len(self._outbound_queues) >= _CHAT_DICT_MAX_SIZE:
-                self._outbound_queues.pop(next(iter(self._outbound_queues)))
-            self._outbound_queues[chat_id] = _OutboundQueue(self, chat_id, reply_to)
-        return self._outbound_queues[chat_id]
-
-    async def _drain_text_before_media(self, chat_id: str) -> None:
-        """媒体发送前先推出文本缓冲（保证文本在媒体前发出）。"""
-        queue = self._outbound_queues.get(chat_id)
-        if queue and not queue.is_empty:
-            await queue.drain_now()
 
     # ------------------------------------------------------------------
     # Media send methods
@@ -1883,9 +1753,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected", retryable=True)
 
         try:
-            # 0. Drain text buffer before sending media
-            await self._drain_text_before_media(chat_id)
-
             # 1. 下载图片
             logger.info("[%s] send_image: downloading %s", self.name, image_url)
             file_bytes, content_type = await media_download_url(image_url, max_size_mb=50)
@@ -1975,9 +1842,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected", retryable=True)
 
         try:
-            # 0. Drain text buffer before sending media
-            await self._drain_text_before_media(chat_id)
-
             # 1. 读取本地文件
             if not os.path.isfile(image_path):
                 return SendResult(success=False, error=f"File not found: {image_path}")
@@ -2072,9 +1936,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected", retryable=True)
 
         try:
-            # 0. Drain text buffer before sending media
-            await self._drain_text_before_media(chat_id)
-
             # 1. 下载文件
             logger.info("[%s] send_file: downloading %s", self.name, file_url)
             file_bytes, content_type = await media_download_url(file_url, max_size_mb=50)
@@ -2218,9 +2079,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected", retryable=True)
 
         try:
-            # 0. Drain text buffer before sending media
-            await self._drain_text_before_media(chat_id)
-
             # 1. 读取本地文件
             if not os.path.isfile(file_path):
                 return SendResult(success=False, error=f"File not found: {file_path}")
