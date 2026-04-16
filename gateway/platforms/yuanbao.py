@@ -140,6 +140,10 @@ OUTBOUND_FLUSH_DELAY_S = 0.5      # flush 延迟（秒），收集更多文本�
 REPLY_REF_TTL_S = 300.0            # 引用去重 TTL（5 分钟）
 _REPLY_REF_MAX_ENTRIES = 500       # 引用去重字典最大容量
 
+# 慢响应提示：agent 处理超过此时长（秒）未产出任何数据时，推送等待提示给用户
+SLOW_RESPONSE_TIMEOUT_S = 120.0
+SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
+
 # 占位符消息过滤（当无实际媒体内容时跳过这些纯占位符）
 _SKIPPABLE_PLACEHOLDERS = frozenset({
     "[image]", "[图片]", "[file]", "[文件]",
@@ -280,6 +284,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
             config.yuanbao_sign_token_url
             or os.getenv("YUANBAO_SIGN_TOKEN_URL", DEFAULT_SIGN_TOKEN_URL)
         ).strip()
+        self._route_env: str = (
+            config.yuanbao_route_env
+            or os.getenv("YUANBAO_ROUTE_ENV", "")
+        ).strip()
 
         # Runtime state
         self._ws = None                          # websockets connection
@@ -316,6 +324,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # Only the first outbound message carries refMsgId for a given inbound msg.
         self._reply_ref_used: Dict[str, float] = {}
+
+        # Slow-response notifier: chat_id -> asyncio.Task
+        # Fires a "please wait" message if the agent takes > SLOW_RESPONSE_TIMEOUT_S
+        self._slow_response_tasks: Dict[str, asyncio.Task] = {}
 
         # replyToMode config: 'off' | 'first' | 'all' (default: 'first')
         self._reply_to_mode: str = (
@@ -367,7 +379,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Step 1: Get sign token
             logger.info("[%s] Fetching sign token from %s", self.name, self._sign_token_url)
             token_data = await get_sign_token(
-                self._app_key, self._app_secret, self._sign_token_url
+                self._app_key, self._app_secret, self._sign_token_url,
+                route_env=self._route_env,
             )
 
             # Update bot_id if returned by sign-token API
@@ -458,6 +471,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if not task.done():
                 task.cancel()
         self._reply_heartbeat_tasks.clear()
+
+        # Cancel all slow-response notifiers
+        for task in list(self._slow_response_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._slow_response_tasks.clear()
 
         await self._cleanup_ws()
         logger.info("[%s] Disconnected", self.name)
@@ -616,6 +635,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         """
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
+
+        self._cancel_slow_response_notifier(chat_id)
 
         lock = self._get_chat_lock(chat_id)
         async with lock:
@@ -841,7 +862,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         token = token_data.get("token", "")
         uid = self._bot_id or token_data.get("bot_id", "")
         source = token_data.get("source") or "bot"  # use API-returned source; default to 'bot' (not 'web') to receive inbound pushes
-        route_env = token_data.get("route_env", "") or ""
+        route_env = self._route_env or token_data.get("route_env", "") or ""
 
         msg_id = str(uuid.uuid4())
 
@@ -1198,6 +1219,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _process_message_background(self, event, session_key: str) -> None:
+        """Wrap base class processing with a slow-response notifier."""
+        chat_id = event.source.chat_id
+        await self._start_slow_response_notifier(chat_id)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            self._cancel_slow_response_notifier(chat_id)
+
     async def _start_reply_heartbeat(self, chat_id: str) -> None:
         """
         启动或续期 Reply Heartbeat 定时续发（RUNNING，每 2s 一次）。
@@ -1313,6 +1343,39 @@ class YuanbaoAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.debug("[%s] _send_heartbeat_once failed: %s", self.name, exc)
+
+    # ------------------------------------------------------------------
+    # Slow-response notifier (超时未回复提示)
+    # ------------------------------------------------------------------
+
+    async def _start_slow_response_notifier(self, chat_id: str) -> None:
+        """Start a delayed task that notifies the user when the agent is slow."""
+        self._cancel_slow_response_notifier(chat_id)
+        task = asyncio.create_task(
+            self._slow_response_notifier(chat_id),
+            name=f"yuanbao-slow-resp-{chat_id}",
+        )
+        self._slow_response_tasks[chat_id] = task
+
+    async def _slow_response_notifier(self, chat_id: str) -> None:
+        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
+        try:
+            await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
+            logger.info(
+                "[%s] Agent response exceeded %ds for %s, sending wait notice",
+                self.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
+            )
+            await self._send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("[%s] Slow-response notifier failed: %s", self.name, exc)
+
+    def _cancel_slow_response_notifier(self, chat_id: str) -> None:
+        """Cancel the pending slow-response notifier for *chat_id*, if any."""
+        task = self._slow_response_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
 
     # ------------------------------------------------------------------
     # 群查询方法
@@ -1941,6 +2004,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 0. Drain text buffer before sending media
             await self._drain_text_before_media(chat_id)
@@ -1968,6 +2033,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2033,6 +2099,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 0. Drain text buffer before sending media
             await self._drain_text_before_media(chat_id)
@@ -2063,6 +2131,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2130,6 +2199,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 0. Drain text buffer before sending media
             await self._drain_text_before_media(chat_id)
@@ -2159,6 +2230,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2226,6 +2298,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             if sticker_name is not None:
                 sticker = get_sticker_by_name(sticker_name)
@@ -2276,6 +2350,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if self._ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        self._cancel_slow_response_notifier(chat_id)
+
         try:
             # 0. Drain text buffer before sending media
             await self._drain_text_before_media(chat_id)
@@ -2308,6 +2384,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 token=token,
                 filename=filename,
                 bot_id=bot_id,
+                route_env=self._route_env,
             )
 
             # 3. 上传到 COS
@@ -2396,7 +2473,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         获取当前有效的签票 token（走模块级缓存）。
         """
         return await get_sign_token(
-            self._app_key, self._app_secret, self._sign_token_url
+            self._app_key, self._app_secret, self._sign_token_url,
+            route_env=self._route_env,
         )
 
     async def _reconnect_with_backoff(self) -> bool:
@@ -2422,7 +2500,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             try:
                 # Force-refresh token to avoid using a stale one
                 token_data = await force_refresh_sign_token(
-                    self._app_key, self._app_secret, self._sign_token_url
+                    self._app_key, self._app_secret, self._sign_token_url,
+                    route_env=self._route_env,
                 )
                 if token_data.get("bot_id"):
                     self._bot_id = str(token_data["bot_id"])
@@ -3065,6 +3144,7 @@ async def _do_fetch_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     发起签票 HTTP 请求，支持自动重试（最多 SIGN_MAX_RETRIES 次）。
@@ -3089,6 +3169,8 @@ async def _do_fetch_sign_token(
                 "X-Instance-Id": "16",
                 "X-Bot-Version": "hermes-agent",
             }
+            if route_env:
+                headers["X-Route-Env"] = route_env
 
             logger.info(
                 "签票请求: url=%s%s",
@@ -3136,6 +3218,7 @@ async def get_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     获取 WS 鉴权 token（带缓存）。
@@ -3153,7 +3236,7 @@ async def get_sign_token(
         if cached and _is_cache_valid(cached):
             return dict(cached)
 
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
@@ -3174,6 +3257,7 @@ async def force_refresh_sign_token(
     app_key: str,
     app_secret: str,
     sign_token_url: str,
+    route_env: str = "",
 ) -> dict[str, Any]:
     """
     强制刷新 token（清除缓存后重新签票）。
@@ -3181,7 +3265,7 @@ async def force_refresh_sign_token(
     logger.warning("[force-refresh] 清除缓存并重新签票: app_key=****%s", app_key[-4:])
     async with _get_refresh_lock(app_key):
         _token_cache.pop(app_key, None)
-        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url)
+        data = await _do_fetch_sign_token(app_key, app_secret, sign_token_url, route_env)
 
         duration: int = data.get("duration", 0)
         expire_ts = time.time() + duration if duration > 0 else time.time() + 3600

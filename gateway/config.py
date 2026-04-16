@@ -160,6 +160,7 @@ class PlatformConfig:
     yuanbao_bot_id: Optional[str] = None          # Bot 账号 ID（可选，sign-token 接口会返回）
     yuanbao_ws_gateway_url: Optional[str] = None  # WS 网关地址（如 wss://xxx）
     yuanbao_sign_token_url: Optional[str] = None  # 签票接口地址（HTTP）
+    yuanbao_route_env: Optional[str] = None       # 内部路由环境标识（如测试/预发/生产）
 
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -188,6 +189,8 @@ class PlatformConfig:
             result["yuanbao_ws_gateway_url"] = self.yuanbao_ws_gateway_url
         if self.yuanbao_sign_token_url:
             result["yuanbao_sign_token_url"] = self.yuanbao_sign_token_url
+        if self.yuanbao_route_env:
+            result["yuanbao_route_env"] = self.yuanbao_route_env
         return result
     
     @classmethod
@@ -203,11 +206,13 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             extra=data.get("extra", {}),
+            yuanbao_app_id=data.get("yuanbao_app_id"),
             yuanbao_app_key=data.get("yuanbao_app_key"),
             yuanbao_app_secret=data.get("yuanbao_app_secret"),
             yuanbao_bot_id=data.get("yuanbao_bot_id"),
             yuanbao_ws_gateway_url=data.get("yuanbao_ws_gateway_url"),
             yuanbao_sign_token_url=data.get("yuanbao_sign_token_url"),
+            yuanbao_route_env=data.get("yuanbao_route_env"),
         )
 
 
@@ -1098,6 +1103,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_sign_token_url = os.getenv("YUANBAO_SIGN_TOKEN_URL")
         if yuanbao_sign_token_url:
             config.platforms[Platform.YUANBAO].yuanbao_sign_token_url = yuanbao_sign_token_url
+        yuanbao_route_env = os.getenv("YUANBAO_ROUTE_ENV")
+        if yuanbao_route_env:
+            config.platforms[Platform.YUANBAO].yuanbao_route_env = yuanbao_route_env
         yuanbao_home = os.getenv("YUANBAO_HOME_CHANNEL")
         if yuanbao_home:
             config.platforms[Platform.YUANBAO].home_channel = HomeChannel(
