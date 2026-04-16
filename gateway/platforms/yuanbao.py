@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -42,7 +43,12 @@ except ImportError:
     websockets = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
     download_url as media_download_url,
@@ -556,10 +562,209 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return from_account == bot_id
 
     @staticmethod
-    def _is_skippable_placeholder(text: str) -> bool:
+    def _is_skippable_placeholder(text: str, media_count: int = 0) -> bool:
         """检测是否为纯占位符消息（无实际内容时应跳过）。"""
+        if media_count > 0:
+            return False
         stripped = text.strip()
         return stripped in _SKIPPABLE_PLACEHOLDERS
+
+    @staticmethod
+    def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        从 cloud_custom_data 提取引用上下文，映射到 MessageEvent.reply_to_*。
+
+        返回:
+          (reply_to_message_id, reply_to_text)
+        """
+        if not cloud_custom_data:
+            return None, None
+        try:
+            parsed = json.loads(cloud_custom_data)
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+
+        quote = parsed.get("quote") if isinstance(parsed, dict) else None
+        if not isinstance(quote, dict):
+            return None, None
+
+        # type=2 对应图片引用，部分场景 desc 为空，给一个占位描述。
+        quote_type = int(quote.get("type") or 0)
+        desc = str(quote.get("desc") or "").strip()
+        if quote_type == 2 and not desc:
+            desc = "[image]"
+        if not desc:
+            return None, None
+
+        quote_id = str(quote.get("id") or "").strip() or None
+        sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
+        quote_text = f"{sender}: {desc}" if sender else desc
+        return quote_id, quote_text
+
+    @staticmethod
+    def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
+        """
+        从 TIM msg_body 提取入站图片/文件引用。
+
+        返回值示例：
+          [{"kind": "image", "url": "https://..."}, {"kind": "file", "url": "...", "name": "a.pdf"}]
+        """
+        refs: List[Dict[str, str]] = []
+        for elem in msg_body or []:
+            if not isinstance(elem, dict):
+                continue
+            msg_type = elem.get("msg_type", "")
+            content = elem.get("msg_content", {}) or {}
+            if not isinstance(content, dict):
+                continue
+
+            if msg_type == "TIMImageElem":
+                # 与 openclaw 插件保持一致：优先中图（索引 1），否则回退索引 0。
+                image_info_array = content.get("image_info_array")
+                if not isinstance(image_info_array, list):
+                    image_info_array = []
+                image_info = None
+                if len(image_info_array) > 1 and isinstance(image_info_array[1], dict):
+                    image_info = image_info_array[1]
+                elif len(image_info_array) > 0 and isinstance(image_info_array[0], dict):
+                    image_info = image_info_array[0]
+                image_url = str((image_info or {}).get("url") or "").strip()
+                if image_url:
+                    refs.append({"kind": "image", "url": image_url})
+                continue
+
+            if msg_type == "TIMFileElem":
+                file_url = str(content.get("url") or "").strip()
+                file_name = (
+                    str(content.get("file_name") or "").strip()
+                    or str(content.get("fileName") or "").strip()
+                    or str(content.get("filename") or "").strip()
+                )
+                if file_url:
+                    ref: Dict[str, str] = {"kind": "file", "url": file_url}
+                    if file_name:
+                        ref["name"] = file_name
+                    refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _guess_image_ext_from_url(url: str) -> str:
+        """根据 URL 路径猜测图片扩展名。"""
+        path = urllib.parse.urlparse(url).path
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}:
+            return ext
+        return ".jpg"
+
+    async def _resolve_inbound_media_urls(
+        self, media_refs: List[Dict[str, str]]
+    ) -> Tuple[List[str], List[str]]:
+        """
+        解析入站图片/文件 URL（不落地本地缓存），返回 (media_urls, media_types)。
+        """
+        media_urls: List[str] = []
+        media_types: List[str] = []
+
+        for ref in media_refs:
+            kind = str(ref.get("kind") or "").strip().lower()
+            url = str(ref.get("url") or "").strip()
+            if kind not in {"image", "file"} or not url:
+                continue
+
+            try:
+                fetch_url = await self._resolve_inbound_download_url(url)
+            except Exception as exc:
+                logger.warning("[%s] inbound media resolve failed: kind=%s url=%s err=%s", self.name, kind, url, exc)
+                continue
+
+            # 按资源类型推断 MIME，直接把 fetch_url 传给模型侧。
+            if kind == "image":
+                ext = self._guess_image_ext_from_url(fetch_url)
+                mime = guess_mime_type(f"image{ext}")
+                if not mime.startswith("image/"):
+                    mime = "image/jpeg"
+                media_urls.append(fetch_url)
+                media_types.append(mime)
+                continue
+
+            file_name = str(ref.get("name") or "").strip()
+            if not file_name:
+                parsed = urllib.parse.urlparse(fetch_url)
+                file_name = os.path.basename(parsed.path) or "file"
+            mime = guess_mime_type(file_name) or "application/octet-stream"
+            media_urls.append(fetch_url)
+            media_types.append(mime)
+
+        return media_urls, media_types
+
+    async def _resolve_inbound_download_url(self, url: str) -> str:
+        """
+        将元宝资源占位下载链接解析为可直接拉取的真实 URL。
+
+        元宝入站图片/文件常见 URL 形态：
+          https://hunyuan.tencent.com/api/resource/download?resourceId=...
+        该地址直接 GET 会 401，需要调用业务接口：
+          GET /api/resource/v1/download?resourceId=...
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return url
+
+        query = urllib.parse.parse_qs(parsed.query)
+        resource_ids = query.get("resourceId") or query.get("resourceid") or []
+        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        if not resource_id:
+            return url
+
+        token_data = await self._get_cached_token()
+        token = str(token_data.get("token") or "").strip()
+        source = str(token_data.get("source") or "web").strip() or "web"
+        bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
+        if not token or not bot_id:
+            return url
+
+        sign_base = urllib.parse.urlparse(self._sign_token_url)
+        api_base = f"{sign_base.scheme}://{sign_base.netloc}"
+        api_url = f"{api_base}/api/resource/v1/download"
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-ID": bot_id,
+            "X-Token": token,
+            "X-Source": source,
+        }
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            for attempt in range(2):
+                resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
+                if resp.status_code == 401 and attempt == 0:
+                    # token 过期时强制刷新一次后重试
+                    token_data = await force_refresh_sign_token(self._app_key, self._app_secret, self._sign_token_url)
+                    token = str(token_data.get("token") or "").strip()
+                    source = str(token_data.get("source") or source or "web").strip() or "web"
+                    bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
+                    if not token or not bot_id:
+                        break
+                    headers["X-ID"] = bot_id
+                    headers["X-Token"] = token
+                    headers["X-Source"] = source
+                    continue
+
+                resp.raise_for_status()
+                payload = resp.json()
+                code = payload.get("code")
+                if code not in (None, 0):
+                    raise RuntimeError(
+                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
+                    )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
+                if real_url:
+                    return real_url
+                raise RuntimeError("resource/v1/download missing url/realUrl")
+
+        return url
 
     @staticmethod
     def truncate_message(
@@ -1617,6 +1822,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         sender_nickname: str = push.get("sender_nickname", "")
         msg_body: list = push.get("msg_body", [])
         msg_id_field: str = push.get("msg_id", "")
+        cloud_custom_data: str = push.get("cloud_custom_data", "")
 
         # ---- Inbound dedup ----
         if msg_id_field and self._dedup.is_duplicate(msg_id_field):
@@ -1656,9 +1862,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Extract raw text first (before any history enrichment)
         raw_text = self._rewrite_slash_command(self._extract_text(msg_body))
+        media_refs = self._extract_inbound_media_refs(msg_body)
 
         # ---- Placeholder filter ----
-        if self._is_skippable_placeholder(raw_text):
+        if self._is_skippable_placeholder(raw_text, len(media_refs)):
             logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
@@ -1687,15 +1894,26 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         msg_type = self._classify_message_type(raw_text, msg_body)
 
-        event = MessageEvent(
-            text=raw_text,
-            message_type=msg_type,
-            source=source,
-            message_id=msg_id_field or None,
-            raw_message=push,
-        )
+        async def _dispatch_inbound_event() -> None:
+            media_urls, media_types = await self._resolve_inbound_media_urls(media_refs)
+            if self._is_skippable_placeholder(raw_text, len(media_urls)):
+                logger.debug("[%s] Skip placeholder after media download: %r", self.name, raw_text)
+                return
+            reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
+            event = MessageEvent(
+                text=raw_text,
+                message_type=msg_type,
+                source=source,
+                message_id=msg_id_field or None,
+                raw_message=push,
+                media_urls=media_urls,
+                media_types=media_types,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
+            )
+            await self.handle_message(event)
 
-        asyncio.create_task(self.handle_message(event))
+        asyncio.create_task(_dispatch_inbound_event())
 
     def _extract_text(self, msg_body: list) -> str:
         """
@@ -1721,7 +1939,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             elif elem_type == "TIMImageElem":
                 parts.append("[图片]")
             elif elem_type == "TIMFileElem":
-                filename = content.get("fileName", content.get("filename", ""))
+                filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
                 parts.append(f"[文件: {filename}]" if filename else "[文件]")
             elif elem_type == "TIMSoundElem":
                 parts.append("[语音]")
@@ -2673,6 +2891,7 @@ def _parse_json_push(raw_json: dict) -> dict | None:
         "msg_seq": raw_json.get("msg_seq", 0) or raw_json.get("MsgSeq", 0),
         "msg_id": raw_json.get("msg_id", "") or raw_json.get("msg_key", "") or raw_json.get("MsgKey", ""),
         "msg_body": msg_body,
+        "cloud_custom_data": raw_json.get("cloud_custom_data", "") or raw_json.get("CloudCustomData", ""),
         "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
     }
 
