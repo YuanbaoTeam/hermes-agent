@@ -179,6 +179,8 @@ AUTHOR_MAP = {
     "limars874@gmail.com": "limars874",
     "lisicheng168@gmail.com": "lesterli",
     "mingjwan@microsoft.com": "MagicRay1217",
+    "orangeko@gmail.com": "GenKoKo",
+    "82095453+iacker@users.noreply.github.com": "iacker",
     "niyant@spicefi.xyz": "spniyant",
     "olafthiele@gmail.com": "olafthiele",
     "oncuevtv@gmail.com": "sprmn24",
@@ -217,6 +219,9 @@ AUTHOR_MAP = {
     "295367132@qq.com": "IxAres",
     "danieldliu@tencent.com": "danieldliu",
     "loongzhao@tencent.com": "loongzhao",
+    "Bartok9@users.noreply.github.com": "Bartok9",
+    "LeonSGP43@users.noreply.github.com": "LeonSGP43",
+    "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
 }
 
 

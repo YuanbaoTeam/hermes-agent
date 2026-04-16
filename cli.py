@@ -401,14 +401,27 @@ def load_cli_config() -> Dict[str, Any]:
     # filesystem is directly accessible.  For ALL remote/container backends
     # (ssh, docker, modal, singularity), the host path doesn't exist on the
     # target -- remove the key so terminal_tool.py uses its per-backend default.
-    if terminal_config.get("cwd") in (".", "auto", "cwd"):
-        effective_backend = terminal_config.get("env_type", "local")
-        if effective_backend == "local":
-            terminal_config["cwd"] = os.getcwd()
-            defaults["terminal"]["cwd"] = terminal_config["cwd"]
+    #
+    # GUARD: If TERMINAL_CWD is already set to a real absolute path (by the
+    # gateway's config bridge earlier in the process), don't clobber it.
+    # This prevents a lazy import of cli.py during gateway runtime from
+    # rewriting TERMINAL_CWD to the service's working directory.
+    # See issue #10817.
+    _CWD_PLACEHOLDERS = (".", "auto", "cwd")
+    if terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
+        _existing_cwd = os.environ.get("TERMINAL_CWD", "")
+        if _existing_cwd and _existing_cwd not in _CWD_PLACEHOLDERS and os.path.isabs(_existing_cwd):
+            # Gateway (or earlier startup) already resolved a real path — keep it
+            terminal_config["cwd"] = _existing_cwd
+            defaults["terminal"]["cwd"] = _existing_cwd
         else:
-            # Remove so TERMINAL_CWD stays unset → tool picks backend default
-            terminal_config.pop("cwd", None)
+            effective_backend = terminal_config.get("env_type", "local")
+            if effective_backend == "local":
+                terminal_config["cwd"] = os.getcwd()
+                defaults["terminal"]["cwd"] = terminal_config["cwd"]
+            else:
+                # Remove so TERMINAL_CWD stays unset → tool picks backend default
+                terminal_config.pop("cwd", None)
     
     env_mappings = {
         "env_type": "TERMINAL_ENV",
@@ -10039,6 +10052,11 @@ def main(
                 ):
                     cli.agent.quiet_mode = True
                     cli.agent.suppress_status_output = True
+                    # Suppress streaming display callbacks so stdout stays
+                    # machine-readable (no styled "Hermes" box, no tool-gen
+                    # status lines).  The response is printed once below.
+                    cli.agent.stream_delta_callback = None
+                    cli.agent.tool_gen_callback = None
                     result = cli.agent.run_conversation(
                         user_message=effective_query,
                         conversation_history=cli.conversation_history,
@@ -10046,7 +10064,8 @@ def main(
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                     if response:
                         print(response)
-                    print(f"\nsession_id: {cli.session_id}")
+                    # Session ID goes to stderr so piped stdout is clean.
+                    print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                     
                     # Ensure proper exit code for automation wrappers
                     sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)

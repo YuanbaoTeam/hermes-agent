@@ -131,6 +131,12 @@ if _config_path.exists():
             for _cfg_key, _env_var in _terminal_env_map.items():
                 if _cfg_key in _terminal_cfg:
                     _val = _terminal_cfg[_cfg_key]
+                    # Skip cwd placeholder values (".", "auto", "cwd") — the
+                    # gateway resolves these to Path.home() later (line ~255).
+                    # Writing the raw placeholder here would just be noise.
+                    # Only bridge explicit absolute paths from config.yaml.
+                    if _cfg_key == "cwd" and str(_val) in (".", "auto", "cwd"):
+                        continue
                     if isinstance(_val, list):
                         os.environ[_env_var] = json.dumps(_val)
                     else:
@@ -214,6 +220,13 @@ try:
 except Exception:
     pass
 
+# Warn if user has deprecated MESSAGING_CWD / TERMINAL_CWD in .env
+try:
+    from hermes_cli.config import warn_deprecated_cwd_env_vars
+    warn_deprecated_cwd_env_vars()
+except Exception:
+    pass
+
 # Gateway runs in quiet mode - suppress debug output and use cwd directly (no temp dirs)
 os.environ["HERMES_QUIET"] = "1"
 
@@ -221,12 +234,14 @@ os.environ["HERMES_QUIET"] = "1"
 os.environ["HERMES_EXEC_ASK"] = "1"
 
 # Set terminal working directory for messaging platforms.
-# If the user set an explicit path in config.yaml (not "." or "auto"),
-# respect it. Otherwise use MESSAGING_CWD or default to home directory.
+# config.yaml terminal.cwd is the canonical source (bridged to TERMINAL_CWD
+# by the config bridge above).  When it's unset or a placeholder, default
+# to home directory.  MESSAGING_CWD is accepted as a backward-compat
+# fallback (deprecated — the warning above tells users to migrate).
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in (".", "auto", "cwd"):
-    messaging_cwd = os.getenv("MESSAGING_CWD") or str(Path.home())
-    os.environ["TERMINAL_CWD"] = messaging_cwd
+    _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
+    os.environ["TERMINAL_CWD"] = _fallback
 
 from gateway.config import (
     Platform,
@@ -756,69 +771,72 @@ class GatewayRunner:
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_session_id,
             )
-            # Fully silence the flush agent — quiet_mode only suppresses init
-            # messages; tool call output still leaks to the terminal through
-            # _safe_print → _print_fn.  Set a no-op to prevent that.
-            tmp_agent._print_fn = lambda *a, **kw: None
-
-            # Build conversation history from transcript
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ]
-
-            # Read live memory state from disk so the flush agent can see
-            # what's already saved and avoid overwriting newer entries.
-            _current_memory = ""
             try:
-                from tools.memory_tool import get_memory_dir
-                _mem_dir = get_memory_dir()
-                for fname, label in [
-                    ("MEMORY.md", "MEMORY (your personal notes)"),
-                    ("USER.md", "USER PROFILE (who the user is)"),
-                ]:
-                    fpath = _mem_dir / fname
-                    if fpath.exists():
-                        content = fpath.read_text(encoding="utf-8").strip()
-                        if content:
-                            _current_memory += f"\n\n## Current {label}:\n{content}"
-            except Exception:
-                pass  # Non-fatal — flush still works, just without the guard
+                # Fully silence the flush agent — quiet_mode only suppresses init
+                # messages; tool call output still leaks to the terminal through
+                # _safe_print → _print_fn.  Set a no-op to prevent that.
+                tmp_agent._print_fn = lambda *a, **kw: None
 
-            # Give the agent a real turn to think about what to save
-            flush_prompt = (
-                "[System: This session is about to be automatically reset due to "
-                "inactivity or a scheduled daily reset. The conversation context "
-                "will be cleared after this turn.\n\n"
-                "Review the conversation above and:\n"
-                "1. Save any important facts, preferences, or decisions to memory "
-                "(user profile or your notes) that would be useful in future sessions.\n"
-                "2. If you discovered a reusable workflow or solved a non-trivial "
-                "problem, consider saving it as a skill.\n"
-                "3. If nothing is worth saving, that's fine — just skip.\n\n"
-            )
+                # Build conversation history from transcript
+                msgs = [
+                    {"role": m.get("role"), "content": m.get("content")}
+                    for m in history
+                    if m.get("role") in ("user", "assistant") and m.get("content")
+                ]
 
-            if _current_memory:
-                flush_prompt += (
-                    "IMPORTANT — here is the current live state of memory. Other "
-                    "sessions, cron jobs, or the user may have updated it since this "
-                    "conversation ended. Do NOT overwrite or remove entries unless "
-                    "the conversation above reveals something that genuinely "
-                    "supersedes them. Only add new information that is not already "
-                    "captured below."
-                    f"{_current_memory}\n\n"
+                # Read live memory state from disk so the flush agent can see
+                # what's already saved and avoid overwriting newer entries.
+                _current_memory = ""
+                try:
+                    from tools.memory_tool import get_memory_dir
+                    _mem_dir = get_memory_dir()
+                    for fname, label in [
+                        ("MEMORY.md", "MEMORY (your personal notes)"),
+                        ("USER.md", "USER PROFILE (who the user is)"),
+                    ]:
+                        fpath = _mem_dir / fname
+                        if fpath.exists():
+                            content = fpath.read_text(encoding="utf-8").strip()
+                            if content:
+                                _current_memory += f"\n\n## Current {label}:\n{content}"
+                except Exception:
+                    pass  # Non-fatal — flush still works, just without the guard
+
+                # Give the agent a real turn to think about what to save
+                flush_prompt = (
+                    "[System: This session is about to be automatically reset due to "
+                    "inactivity or a scheduled daily reset. The conversation context "
+                    "will be cleared after this turn.\n\n"
+                    "Review the conversation above and:\n"
+                    "1. Save any important facts, preferences, or decisions to memory "
+                    "(user profile or your notes) that would be useful in future sessions.\n"
+                    "2. If you discovered a reusable workflow or solved a non-trivial "
+                    "problem, consider saving it as a skill.\n"
+                    "3. If nothing is worth saving, that's fine — just skip.\n\n"
                 )
 
-            flush_prompt += (
-                "Do NOT respond to the user. Just use the memory and skill_manage "
-                "tools if needed, then stop.]"
-            )
+                if _current_memory:
+                    flush_prompt += (
+                        "IMPORTANT — here is the current live state of memory. Other "
+                        "sessions, cron jobs, or the user may have updated it since this "
+                        "conversation ended. Do NOT overwrite or remove entries unless "
+                        "the conversation above reveals something that genuinely "
+                        "supersedes them. Only add new information that is not already "
+                        "captured below."
+                        f"{_current_memory}\n\n"
+                    )
 
-            tmp_agent.run_conversation(
-                user_message=flush_prompt,
-                conversation_history=msgs,
-            )
+                flush_prompt += (
+                    "Do NOT respond to the user. Just use the memory and skill_manage "
+                    "tools if needed, then stop.]"
+                )
+
+                tmp_agent.run_conversation(
+                    user_message=flush_prompt,
+                    conversation_history=msgs,
+                )
+            finally:
+                self._cleanup_agent_resources(tmp_agent)
             logger.info("Pre-reset memory flush completed for session %s", old_session_id)
         except Exception as e:
             logger.debug("Pre-reset memory flush failed for session %s: %s", old_session_id, e)
@@ -1497,19 +1515,25 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
-            try:
-                if hasattr(agent, "shutdown_memory_provider"):
-                    agent.shutdown_memory_provider()
-            except Exception:
-                pass
-            # Close tool resources (terminal sandboxes, browser daemons,
-            # background processes, httpx clients) to prevent zombie
-            # process accumulation.
-            try:
-                if hasattr(agent, 'close'):
-                    agent.close()
-            except Exception:
-                pass
+            self._cleanup_agent_resources(agent)
+
+    def _cleanup_agent_resources(self, agent: Any) -> None:
+        """Best-effort cleanup for temporary or cached agent instances."""
+        if agent is None:
+            return
+        try:
+            if hasattr(agent, "shutdown_memory_provider"):
+                agent.shutdown_memory_provider()
+        except Exception:
+            pass
+        # Close tool resources (terminal sandboxes, browser daemons,
+        # background processes, httpx clients) to prevent zombie
+        # process accumulation.
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
 
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
@@ -1691,8 +1715,10 @@ class GatewayRunner:
                        "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
                        "FEISHU_ALLOWED_USERS",
                        "WECOM_ALLOWED_USERS",
+                       "WECOM_CALLBACK_ALLOWED_USERS",
                        "WEIXIN_ALLOWED_USERS",
                        "BLUEBUBBLES_ALLOWED_USERS",
+                       "QQ_ALLOWED_USERS",
                        "YUANBAO_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
@@ -1705,8 +1731,10 @@ class GatewayRunner:
                        "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
                        "FEISHU_ALLOW_ALL_USERS",
                        "WECOM_ALLOW_ALL_USERS",
+                       "WECOM_CALLBACK_ALLOW_ALL_USERS",
                        "WEIXIN_ALLOW_ALL_USERS",
                        "BLUEBUBBLES_ALLOW_ALL_USERS",
+                       "QQ_ALLOW_ALL_USERS",
                        "YUANBAO_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
@@ -1977,16 +2005,7 @@ class GatewayRunner:
                         if _cached_agent is None:
                             _cached_agent = self._running_agents.get(key)
                         if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
-                            try:
-                                if hasattr(_cached_agent, 'shutdown_memory_provider'):
-                                    _cached_agent.shutdown_memory_provider()
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(_cached_agent, 'close'):
-                                    _cached_agent.close()
-                            except Exception:
-                                pass
+                            self._cleanup_agent_resources(_cached_agent)
                         # Mark as flushed and persist to disk so the flag
                         # survives gateway restarts.
                         with self.session_store._lock:
@@ -2419,6 +2438,23 @@ class GatewayRunner:
                 return None
             return BlueBubblesAdapter(config)
 
+        elif platform == Platform.WECOM_CALLBACK:
+            from gateway.platforms.wecom_callback import (
+                WecomCallbackAdapter,
+                check_wecom_callback_requirements,
+            )
+            if not check_wecom_callback_requirements():
+                logger.warning("WeComCallback: aiohttp/httpx not installed")
+                return None
+            return WecomCallbackAdapter(config)
+
+        elif platform == Platform.QQBOT:
+            from gateway.platforms.qqbot import QQAdapter, check_qq_requirements
+            if not check_qq_requirements():
+                logger.warning("QQBot: aiohttp/httpx missing or QQ_APP_ID/QQ_CLIENT_SECRET not configured")
+                return None
+            return QQAdapter(config)
+
         elif platform == Platform.YUANBAO:
             from gateway.platforms.yuanbao import YuanbaoAdapter, WEBSOCKETS_AVAILABLE
             if not WEBSOCKETS_AVAILABLE:
@@ -2464,8 +2500,10 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
+            Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
         }
         platform_allow_all_map = {
@@ -2481,8 +2519,10 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
+            Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
         }
 
@@ -3127,6 +3167,162 @@ class GatewayRunner:
                 del self._running_agents[_quick_key]
             self._running_agents_ts.pop(_quick_key, None)
 
+    async def _prepare_inbound_message_text(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Prepare inbound event text for the agent.
+
+        Keep the normal inbound path and the queued follow-up path on the same
+        preprocessing pipeline so sender attribution, image enrichment, STT,
+        document notes, reply context, and @ references all behave the same.
+        """
+        history = history or []
+        message_text = event.text or ""
+
+        _is_shared_thread = (
+            source.chat_type != "dm"
+            and source.thread_id
+            and not getattr(self.config, "thread_sessions_per_user", False)
+        )
+        if _is_shared_thread and source.user_name:
+            message_text = f"[{source.user_name}] {message_text}"
+
+        if event.media_urls:
+            image_paths = []
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
+                    image_paths.append(path)
+                if mtype.startswith("audio/") or event.message_type in (MessageType.VOICE, MessageType.AUDIO):
+                    audio_paths.append(path)
+
+            if image_paths:
+                message_text = await self._enrich_message_with_vision(
+                    message_text,
+                    image_paths,
+                )
+
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text,
+                    audio_paths,
+                )
+                _stt_fail_markers = (
+                    "No STT provider",
+                    "STT is disabled",
+                    "can't listen",
+                    "VOICE_TOOLS_OPENAI_KEY",
+                )
+                if any(marker in message_text for marker in _stt_fail_markers):
+                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    if _stt_adapter:
+                        try:
+                            _stt_msg = (
+                                "🎤 I received your voice message but can't transcribe it — "
+                                "no speech-to-text provider is configured.\n\n"
+                                "To enable voice: install faster-whisper "
+                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "and set `stt.enabled: true` in config.yaml, "
+                                "then /restart the gateway."
+                            )
+                            if self._has_setup_skill():
+                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                            await _stt_adapter.send(
+                                source.chat_id,
+                                _stt_msg,
+                                metadata=_stt_meta,
+                            )
+                        except Exception:
+                            pass
+
+        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            import mimetypes as _mimetypes
+
+            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                if mtype in ("", "application/octet-stream"):
+                    import os as _os2
+
+                    _ext = _os2.path.splitext(path)[1].lower()
+                    if _ext in _TEXT_EXTENSIONS:
+                        mtype = "text/plain"
+                    else:
+                        guessed, _ = _mimetypes.guess_type(path)
+                        if guessed:
+                            mtype = guessed
+                if not mtype.startswith(("application/", "text/")):
+                    continue
+
+                import os as _os
+                import re as _re
+
+                basename = _os.path.basename(path)
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+
+                if mtype.startswith("text/"):
+                    context_note = (
+                        f"[The user sent a text document: '{display_name}'. "
+                        f"Its content has been included below. "
+                        f"The file is also saved at: {path}]"
+                    )
+                else:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"The file is saved at: {path}. "
+                        f"Ask the user what they'd like you to do with it.]"
+                    )
+                message_text = f"{context_note}\n\n{message_text}"
+
+        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
+            reply_snippet = event.reply_to_text[:500]
+            found_in_history = any(
+                reply_snippet[:200] in (msg.get("content") or "")
+                for msg in history
+                if msg.get("role") in ("assistant", "user", "tool")
+            )
+            if not found_in_history:
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+
+        if "@" in message_text:
+            try:
+                from agent.context_references import preprocess_context_references_async
+                from agent.model_metadata import get_model_context_length
+
+                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                _msg_ctx_len = get_model_context_length(
+                    self._model,
+                    base_url=self._base_url or "",
+                )
+                _ctx_result = await preprocess_context_references_async(
+                    message_text,
+                    cwd=_msg_cwd,
+                    context_length=_msg_ctx_len,
+                    allowed_root=_msg_cwd,
+                )
+                if _ctx_result.blocked:
+                    _adapter = self.adapters.get(source.platform)
+                    if _adapter:
+                        await _adapter.send(
+                            source.chat_id,
+                            "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                        )
+                    return None
+                if _ctx_result.expanded:
+                    message_text = _ctx_result.message
+            except Exception as exc:
+                logger.debug("@ context reference expansion failed: %s", exc)
+
+        return message_text
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -3462,50 +3658,53 @@ class GatewayRunner:
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                 )
-                                _hyg_agent._print_fn = lambda *a, **kw: None
+                                try:
+                                    _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                loop = asyncio.get_running_loop()
-                                _compressed, _ = await loop.run_in_executor(
-                                    None,
-                                    lambda: _hyg_agent._compress_context(
-                                        _hyg_msgs, "",
-                                        approx_tokens=_approx_tokens,
-                                    ),
-                                )
-
-                                # _compress_context ends the old session and creates
-                                # a new session_id.  Write compressed messages into
-                                # the NEW session so the old transcript stays intact
-                                # and searchable via session_search.
-                                _hyg_new_sid = _hyg_agent.session_id
-                                if _hyg_new_sid != session_entry.session_id:
-                                    session_entry.session_id = _hyg_new_sid
-                                    self.session_store._save()
-
-                                self.session_store.rewrite_transcript(
-                                    session_entry.session_id, _compressed
-                                )
-                                # Reset stored token count — transcript was rewritten
-                                session_entry.last_prompt_tokens = 0
-                                history = _compressed
-                                _new_count = len(_compressed)
-                                _new_tokens = estimate_messages_tokens_rough(
-                                    _compressed
-                                )
-
-                                logger.info(
-                                    "Session hygiene: compressed %s → %s msgs, "
-                                    "~%s → ~%s tokens",
-                                    _msg_count, _new_count,
-                                    f"{_approx_tokens:,}", f"{_new_tokens:,}",
-                                )
-
-                                if _new_tokens >= _warn_token_threshold:
-                                    logger.warning(
-                                        "Session hygiene: still ~%s tokens after "
-                                        "compression",
-                                        f"{_new_tokens:,}",
+                                    loop = asyncio.get_running_loop()
+                                    _compressed, _ = await loop.run_in_executor(
+                                        None,
+                                        lambda: _hyg_agent._compress_context(
+                                            _hyg_msgs, "",
+                                            approx_tokens=_approx_tokens,
+                                        ),
                                     )
+
+                                    # _compress_context ends the old session and creates
+                                    # a new session_id.  Write compressed messages into
+                                    # the NEW session so the old transcript stays intact
+                                    # and searchable via session_search.
+                                    _hyg_new_sid = _hyg_agent.session_id
+                                    if _hyg_new_sid != session_entry.session_id:
+                                        session_entry.session_id = _hyg_new_sid
+                                        self.session_store._save()
+
+                                    self.session_store.rewrite_transcript(
+                                        session_entry.session_id, _compressed
+                                    )
+                                    # Reset stored token count — transcript was rewritten
+                                    session_entry.last_prompt_tokens = 0
+                                    history = _compressed
+                                    _new_count = len(_compressed)
+                                    _new_tokens = estimate_messages_tokens_rough(
+                                        _compressed
+                                    )
+
+                                    logger.info(
+                                        "Session hygiene: compressed %s → %s msgs, "
+                                        "~%s → ~%s tokens",
+                                        _msg_count, _new_count,
+                                        f"{_approx_tokens:,}", f"{_new_tokens:,}",
+                                    )
+
+                                    if _new_tokens >= _warn_token_threshold:
+                                        logger.warning(
+                                            "Session hygiene: still ~%s tokens after "
+                                            "compression",
+                                            f"{_new_tokens:,}",
+                                        )
+                                finally:
+                                    self._cleanup_agent_resources(_hyg_agent)
 
                     except Exception as e:
                         logger.warning(
@@ -4174,16 +4373,7 @@ class GatewayRunner:
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
-                try:
-                    if hasattr(_old_agent, "shutdown_memory_provider"):
-                        _old_agent.shutdown_memory_provider()
-                except Exception:
-                    pass
-                try:
-                    if hasattr(_old_agent, "close"):
-                        _old_agent.close()
-                except Exception:
-                    pass
+                self._cleanup_agent_resources(_old_agent)
         self._evict_cached_agent(session_key)
 
         try:
@@ -5399,7 +5589,7 @@ class GatewayRunner:
             max_snapshots=cp_cfg.get("max_snapshots", 50),
         )
 
-        cwd = os.getenv("MESSAGING_CWD", str(Path.home()))
+        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         if not arg:
@@ -5520,11 +5710,13 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
-
-                return agent.run_conversation(
-                    user_message=prompt,
-                    task_id=task_id,
-                )
+                try:
+                    return agent.run_conversation(
+                        user_message=prompt,
+                        task_id=task_id,
+                    )
+                finally:
+                    self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
 
@@ -5702,11 +5894,14 @@ class GatewayRunner:
                     skip_context_files=True,
                     persist_session=False,
                 )
-                return agent.run_conversation(
-                    user_message=btw_prompt,
-                    conversation_history=history_snapshot,
-                    task_id=task_id,
-                )
+                try:
+                    return agent.run_conversation(
+                        user_message=btw_prompt,
+                        conversation_history=history_snapshot,
+                        task_id=task_id,
+                    )
+                finally:
+                    self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
 
@@ -5979,13 +6174,21 @@ class GatewayRunner:
             return f"{descriptions[new_mode]}\n_(could not save to config: {e})_"
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
-        """Handle /compress command -- manually compress conversation context."""
+        """Handle /compress command -- manually compress conversation context.
+
+        Accepts an optional focus topic: ``/compress <focus>`` guides the
+        summariser to preserve information related to *focus* while being
+        more aggressive about discarding everything else.
+        """
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
             return "Not enough conversation to compress (need at least 4 messages)."
+
+        # Extract optional focus topic from command args
+        focus_topic = (event.get_command_args() or "").strip() or None
 
         try:
             from run_agent import AIAgent
@@ -6017,43 +6220,49 @@ class GatewayRunner:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
             )
-            tmp_agent._print_fn = lambda *a, **kw: None
+            try:
+                tmp_agent._print_fn = lambda *a, **kw: None
 
-            compressor = tmp_agent.context_compressor
-            compress_start = compressor.protect_first_n
-            compress_start = compressor._align_boundary_forward(msgs, compress_start)
-            compress_end = compressor._find_tail_cut_by_tokens(msgs, compress_start)
-            if compress_start >= compress_end:
-                return "Nothing to compress yet (the transcript is still all protected context)."
+                compressor = tmp_agent.context_compressor
+                compress_start = compressor.protect_first_n
+                compress_start = compressor._align_boundary_forward(msgs, compress_start)
+                compress_end = compressor._find_tail_cut_by_tokens(msgs, compress_start)
+                if compress_start >= compress_end:
+                    return "Nothing to compress yet (the transcript is still all protected context)."
 
-            loop = asyncio.get_running_loop()
-            compressed, _ = await loop.run_in_executor(
-                None,
-                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens)
-            )
+                loop = asyncio.get_running_loop()
+                compressed, _ = await loop.run_in_executor(
+                    None,
+                    lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic)
+                )
 
-            # _compress_context already calls end_session() on the old session
-            # (preserving its full transcript in SQLite) and creates a new
-            # session_id for the continuation.  Write the compressed messages
-            # into the NEW session so the original history stays searchable.
-            new_session_id = tmp_agent.session_id
-            if new_session_id != session_entry.session_id:
-                session_entry.session_id = new_session_id
-                self.session_store._save()
+                # _compress_context already calls end_session() on the old session
+                # (preserving its full transcript in SQLite) and creates a new
+                # session_id for the continuation.  Write the compressed messages
+                # into the NEW session so the original history stays searchable.
+                new_session_id = tmp_agent.session_id
+                if new_session_id != session_entry.session_id:
+                    session_entry.session_id = new_session_id
+                    self.session_store._save()
 
-            self.session_store.rewrite_transcript(new_session_id, compressed)
-            # Reset stored token count — transcript changed, old value is stale
-            self.session_store.update_session(
-                session_entry.session_key, last_prompt_tokens=0
-            )
-            new_tokens = estimate_messages_tokens_rough(compressed)
-            summary = summarize_manual_compression(
-                msgs,
-                compressed,
-                approx_tokens,
-                new_tokens,
-            )
-            lines = [f"🗜️ {summary['headline']}", summary["token_line"]]
+                self.session_store.rewrite_transcript(new_session_id, compressed)
+                # Reset stored token count — transcript changed, old value is stale
+                self.session_store.update_session(
+                    session_entry.session_key, last_prompt_tokens=0
+                )
+                new_tokens = estimate_messages_tokens_rough(compressed)
+                summary = summarize_manual_compression(
+                    msgs,
+                    compressed,
+                    approx_tokens,
+                    new_tokens,
+                )
+            finally:
+                self._cleanup_agent_resources(tmp_agent)
+            lines = [f"🗜️ {summary['headline']}"]
+            if focus_topic:
+                lines.append(f"Focus: \"{focus_topic}\"")
+            lines.append(summary["token_line"])
             if summary["note"]:
                 lines.append(summary["note"])
             return "\n".join(lines)
@@ -8522,7 +8731,7 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
+                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
