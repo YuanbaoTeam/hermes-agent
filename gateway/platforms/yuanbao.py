@@ -8,7 +8,7 @@ will be added in follow-up tasks.
 Configuration in config.yaml (or via env vars):
     platforms:
       yuanbao:
-        yuanbao_app_key: "..."        # or YUANBAO_APP_KEY
+        yuanbao_app_id: "..."         # or YUANBAO_APP_ID
         yuanbao_app_secret: "..."     # or YUANBAO_APP_SECRET
         yuanbao_bot_id: "..."         # or YUANBAO_BOT_ID  (optional, returned by sign-token)
         yuanbao_ws_gateway_url: "wss://..." # or YUANBAO_WS_GATEWAY_URL
@@ -90,6 +90,20 @@ from gateway.platforms.yuanbao_proto import (
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Module-level active adapter singleton.
+# Set by YuanbaoAdapter.connect(), cleared by disconnect().
+# Consumers (cron delivery, send_message tool) import get_active_adapter()
+# to obtain the running instance without going through yuanbao_tools.
+# ---------------------------------------------------------------------------
+_active_adapter: Optional["YuanbaoAdapter"] = None
+
+
+def get_active_adapter() -> Optional["YuanbaoAdapter"]:
+    """Return the currently connected YuanbaoAdapter, or None."""
+    return _active_adapter
+
 
 DEFAULT_WS_GATEWAY_URL = "wss://yuanbao.tencent.com/ws"
 DEFAULT_SIGN_TOKEN_URL = "https://yuanbao.tencent.com/api/sign-token"
@@ -249,8 +263,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.YUANBAO)
 
         # Credentials / endpoints from config or environment
+        # 优先使用 app_id（推荐），兼容旧的 app_key
         self._app_key: str = (
-            config.yuanbao_app_key or os.getenv("YUANBAO_APP_KEY", "")
+            config.yuanbao_app_id
+            or config.yuanbao_app_key
+            or os.getenv("YUANBAO_APP_ID", "")
+            or os.getenv("YUANBAO_APP_KEY", "")
         ).strip()
         self._app_secret: str = (
             config.yuanbao_app_secret or os.getenv("YUANBAO_APP_SECRET", "")
@@ -337,7 +355,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if not self._app_key or not self._app_secret:
             msg = (
                 "Yuanbao startup failed: "
-                "YUANBAO_APP_KEY and YUANBAO_APP_SECRET are required"
+                "YUANBAO_APP_ID (or YUANBAO_APP_KEY) and YUANBAO_APP_SECRET are required"
             )
             self._set_fatal_error("yuanbao_missing_credentials", msg, retryable=False)
             logger.error("[%s] %s", self.name, msg)
@@ -386,6 +404,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
             self._mark_connected()
+            self._loop = asyncio.get_running_loop()
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
             )
@@ -397,11 +416,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 self.name, self._connect_id, self._bot_id,
             )
 
-            try:
-                from tools.yuanbao_tools import set_adapter
-                set_adapter(self)
-            except Exception as exc:
-                logger.warning("[%s] Failed to inject yuanbao_tools adapter: %s", self.name, exc)
+            global _active_adapter
+            _active_adapter = self
 
             return True
 
@@ -416,6 +432,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Cancel background tasks and close the WebSocket connection."""
+        global _active_adapter
+        if _active_adapter is self:
+            _active_adapter = None
+
         self._running = False
         self._mark_disconnected()
 
@@ -1639,6 +1659,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         - TIMFileElem      → "[文件: {filename}]"
         - TIMSoundElem     → "[语音]"
         - TIMVideoFileElem → "[视频]"
+        - TIMFaceElem      → "[表情: {name}]" 或 "[表情]"
         - TIMCustomElem    → 尝试提取 data 字段，否则 "[自定义消息]"
         - 多个 elem 用空格拼接
         """
@@ -1663,6 +1684,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
             elif elem_type == "TIMCustomElem":
                 data_val = content.get("data", "")
                 parts.append(data_val if data_val else "[自定义消息]")
+            elif elem_type == "TIMFaceElem":
+                # 贴纸/表情：从 data JSON 中提取 name
+                raw_data = content.get("data", "")
+                face_name = ""
+                if raw_data:
+                    try:
+                        face_data = json.loads(raw_data)
+                        face_name = (face_data.get("name") or "").strip()
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+                parts.append(f"[表情: {face_name}]" if face_name else "[表情]")
             elif elem_type:
                 # Unknown element type — include type as placeholder
                 parts.append(f"[{elem_type}]")
