@@ -192,8 +192,16 @@ class InboundContext:
     # Source built by BuildSourceMiddleware
     source: Optional[Any] = None  # SessionSource
 
-    # Final event fields (populated by DispatchMiddleware)
+    # Populated by ClassifyMessageTypeMiddleware
     msg_type: Optional[Any] = None  # MessageType
+
+    # Populated by QuoteContextMiddleware
+    reply_to_message_id: Optional[str] = None
+    reply_to_text: Optional[str] = None
+
+    # Populated by MediaResolveMiddleware
+    media_urls: list = dc_field(default_factory=list)
+    media_types: list = dc_field(default_factory=list)
 
 
 class InboundMiddleware(ABC):
@@ -492,8 +500,15 @@ class SkipSelfMiddleware(InboundMiddleware):
 
     name = "skip-self"
 
+    @staticmethod
+    def _is_self_reference(from_account: str, bot_id: Optional[str]) -> bool:
+        """Detect whether the message is from the bot itself."""
+        if not from_account or not bot_id:
+            return False
+        return from_account == bot_id
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        if YuanbaoAdapter._is_self_reference(ctx.from_account, ctx.adapter._bot_id):
+        if self._is_self_reference(ctx.from_account, ctx.adapter._bot_id):
             logger.debug("[%s] Ignoring self-sent message from %s", ctx.adapter.name, ctx.from_account)
             return  # Stop pipeline
         await next_fn()
@@ -516,6 +531,51 @@ class ChatRoutingMiddleware(InboundMiddleware):
         await next_fn()
 
 
+class AccessPolicy:
+    """Platform-level DM / Group access control policy.
+
+    Encapsulates the allow/deny logic so that both inbound middleware
+    and outbound ``send_dm`` can share the same rules without reaching
+    into adapter internals.
+    """
+
+    def __init__(
+        self,
+        dm_policy: str,
+        dm_allow_from: list[str],
+        group_policy: str,
+        group_allow_from: list[str],
+    ) -> None:
+        self._dm_policy = dm_policy
+        self._dm_allow_from = dm_allow_from
+        self._group_policy = group_policy
+        self._group_allow_from = group_allow_from
+
+    def is_dm_allowed(self, sender_id: str) -> bool:
+        """Platform-level DM inbound filter (open / allowlist / disabled)."""
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return sender_id.strip() in self._dm_allow_from
+        return True
+
+    def is_group_allowed(self, group_code: str) -> bool:
+        """Platform-level group chat inbound filter (open / allowlist / disabled)."""
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "allowlist":
+            return group_code.strip() in self._group_allow_from
+        return True
+
+    @property
+    def dm_policy(self) -> str:
+        return self._dm_policy
+
+    @property
+    def group_policy(self) -> str:
+        return self._group_policy
+
+
 class AccessGuardMiddleware(InboundMiddleware):
     """Platform-level DM/Group access control filter."""
 
@@ -523,18 +583,19 @@ class AccessGuardMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
+        policy: AccessPolicy = adapter._access_policy
         if ctx.chat_type == "dm":
-            if not adapter._is_dm_allowed(ctx.from_account):
+            if not policy.is_dm_allowed(ctx.from_account):
                 logger.debug(
                     "[%s] DM from %s blocked by dm_policy=%s",
-                    adapter.name, ctx.from_account, adapter._dm_policy,
+                    adapter.name, ctx.from_account, policy.dm_policy,
                 )
                 return  # Stop pipeline
         elif ctx.chat_type == "group":
-            if not adapter._is_group_allowed(ctx.group_code):
+            if not policy.is_group_allowed(ctx.group_code):
                 logger.debug(
                     "[%s] Group %s blocked by group_policy=%s",
-                    adapter.name, ctx.group_code, adapter._group_policy,
+                    adapter.name, ctx.group_code, policy.group_policy,
                 )
                 return  # Stop pipeline
         await next_fn()
@@ -545,10 +606,125 @@ class ExtractContentMiddleware(InboundMiddleware):
 
     name = "extract-content"
 
+    @staticmethod
+    def _extract_text(msg_body: list) -> str:
+        """Extract plain text content from MsgBody.
+
+        - TIMTextElem      -> text field
+        - TIMImageElem     -> "[image]"
+        - TIMFileElem      -> "[file: {filename}]"
+        - TIMSoundElem     -> "[voice]"
+        - TIMVideoFileElem -> "[video]"
+        - TIMFaceElem      -> "[emoji: {name}]" or "[emoji]"
+        - TIMCustomElem    -> try to extract data field, otherwise "[custom message]"
+        - Multiple elems joined with spaces
+        """
+        parts: list[str] = []
+        for elem in msg_body:
+            elem_type: str = elem.get("msg_type", "")
+            content: dict = elem.get("msg_content", {})
+
+            if elem_type == "TIMTextElem":
+                text = content.get("text", "")
+                if text:
+                    parts.append(text)
+            elif elem_type == "TIMImageElem":
+                parts.append("[image]")
+            elif elem_type == "TIMFileElem":
+                filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
+                parts.append(f"[file: {filename}]" if filename else "[file]")
+            elif elem_type == "TIMSoundElem":
+                parts.append("[voice]")
+            elif elem_type == "TIMVideoFileElem":
+                parts.append("[video]")
+            elif elem_type == "TIMCustomElem":
+                data_val = content.get("data", "")
+                if data_val:
+                    try:
+                        custom = json.loads(data_val)
+                        if isinstance(custom, dict) and custom.get("elem_type") == 1002:
+                            parts.append(custom.get("text", "[mention]"))
+                        else:
+                            parts.append("[unsupported message type]")
+                    except (json.JSONDecodeError, TypeError):
+                        parts.append(data_val)
+                else:
+                    parts.append("[unsupported message type]")
+            elif elem_type == "TIMFaceElem":
+                # Sticker/emoji: extract name from data JSON
+                raw_data = content.get("data", "")
+                face_name = ""
+                if raw_data:
+                    try:
+                        face_data = json.loads(raw_data)
+                        face_name = (face_data.get("name") or "").strip()
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+                parts.append(f"[emoji: {face_name}]" if face_name else "[emoji]")
+            elif elem_type:
+                # Unknown element type — include type as placeholder
+                parts.append(f"[{elem_type}]")
+
+        return " ".join(parts) if parts else ""
+
+    @staticmethod
+    def _rewrite_slash_command(text: str) -> str:
+        """Normalize input text: strip whitespace and convert full-width slash
+        (Chinese input method) to ASCII slash so commands are recognized correctly.
+        """
+        text = text.strip()
+        if text.startswith('\uff0f'):  # Full-width slash
+            text = '/' + text[1:]
+        return text
+
+    @staticmethod
+    def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
+        """Extract inbound image/file references from TIM msg_body.
+
+        Return example:
+          [{"kind": "image", "url": "https://..."}, {"kind": "file", "url": "...", "name": "a.pdf"}]
+        """
+        refs: List[Dict[str, str]] = []
+        for elem in msg_body or []:
+            if not isinstance(elem, dict):
+                continue
+            msg_type = elem.get("msg_type", "")
+            content = elem.get("msg_content", {}) or {}
+            if not isinstance(content, dict):
+                continue
+
+            if msg_type == "TIMImageElem":
+                # Prefer medium image (index 1), fallback to index 0.
+                image_info_array = content.get("image_info_array")
+                if not isinstance(image_info_array, list):
+                    image_info_array = []
+                image_info = None
+                if len(image_info_array) > 1 and isinstance(image_info_array[1], dict):
+                    image_info = image_info_array[1]
+                elif len(image_info_array) > 0 and isinstance(image_info_array[0], dict):
+                    image_info = image_info_array[0]
+                image_url = str((image_info or {}).get("url") or "").strip()
+                if image_url:
+                    refs.append({"kind": "image", "url": image_url})
+                continue
+
+            if msg_type == "TIMFileElem":
+                file_url = str(content.get("url") or "").strip()
+                file_name = (
+                    str(content.get("file_name") or "").strip()
+                    or str(content.get("fileName") or "").strip()
+                    or str(content.get("filename") or "").strip()
+                )
+                if file_url:
+                    ref: Dict[str, str] = {"kind": "file", "url": file_url}
+                    if file_name:
+                        ref["name"] = file_name
+                    refs.append(ref)
+        return refs
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        adapter = ctx.adapter
-        ctx.raw_text = adapter._rewrite_slash_command(adapter._extract_text(ctx.msg_body))
-        ctx.media_refs = adapter._extract_inbound_media_refs(ctx.msg_body)
+        ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
+        ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         await next_fn()
 
 
@@ -557,29 +733,104 @@ class PlaceholderFilterMiddleware(InboundMiddleware):
 
     name = "placeholder-filter"
 
+    SKIPPABLE_PLACEHOLDERS: frozenset = frozenset({
+        "[image]", "[图片]", "[file]", "[文件]",
+        "[video]", "[视频]", "[voice]", "[语音]",
+    })
+
+    @classmethod
+    def is_skippable_placeholder(cls, text: str, media_count: int = 0) -> bool:
+        """Detect whether the message is a pure placeholder (should be skipped)."""
+        if media_count > 0:
+            return False
+        stripped = text.strip()
+        return stripped in cls.SKIPPABLE_PLACEHOLDERS
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
-        if YuanbaoAdapter._is_skippable_placeholder(ctx.raw_text, len(ctx.media_refs)):
+        if self.is_skippable_placeholder(ctx.raw_text, len(ctx.media_refs)):
             logger.debug("[%s] Skipping placeholder message: %r", ctx.adapter.name, ctx.raw_text)
             return  # Stop pipeline
         await next_fn()
 
 
 class OwnerCommandMiddleware(InboundMiddleware):
-    """Detect bot-owner slash commands in group chat."""
+    """Detect bot-owner slash commands in group chat.
+
+    Identifies in-group allowlisted slash commands and determines sender identity.
+    Owner commands skip @Bot detection; non-owner attempts are rejected.
+    """
 
     name = "owner-command"
 
+    # Slash command allowlist that bot owner can execute in group without @Bot
+    ALLOWLIST: frozenset = frozenset({
+        "/new", "/reset", "/retry", "/undo", "/stop",
+        "/approve", "/deny", "/background", "/bg",
+        "/btw", "/queue", "/q",
+    })
+
+    @staticmethod
+    def _rewrite_slash_command(text: str) -> str:
+        """Normalize full-width slash to ASCII slash and strip whitespace."""
+        text = text.strip()
+        if text.startswith('\uff0f'):  # Full-width slash
+            text = '/' + text[1:]
+        return text
+
+    @classmethod
+    def _detect_owner_command(
+        cls,
+        *,
+        push: dict,
+        msg_body: list,
+        chat_type: str,
+        from_account: str,
+    ) -> Tuple[Optional[str], Optional[str], bool]:
+        """Identify allowlisted slash commands and determine sender identity.
+
+        Returns (cmd, cmd_line, is_owner):
+          - (None, None, False): Not an allowlisted command
+          - (cmd, cmd_line, True): Owner match
+          - (cmd, cmd_line, False): Allowlisted command but sender is not owner
+        """
+        if chat_type != "group" or not cls.ALLOWLIST:
+            return None, None, False
+
+        # Extract TIMTextElem: only do command recognition with exactly one text segment
+        text_elems = [
+            e for e in (msg_body or [])
+            if e.get("msg_type") == "TIMTextElem"
+        ]
+        if len(text_elems) != 1:
+            return None, None, False
+
+        text = (text_elems[0].get("msg_content") or {}).get("text", "")
+        cmd_line = cls._rewrite_slash_command(text)
+        if not cmd_line.startswith("/"):
+            return None, None, False
+        cmd = cmd_line.split(maxsplit=1)[0].lower()
+        if cmd not in cls.ALLOWLIST:
+            return None, None, False
+
+        # Sender identity check: bot owner <-> push.from_account == push.bot_owner_id
+        owner_id = (push or {}).get("bot_owner_id") or ""
+        is_owner = bool(owner_id) and owner_id == from_account
+        return cmd, cmd_line, is_owner
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
-        matched_cmd, cmd_line, is_owner = adapter._detect_owner_command(
+        matched_cmd, cmd_line, is_owner = self._detect_owner_command(
             push=ctx.push,
             msg_body=ctx.msg_body,
             chat_type=ctx.chat_type,
-            chat_id=ctx.chat_id,
             from_account=ctx.from_account,
         )
         if matched_cmd and not is_owner:
             # Non-owner tried an owner-only command — reject and stop
+            logger.info(
+                "[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s",
+                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
+            )
             adapter._track_task(asyncio.create_task(
                 adapter.send(ctx.chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
                 name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
@@ -587,6 +838,10 @@ class OwnerCommandMiddleware(InboundMiddleware):
             return  # Stop pipeline
 
         if matched_cmd and is_owner and cmd_line:
+            logger.info(
+                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
+                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
+            )
             ctx.owner_command = matched_cmd
             ctx.raw_text = cmd_line  # Override with clean command text
         await next_fn()
@@ -618,11 +873,60 @@ class GroupAtGuardMiddleware(InboundMiddleware):
 
     name = "group-at-guard"
 
+    @staticmethod
+    def _is_at_bot(msg_body: list, bot_id: Optional[str]) -> bool:
+        """Detect whether the message @Bot.
+
+        AT element format: TIMCustomElem, msg_content.data is a JSON string:
+            {"elem_type": 1002, "text": "@xxx", "user_id": "<botId>"}
+        Considered @Bot when elem_type == 1002 and user_id == bot_id.
+        """
+        if not bot_id:
+            return False
+        for elem in msg_body:
+            if elem.get("msg_type") != "TIMCustomElem":
+                continue
+            data_str = elem.get("msg_content", {}).get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if custom.get("elem_type") == 1002 and custom.get("user_id") == bot_id:
+                return True
+        return False
+
+    @staticmethod
+    def _observe_group_message(adapter, source, sender_display: str, text: str) -> None:
+        """Write a group message into the session transcript without triggering the agent.
+
+        This allows the model to see the full group conversation when it is
+        eventually invoked via @bot.
+        """
+        store = getattr(adapter, "_session_store", None)
+        if not store:
+            return
+        try:
+            session_entry = store.get_or_create_session(source)
+            attributed = f"[{sender_display}] {text}"
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": attributed,
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    "observed": True,
+                },
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to observe group message: %s", adapter.name, exc)
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
-        if ctx.chat_type == "group" and not ctx.owner_command and not adapter._is_at_bot(ctx.msg_body):
-            adapter._observe_group_message(
-                ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
+        if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
+            self._observe_group_message(
+                adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
             )
             logger.info(
                 "[%s] Group message observed (no @bot): chat=%s from=%s",
@@ -632,31 +936,229 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         await next_fn()
 
 
+class ClassifyMessageTypeMiddleware(InboundMiddleware):
+    """Determine MessageType from text content and msg_body elements."""
+
+    name = "classify-msg-type"
+
+    @staticmethod
+    def _classify(text: str, msg_body: list) -> MessageType:
+        """Classify message type based on text and msg_body."""
+        if text.startswith("/"):
+            return MessageType.COMMAND
+        for elem in msg_body:
+            etype = elem.get("msg_type", "")
+            if etype == "TIMImageElem":
+                return MessageType.PHOTO
+            if etype == "TIMSoundElem":
+                return MessageType.VOICE
+            if etype == "TIMVideoFileElem":
+                return MessageType.VIDEO
+            if etype == "TIMFileElem":
+                return MessageType.DOCUMENT
+        return MessageType.TEXT
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        ctx.msg_type = self._classify(ctx.raw_text, ctx.msg_body)
+        await next_fn()
+
+
+class QuoteContextMiddleware(InboundMiddleware):
+    """Extract quote/reply context from cloud_custom_data."""
+
+    name = "quote-context"
+
+    @staticmethod
+    def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract quote context, mapping to MessageEvent.reply_to_*.
+
+        Returns:
+          (reply_to_message_id, reply_to_text)
+        """
+        if not cloud_custom_data:
+            return None, None
+        try:
+            parsed = json.loads(cloud_custom_data)
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+
+        quote = parsed.get("quote") if isinstance(parsed, dict) else None
+        if not isinstance(quote, dict):
+            return None, None
+
+        # type=2 corresponds to image reference; desc may be empty, provide a placeholder.
+        quote_type = int(quote.get("type") or 0)
+        desc = str(quote.get("desc") or "").strip()
+        if quote_type == 2 and not desc:
+            desc = "[image]"
+        if not desc:
+            return None, None
+
+        quote_id = str(quote.get("id") or "").strip() or None
+        sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
+        quote_text = f"{sender}: {desc}" if sender else desc
+        return quote_id, quote_text
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        ctx.reply_to_message_id, ctx.reply_to_text = self._extract_quote_context(ctx.cloud_custom_data)
+        await next_fn()
+
+
+class MediaResolveMiddleware(InboundMiddleware):
+    """Resolve inbound media references to downloadable URLs."""
+
+    name = "media-resolve"
+
+    @staticmethod
+    def _guess_image_ext_from_url(url: str) -> str:
+        """Guess image extension from URL path."""
+        path = urllib.parse.urlparse(url).path
+        ext = os.path.splitext(path)[1].lower()
+        if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}:
+            return ext
+        return ".jpg"
+
+    @staticmethod
+    async def _resolve_download_url(adapter, url: str) -> str:
+        """Resolve Yuanbao resource placeholder to a directly fetchable real URL.
+
+        Common URL patterns:
+          https://hunyuan.tencent.com/api/resource/download?resourceId=...
+        Direct GET returns 401; need business API:
+          GET /api/resource/v1/download?resourceId=...
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return url
+
+        query = urllib.parse.parse_qs(parsed.query)
+        resource_ids = query.get("resourceId") or query.get("resourceid") or []
+        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
+        if not resource_id:
+            return url
+
+        token_data = await adapter._get_cached_token()
+        token = str(token_data.get("token") or "").strip()
+        source = str(token_data.get("source") or "web").strip() or "web"
+        bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
+        if not token or not bot_id:
+            return url
+
+        api_url = f"{adapter._api_domain}/api/resource/v1/download"
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-ID": bot_id,
+            "X-Token": token,
+            "X-Source": source,
+        }
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            for attempt in range(2):
+                resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
+                if resp.status_code == 401 and attempt == 0:
+                    # Force refresh token once on expiry and retry
+                    token_data = await SignManager.force_refresh(
+                        adapter._app_key, adapter._app_secret, adapter._api_domain,
+                    )
+                    token = str(token_data.get("token") or "").strip()
+                    source = str(token_data.get("source") or source or "web").strip() or "web"
+                    bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
+                    if not token or not bot_id:
+                        break
+                    headers["X-ID"] = bot_id
+                    headers["X-Token"] = token
+                    headers["X-Source"] = source
+                    continue
+
+                resp.raise_for_status()
+                payload = resp.json()
+                code = payload.get("code")
+                if code not in (None, 0):
+                    raise RuntimeError(
+                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
+                    )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
+                if real_url:
+                    return real_url
+                raise RuntimeError("resource/v1/download missing url/realUrl")
+
+        return url
+
+    @classmethod
+    async def _resolve_media_urls(
+        cls, adapter, media_refs: List[Dict[str, str]]
+    ) -> Tuple[List[str], List[str]]:
+        """Parse inbound image/file URLs, return (media_urls, media_types)."""
+        media_urls: List[str] = []
+        media_types: List[str] = []
+
+        for ref in media_refs:
+            kind = str(ref.get("kind") or "").strip().lower()
+            url = str(ref.get("url") or "").strip()
+            if kind not in {"image", "file"} or not url:
+                continue
+
+            try:
+                fetch_url = await cls._resolve_download_url(adapter, url)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] inbound media resolve failed: kind=%s url=%s err=%s",
+                    adapter.name, kind, url, exc,
+                )
+                continue
+
+            # Infer MIME by resource type
+            if kind == "image":
+                ext = cls._guess_image_ext_from_url(fetch_url)
+                mime = guess_mime_type(f"image{ext}")
+                if not mime.startswith("image/"):
+                    mime = "image/jpeg"
+                media_urls.append(fetch_url)
+                media_types.append(mime)
+                continue
+
+            file_name = str(ref.get("name") or "").strip()
+            if not file_name:
+                parsed = urllib.parse.urlparse(fetch_url)
+                file_name = os.path.basename(parsed.path) or "file"
+            mime = guess_mime_type(file_name) or "application/octet-stream"
+            media_urls.append(fetch_url)
+            media_types.append(mime)
+
+        return media_urls, media_types
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        adapter = ctx.adapter
+        ctx.media_urls, ctx.media_types = await self._resolve_media_urls(adapter, ctx.media_refs)
+        # Re-check placeholder after media resolution
+        if PlaceholderFilterMiddleware.is_skippable_placeholder(ctx.raw_text, len(ctx.media_urls)):
+            logger.debug("[%s] Skip placeholder after media download: %r", adapter.name, ctx.raw_text)
+            return  # Stop pipeline
+        await next_fn()
+
+
 class DispatchMiddleware(InboundMiddleware):
-    """Classify message type, resolve media, build event, dispatch to AI."""
+    """Build MessageEvent and dispatch to AI handler."""
 
     name = "dispatch"
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
-        ctx.msg_type = adapter._classify_message_type(ctx.raw_text, ctx.msg_body)
 
         async def _dispatch_inbound_event() -> None:
-            media_urls, media_types = await adapter._resolve_inbound_media_urls(ctx.media_refs)
-            if adapter._is_skippable_placeholder(ctx.raw_text, len(media_urls)):
-                logger.debug("[%s] Skip placeholder after media download: %r", adapter.name, ctx.raw_text)
-                return
-            reply_to_message_id, reply_to_text = adapter._extract_quote_context(ctx.cloud_custom_data)
             event = MessageEvent(
                 text=ctx.raw_text,
                 message_type=ctx.msg_type,
                 source=ctx.source,
                 message_id=ctx.msg_id or None,
                 raw_message=ctx.push,
-                media_urls=media_urls,
-                media_types=media_types,
-                reply_to_message_id=reply_to_message_id,
-                reply_to_text=reply_to_text,
+                media_urls=ctx.media_urls,
+                media_types=ctx.media_types,
+                reply_to_message_id=ctx.reply_to_message_id,
+                reply_to_text=ctx.reply_to_text,
             )
             await adapter.handle_message(event)
 
@@ -690,6 +1192,9 @@ class InboundPipelineBuilder:
         OwnerCommandMiddleware,
         BuildSourceMiddleware,
         GroupAtGuardMiddleware,
+        ClassifyMessageTypeMiddleware,
+        QuoteContextMiddleware,
+        MediaResolveMiddleware,
         DispatchMiddleware,
     ]
 
@@ -1121,13 +1626,30 @@ class ConnectionManager:
                     "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
                     a.name, cmd, len(data),
                 )
-                a._push_to_inbound(data)
+                self._push_to_inbound(data)
             return
 
         logger.debug(
             "[%s] Ignoring frame: cmd_type=%d cmd=%s msg_id=%s",
             a.name, cmd_type, cmd, msg_id,
         )
+
+    # -- Inbound dispatch ---------------------------------------------------
+
+    def _push_to_inbound(self, conn_data: bytes) -> None:
+        """Convert push frame to MessageEvent and dispatch to AI via pipeline.
+
+        Bridges the WS receive loop with the inbound middleware pipeline.
+        conn_data in Yuanbao scenario has only two forms:
+          - JSON string: callback_command format inbound message (mainstream)
+          - Protobuf binary: InboundMessagePush
+        """
+        a = self._adapter
+        ctx = InboundContext(adapter=a, conn_data=conn_data)
+        a._track_task(asyncio.create_task(
+            a._inbound_pipeline.execute(ctx),
+            name=f"yuanbao-pipeline-{id(conn_data)}",
+        ))
 
     # -- Send business request ---------------------------------------------
 
@@ -1308,12 +1830,12 @@ class MediaSendHandler(ABC):
     ) -> "SendResult":
         """Template method: shared media send flow."""
         conn = adapter._connection
-        outbound = adapter._outbound
+        sender = adapter._outbound.sender
 
         if conn.ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
-        outbound.cancel_slow_response_notifier(chat_id)
+        adapter._outbound.cancel_slow_notifier(chat_id)
 
         try:
             # 1. Acquire file bytes
@@ -1322,7 +1844,7 @@ class MediaSendHandler(ABC):
             )
 
             # 2. Validate
-            validation_err = adapter._validate_media_before_queue(
+            validation_err = MessageSender.validate_media(
                 file_bytes, filename, adapter.MEDIA_MAX_SIZE_MB,
             )
             if validation_err:
@@ -1376,7 +1898,7 @@ class MediaSendHandler(ABC):
                 )
 
             # 7. Lock + dispatch
-            return await outbound.dispatch_msg_body(chat_id, msg_body, reply_to)
+            return await sender.dispatch_msg_body(chat_id, msg_body, reply_to)
 
         except ValueError as ve:
             return SendResult(success=False, error=str(ve))
@@ -1524,24 +2046,319 @@ class StickerHandler(MediaSendHandler):
 
 
 # ============================================================
-# OutboundManager — outbound message sending (text / media / heartbeat)
+# Outbound — message sending, heartbeat, slow-response notification
 # ============================================================
 
-class OutboundManager:
-    """Manages all outbound message sending for YuanbaoAdapter.
+class GroupQueryService:
+    """Encapsulates AI-tool-facing group query operations.
+
+    Delegates low-level WS calls to the adapter's ``query_group_info`` and
+    ``get_group_member_list`` methods, adding chat_id parsing, error
+    wrapping and result filtering.
+    """
+
+    def __init__(self, adapter: "YuanbaoAdapter") -> None:
+        self._adapter = adapter
+
+    async def query_group_info(self, chat_id: str) -> dict:
+        """AI tool: Query current group info.
+
+        No parameters needed (group_code extracted from session context).
+        Returns group name, owner, member count, etc.
+        """
+        if not chat_id.startswith("group:"):
+            return {"error": "This command is only available in group chats"}
+        group_code = chat_id[len("group:"):]
+        result = await self._adapter.query_group_info(group_code)
+        if result is None:
+            return {"error": "Failed to query group info"}
+        return result
+
+    async def query_session_members(
+        self,
+        chat_id: str,
+        action: str = "list_all",
+        name: Optional[str] = None,
+    ) -> dict:
+        """AI tool: Query group member list.
+
+        Args:
+            chat_id: Chat ID (extracted from session context)
+            action: 'find' (search by name) | 'list_bots' (list bots) | 'list_all' (list all)
+            name: Search keyword when action='find'
+
+        Returns:
+            {"members": [...], "total": int, "mentionHint": str}
+        """
+        if not chat_id.startswith("group:"):
+            return {"error": "This command is only available in group chats"}
+        group_code = chat_id[len("group:"):]
+        result = await self._adapter.get_group_member_list(group_code)
+        if result is None:
+            return {"error": "Failed to query group members"}
+
+        members = result.get("members", [])
+
+        if action == "find" and name:
+            query = name.lower()
+            members = [
+                m for m in members
+                if query in (m.get("nickname", "") or "").lower()
+                or query in (m.get("name_card", "") or "").lower()
+                or query in (m.get("user_id", "") or "").lower()
+            ]
+        elif action == "list_bots":
+            members = [m for m in members if "bot" in (m.get("nickname", "") or "").lower()]
+
+        # Construct mentionHint
+        mention_hint = ""
+        if members and len(members) <= 10:
+            names = [m.get("name_card") or m.get("nickname") or m.get("user_id", "") for m in members]
+            mention_hint = "Mention with @name: " + ", ".join(names)
+
+        return {
+            "members": members[:50],  # Limit return count
+            "total": len(members),
+            "mentionHint": mention_hint,
+        }
+
+
+class HeartbeatManager:
+    """Manages reply heartbeat (RUNNING / FINISH) lifecycle.
+
+    Responsibilities:
+      - Periodic RUNNING heartbeat sender (every 2s)
+      - Auto-FINISH after 30s inactivity
+      - Explicit stop with optional FINISH signal
+    """
+
+    def __init__(self, adapter: "YuanbaoAdapter") -> None:
+        self._adapter = adapter
+        self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
+        self._reply_hb_last_active: Dict[str, float] = {}
+
+    async def send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
+        """Send a single heartbeat (RUNNING or FINISH), best effort."""
+        a = self._adapter
+        conn = a._connection
+        if conn.ws is None or not a._bot_id:
+            return
+        try:
+            if chat_id.startswith("group:"):
+                group_code = chat_id[len("group:"):]
+                encoded = encode_send_group_heartbeat(
+                    from_account=a._bot_id,
+                    group_code=group_code,
+                    heartbeat=heartbeat_val,
+                )
+            else:
+                to_account = chat_id.removeprefix("direct:")
+                encoded = encode_send_private_heartbeat(
+                    from_account=a._bot_id,
+                    to_account=to_account,
+                    heartbeat=heartbeat_val,
+                )
+            await conn.ws.send(encoded)
+            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
+            logger.debug(
+                "[%s] Reply heartbeat %s sent: chat=%s",
+                a.name, status_name, chat_id,
+            )
+        except Exception as exc:
+            logger.debug("[%s] send_heartbeat_once failed: %s", a.name, exc)
+
+    async def start(self, chat_id: str) -> None:
+        """Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s)."""
+        a = self._adapter
+        conn = a._connection
+        if conn.ws is None or not a._bot_id:
+            return
+
+        existing = self._reply_heartbeat_tasks.get(chat_id)
+        if existing and not existing.done():
+            self._reply_hb_last_active[chat_id] = time.time()
+            return
+
+        self._reply_hb_last_active[chat_id] = time.time()
+
+        task = asyncio.create_task(
+            self._worker(chat_id),
+            name=f"yuanbao-reply-hb-{chat_id}",
+        )
+        self._reply_heartbeat_tasks[chat_id] = task
+
+    async def _worker(self, chat_id: str) -> None:
+        """Background coroutine: send RUNNING heartbeat every 2s.
+        30s without renewal -> send FINISH and exit.
+        """
+        try:
+            await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
+
+            while True:
+                await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
+
+                last_active = self._reply_hb_last_active.get(chat_id, 0)
+                if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
+                    break
+
+                conn = self._adapter._connection
+                if conn.ws is None:
+                    break
+
+                await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
+
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            cancelled = False
+        else:
+            cancelled = False
+        finally:
+            if not cancelled:
+                try:
+                    await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+                except Exception:
+                    pass
+            self._reply_heartbeat_tasks.pop(chat_id, None)
+            self._reply_hb_last_active.pop(chat_id, None)
+
+    async def stop(self, chat_id: str, send_finish: bool = True) -> None:
+        """Stop Reply Heartbeat and optionally send FINISH."""
+        task = self._reply_heartbeat_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if send_finish:
+            try:
+                await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+            except Exception:
+                pass
+
+    async def close(self) -> None:
+        """Cancel all reply heartbeat tasks."""
+        for task in list(self._reply_heartbeat_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._reply_heartbeat_tasks.clear()
+        self._reply_hb_last_active.clear()
+
+
+class SlowResponseNotifier:
+    """Manages delayed 'please wait' notifications for slow agent responses.
+
+    Starts a timer per chat_id; if the agent hasn't replied within
+    SLOW_RESPONSE_TIMEOUT_S seconds, sends a courtesy message.
+    """
+
+    def __init__(self, adapter: "YuanbaoAdapter", sender: "MessageSender") -> None:
+        self._adapter = adapter
+        self._sender = sender
+        self._tasks: Dict[str, asyncio.Task] = {}
+
+    async def start(self, chat_id: str) -> None:
+        """Start a delayed task that notifies the user when the agent is slow."""
+        self.cancel(chat_id)
+        task = asyncio.create_task(
+            self._notifier(chat_id),
+            name=f"yuanbao-slow-resp-{chat_id}",
+        )
+        self._tasks[chat_id] = task
+
+    async def _notifier(self, chat_id: str) -> None:
+        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
+        try:
+            await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
+            logger.info(
+                "[%s] Agent response exceeded %ds for %s, sending wait notice",
+                self._adapter.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
+            )
+            await self._sender.send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("[%s] Slow-response notifier failed: %s", self._adapter.name, exc)
+
+    def cancel(self, chat_id: str) -> None:
+        """Cancel the pending slow-response notifier for *chat_id*, if any."""
+        task = self._tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def close(self) -> None:
+        """Cancel all slow-response tasks."""
+        for task in list(self._tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+
+
+class MessageSender:
+    """Core message sending dispatcher for YuanbaoAdapter.
 
     Responsibilities:
       - Per-chat-id lock management (serial send ordering)
       - Text chunk sending with retry
       - C2C / Group message encoding and dispatch
-      - Reply heartbeat (RUNNING / FINISH) signals
-      - Slow-response notifier
       - Media send helpers (image, file, sticker, document)
       - Direct send helper (text + media, used by send_message tool)
     """
 
     IMAGE_EXTS: ClassVar[frozenset] = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
     CHAT_DICT_MAX_SIZE: ClassVar[int] = 1000  # Max distinct chat IDs in _chat_locks
+
+    # -- Media validation ---------------------------------------------------
+
+    @staticmethod
+    def validate_media(
+        file_bytes: Optional[bytes], filename: str, max_size_mb: int = 20
+    ) -> Optional[str]:
+        """Media pre-validation: check file validity before sending/uploading.
+
+        Returns:
+            Error description (str) if validation fails, otherwise None.
+        """
+        if file_bytes is None or len(file_bytes) == 0:
+            return f"Empty file: {filename}"
+        max_bytes = max_size_mb * 1024 * 1024
+        if len(file_bytes) > max_bytes:
+            size_mb = len(file_bytes) / 1024 / 1024
+            return f"File too large: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
+        return None
+
+    # -- Text truncation (table-aware) --------------------------------------
+
+    @staticmethod
+    def truncate_message(
+        content: str,
+        max_length: int = 4000,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> List[str]:
+        """
+        Split a long message into chunks with table-awareness.
+
+        Delegates core splitting to ``MarkdownProcessor.chunk_markdown_text``
+        and strips page indicators like ``(1/3)`` from the output.
+
+        Falls back to ``BasePlatformAdapter.truncate_message`` for non-table
+        content and for overall text that fits in a single chunk.
+        """
+        _len = len_fn or len
+        if _len(content) <= max_length:
+            return [content]
+
+        # Delegate to MarkdownProcessor for table/fence-aware chunking
+        chunks = MarkdownProcessor.chunk_markdown_text(
+            content, max_length, len_fn=len_fn,
+        )
+
+        # Strip page indicators like (1/3) that BasePlatformAdapter may add
+        _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
+        chunks = [_INDICATOR_RE.sub('', c) for c in chunks]
+
+        return chunks if chunks else [content]
 
     # -- Cron wrapper stripping ---------------------------------------------
 
@@ -1570,12 +2387,9 @@ class OutboundManager:
         self._adapter = adapter
         self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
 
-        # Reply Heartbeat state: chat_id -> asyncio.Task (the periodic sender)
-        self._reply_heartbeat_tasks: Dict[str, asyncio.Task] = {}
-        self._reply_hb_last_active: Dict[str, float] = {}
-
-        # Slow-response notifier: chat_id -> asyncio.Task
-        self._slow_response_tasks: Dict[str, asyncio.Task] = {}
+        # Optional hooks injected by OutboundManager for coordination
+        self._on_send_start: Optional[Callable[[str], Any]] = None   # cancel slow-notifier
+        self._on_send_finish: Optional[Callable[[str], Any]] = None  # send FINISH heartbeat
 
         # Media send handlers (strategy pattern)
         self._media_handlers: Dict[str, MediaSendHandler] = {
@@ -1665,12 +2479,13 @@ class OutboundManager:
         if conn.ws is None:
             return SendResult(success=False, error="Not connected", retryable=True)
 
-        self.cancel_slow_response_notifier(chat_id)
+        if self._on_send_start:
+            self._on_send_start(chat_id)
 
         lock = self.get_chat_lock(chat_id)
         async with lock:
             content_to_send = self.strip_cron_wrapper(content)
-            chunks = a.truncate_message(content_to_send, a.MAX_TEXT_CHUNK)
+            chunks = self.truncate_message(content_to_send, a.MAX_TEXT_CHUNK)
             logger.info(
                 "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
                 a.name, len(content_to_send), a.MAX_TEXT_CHUNK,
@@ -1682,11 +2497,12 @@ class OutboundManager:
                 if not result.success:
                     return result
 
-        # Send FINISH heartbeat after message delivery
-        try:
-            await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-        except Exception:
-            pass
+        # Notify outbound coordinator that send is complete (e.g. FINISH heartbeat)
+        if self._on_send_finish:
+            try:
+                await self._on_send_finish(chat_id)
+            except Exception:
+                pass
         return SendResult(success=True)
 
     async def send_text_chunk(
@@ -1736,22 +2552,58 @@ class OutboundManager:
 
     async def send_c2c_message(self, to_account: str, text: str) -> dict:
         """Send C2C text message, return {success: bool, msg_key: str}."""
-        a = self._adapter
         msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
-        req_id = f"c2c_{next_seq_no()}"
-        encoded = encode_send_c2c_message(
-            to_account=to_account,
-            msg_body=msg_body,
-            from_account=a._bot_id or "",
-            msg_id=req_id,
-        )
-        try:
-            response = await a._connection.send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        return await self.send_c2c_msg_body(to_account, msg_body)
+
+    # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
+    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
+
+    def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
+        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
+        members = self._adapter._member_cache.get(group_code, [])
+        if not members:
+            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+
+        nickname_to_uid = {}
+        for m in members:
+            nick = m.get("nickname") or m.get("nick_name") or ""
+            uid = m.get("user_id") or ""
+            if nick and uid:
+                nickname_to_uid[nick.lower()] = (nick, uid)
+
+        msg_body: list = []
+        last_idx = 0
+        for match in self._AT_USER_RE.finditer(text):
+            start = match.start()
+            if start > last_idx:
+                seg = text[last_idx:start].strip()
+                if seg:
+                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
+
+            nickname = match.group(1)
+            entry = nickname_to_uid.get(nickname.lower())
+            if entry:
+                real_nick, uid = entry
+                msg_body.append({
+                    "msg_type": "TIMCustomElem",
+                    "msg_content": {
+                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
+                    },
+                })
+            else:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
+
+            last_idx = match.end()
+
+        if last_idx < len(text):
+            tail = text[last_idx:].strip()
+            if tail:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
+
+        if not msg_body:
+            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
+
+        return msg_body
 
     async def send_group_message(
         self,
@@ -1760,23 +2612,8 @@ class OutboundManager:
         reply_to: Optional[str] = None,
     ) -> dict:
         """Send group text message, auto-converting @nickname to TIMCustomElem."""
-        a = self._adapter
-        msg_body = a._build_msg_body_with_mentions(text, group_code)
-        req_id = f"grp_{next_seq_no()}"
-        encoded = encode_send_group_message(
-            group_code=group_code,
-            msg_body=msg_body,
-            from_account=a._bot_id or "",
-            msg_id=req_id,
-            ref_msg_id=reply_to or "",
-        )
-        try:
-            response = await a._connection.send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        msg_body = self._build_msg_body_with_mentions(text, group_code)
+        return await self.send_group_msg_body(group_code, msg_body, reply_to)
 
     async def send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
         """Send C2C message with arbitrary MsgBody."""
@@ -1788,13 +2625,7 @@ class OutboundManager:
             from_account=a._bot_id or "",
             msg_id=req_id,
         )
-        try:
-            response = await a._connection.send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "Request timeout after 30.0s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        return await self._dispatch_encoded(a, encoded, req_id)
 
     async def send_group_msg_body(
         self,
@@ -1812,162 +2643,28 @@ class OutboundManager:
             msg_id=req_id,
             ref_msg_id=reply_to or "",
         )
+        return await self._dispatch_encoded(a, encoded, req_id)
+
+    # -- Common dispatch helper --------------------------------------------
+
+    @staticmethod
+    async def _dispatch_encoded(
+        adapter: "YuanbaoAdapter", encoded: bytes, req_id: str,
+    ) -> dict:
+        """Send pre-encoded bytes via WS and return a normalised result dict."""
         try:
-            response = await a._connection.send_biz_request(encoded, req_id=req_id)
+            response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
             return {"success": True, "msg_key": response.get("msg_id", "")}
         except asyncio.TimeoutError:
-            return {"success": False, "error": "Request timeout after 30.0s"}
+            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
-
-    # -- Heartbeat signals -------------------------------------------------
-
-    async def send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
-        """Send a single heartbeat (RUNNING or FINISH), best effort."""
-        a = self._adapter
-        conn = a._connection
-        if conn.ws is None or not a._bot_id:
-            return
-        try:
-            if chat_id.startswith("group:"):
-                group_code = chat_id[len("group:"):]
-                encoded = encode_send_group_heartbeat(
-                    from_account=a._bot_id,
-                    group_code=group_code,
-                    heartbeat=heartbeat_val,
-                )
-            else:
-                to_account = chat_id.removeprefix("direct:")
-                encoded = encode_send_private_heartbeat(
-                    from_account=a._bot_id,
-                    to_account=to_account,
-                    heartbeat=heartbeat_val,
-                )
-            await conn.ws.send(encoded)
-            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
-            logger.debug(
-                "[%s] Reply heartbeat %s sent: chat=%s",
-                a.name, status_name, chat_id,
-            )
-        except Exception as exc:
-            logger.debug("[%s] send_heartbeat_once failed: %s", a.name, exc)
-
-    # -- Reply heartbeat state machine -------------------------------------
-
-    async def start_reply_heartbeat(self, chat_id: str) -> None:
-        """Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s)."""
-        a = self._adapter
-        conn = a._connection
-        if conn.ws is None or not a._bot_id:
-            return
-
-        existing = self._reply_heartbeat_tasks.get(chat_id)
-        if existing and not existing.done():
-            self._reply_hb_last_active[chat_id] = time.time()
-            return
-
-        self._reply_hb_last_active[chat_id] = time.time()
-
-        task = asyncio.create_task(
-            self._reply_heartbeat_worker(chat_id),
-            name=f"yuanbao-reply-hb-{chat_id}",
-        )
-        self._reply_heartbeat_tasks[chat_id] = task
-
-    async def _reply_heartbeat_worker(self, chat_id: str) -> None:
-        """Background coroutine: send RUNNING heartbeat every 2s.
-        30s without renewal → send FINISH and exit.
-        """
-        try:
-            await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
-
-            while True:
-                await asyncio.sleep(REPLY_HEARTBEAT_INTERVAL_S)
-
-                last_active = self._reply_hb_last_active.get(chat_id, 0)
-                if time.time() - last_active > REPLY_HEARTBEAT_TIMEOUT_S:
-                    break
-
-                conn = self._adapter._connection
-                if conn.ws is None:
-                    break
-
-                await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_RUNNING)
-
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception:
-            cancelled = False
-        else:
-            cancelled = False
-        finally:
-            if not cancelled:
-                try:
-                    await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-                except Exception:
-                    pass
-            self._reply_heartbeat_tasks.pop(chat_id, None)
-            self._reply_hb_last_active.pop(chat_id, None)
-
-    async def stop_reply_heartbeat(self, chat_id: str, send_finish: bool = True) -> None:
-        """Stop Reply Heartbeat and optionally send FINISH."""
-        task = self._reply_heartbeat_tasks.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        if send_finish:
-            try:
-                await self.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
-            except Exception:
-                pass
-
-    # -- Slow-response notifier --------------------------------------------
-
-    async def start_slow_response_notifier(self, chat_id: str) -> None:
-        """Start a delayed task that notifies the user when the agent is slow."""
-        self.cancel_slow_response_notifier(chat_id)
-        task = asyncio.create_task(
-            self._slow_response_notifier(chat_id),
-            name=f"yuanbao-slow-resp-{chat_id}",
-        )
-        self._slow_response_tasks[chat_id] = task
-
-    async def _slow_response_notifier(self, chat_id: str) -> None:
-        """Wait SLOW_RESPONSE_TIMEOUT_S, then push a 'please wait' message."""
-        try:
-            await asyncio.sleep(SLOW_RESPONSE_TIMEOUT_S)
-            logger.info(
-                "[%s] Agent response exceeded %ds for %s, sending wait notice",
-                self._adapter.name, int(SLOW_RESPONSE_TIMEOUT_S), chat_id,
-            )
-            await self.send_text_chunk(chat_id, SLOW_RESPONSE_MESSAGE)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.debug("[%s] Slow-response notifier failed: %s", self._adapter.name, exc)
-
-    def cancel_slow_response_notifier(self, chat_id: str) -> None:
-        """Cancel the pending slow-response notifier for *chat_id*, if any."""
-        task = self._slow_response_tasks.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
 
     # -- Cleanup on disconnect ---------------------------------------------
 
     async def close(self) -> None:
-        """Cancel all reply heartbeat and slow-response tasks."""
-        for task in list(self._reply_heartbeat_tasks.values()):
-            if not task.done():
-                task.cancel()
-        self._reply_heartbeat_tasks.clear()
-
-        for task in list(self._slow_response_tasks.values()):
-            if not task.done():
-                task.cancel()
-        self._slow_response_tasks.clear()
+        """Release chat locks (no-op for now; placeholder for future cleanup)."""
+        self._chat_locks.clear()
 
     # -- Direct send (text + media, used by send_message tool) -------------
 
@@ -2015,16 +2712,107 @@ class OutboundManager:
         }
 
 
+class OutboundManager:
+    """Outbound coordinator that orchestrates sending, heartbeat and slow-response.
+
+    Composes:
+      - MessageSender   — core text/media sending
+      - HeartbeatManager — reply heartbeat (RUNNING / FINISH) lifecycle
+      - SlowResponseNotifier — delayed 'please wait' notifications
+
+    YuanbaoAdapter holds a single ``_outbound: OutboundManager`` and delegates
+    all outbound operations through it.
+    """
+
+    # Expose class-level constants from MessageSender for backward compatibility
+    CHAT_DICT_MAX_SIZE: ClassVar[int] = MessageSender.CHAT_DICT_MAX_SIZE
+
+    def __init__(self, adapter: "YuanbaoAdapter") -> None:
+        self._adapter = adapter
+        self.sender: MessageSender = MessageSender(adapter)
+        self.heartbeat: HeartbeatManager = HeartbeatManager(adapter)
+        self.slow_notifier: SlowResponseNotifier = SlowResponseNotifier(adapter, self.sender)
+
+        # Wire coordination hooks into MessageSender
+        self.sender._on_send_start = self._handle_send_start
+        self.sender._on_send_finish = self._handle_send_finish
+
+    # -- Coordination hooks ------------------------------------------------
+
+    def _handle_send_start(self, chat_id: str) -> None:
+        """Called by MessageSender before sending: cancel slow-response notifier."""
+        self.slow_notifier.cancel(chat_id)
+
+    async def _handle_send_finish(self, chat_id: str) -> None:
+        """Called by MessageSender after sending: send FINISH heartbeat."""
+        await self.heartbeat.send_heartbeat_once(chat_id, WS_HEARTBEAT_FINISH)
+
+    # -- Delegated public API (used by YuanbaoAdapter) ---------------------
+
+    async def send_text(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None,
+    ) -> "SendResult":
+        """Send text message with auto-chunking."""
+        return await self.sender.send_text(chat_id, content, reply_to)
+
+    async def send_media(
+        self, chat_id: str, handler_name: str, **kwargs: Any,
+    ) -> "SendResult":
+        """Dispatch media send to the named handler strategy."""
+        return await self.sender.send_media(chat_id, handler_name, **kwargs)
+
+    async def send_direct(
+        self, chat_id: str, message: str,
+        media_files: Optional[List[Tuple[str, bool]]] = None,
+    ) -> Dict[str, Any]:
+        """Send text + media (used by send_message tool)."""
+        return await self.sender.send_direct(chat_id, message, media_files)
+
+    async def start_typing(self, chat_id: str) -> None:
+        """Start reply heartbeat (RUNNING)."""
+        await self.heartbeat.start(chat_id)
+
+    async def stop_typing(self, chat_id: str, send_finish: bool = False) -> None:
+        """Stop reply heartbeat."""
+        await self.heartbeat.stop(chat_id, send_finish=send_finish)
+
+    async def start_slow_notifier(self, chat_id: str) -> None:
+        """Start slow-response notifier."""
+        await self.slow_notifier.start(chat_id)
+
+    def cancel_slow_notifier(self, chat_id: str) -> None:
+        """Cancel slow-response notifier."""
+        self.slow_notifier.cancel(chat_id)
+
+    def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        """Proxy to MessageSender.get_chat_lock for backward compatibility."""
+        return self.sender.get_chat_lock(chat_id)
+
+    @property
+    def _chat_locks(self) -> collections.OrderedDict:
+        """Proxy to MessageSender._chat_locks for backward compatibility."""
+        return self.sender._chat_locks
+
+    @staticmethod
+    def validate_media(
+        file_bytes: Optional[bytes], filename: str, max_size_mb: int = 20,
+    ) -> Optional[str]:
+        """Proxy to MessageSender.validate_media."""
+        return MessageSender.validate_media(file_bytes, filename, max_size_mb)
+
+    async def close(self) -> None:
+        """Shut down all sub-managers."""
+        await self.sender.close()
+        await self.heartbeat.close()
+        await self.slow_notifier.close()
+
+
 class YuanbaoAdapter(BasePlatformAdapter):
     """Yuanbao AI Bot adapter backed by a persistent WebSocket connection."""
 
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
     REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
-    SKIPPABLE_PLACEHOLDERS: ClassVar[frozenset] = frozenset({
-        "[image]", "[图片]", "[file]", "[文件]",
-        "[video]", "[视频]", "[voice]", "[语音]",
-    })
 
     # -- Active instance registry (class-level singleton) -------------------
 
@@ -2061,9 +2849,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Set of background tasks — prevent GC from collecting fire-and-forget tasks
         self._background_tasks: set[asyncio.Task] = set()
 
-        # Internal sequence counter (separate from proto-level next_seq_no)
-        self._seq: int = 0
-
         # Member cache: group_code -> [{"user_id":..., "nickname":..., ...}, ...]
         # Populated by get_group_member_list(), used by @mention resolution.
         self._member_cache: Dict[str, list] = {}
@@ -2072,19 +2857,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(ttl_seconds=300)
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
-        # Only the first outbound message carries refMsgId for a given inbound msg.
-        self._reply_ref_used: Dict[str, float] = {}
-
-        # replyToMode config: 'off' | 'first' | 'all' (default: 'first')
-        self._reply_to_mode: str = (
-            getattr(config, 'yuanbao_reply_to_mode', None)
-            or os.getenv("YUANBAO_REPLY_TO_MODE", "first")
-        ).strip().lower()
-
         # ------------------------------------------------------------------
-        # DM / Group access control policy (platform-level filter, aligned with wecom.py)
+        # Access control policy (DM / Group)
         # ------------------------------------------------------------------
-        self._dm_policy: str = (
+        dm_policy: str = (
             config.yuanbao_dm_policy
             or os.getenv("YUANBAO_DM_POLICY", "open")
         ).strip().lower()
@@ -2093,9 +2869,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
             config.yuanbao_dm_allow_from
             or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
         )
-        self._dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
+        dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
 
-        self._group_policy: str = (
+        group_policy: str = (
             config.yuanbao_group_policy
             or os.getenv("YUANBAO_GROUP_POLICY", "open")
         ).strip().lower()
@@ -2104,7 +2880,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
             config.yuanbao_group_allow_from
             or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
         )
-        self._group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
+        group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
+
+        self._access_policy = AccessPolicy(
+            dm_policy=dm_policy,
+            dm_allow_from=dm_allow_from,
+            group_policy=group_policy,
+            group_allow_from=group_allow_from,
+        )
+
+        # Group query service (AI tool backing)
+        self._group_query = GroupQueryService(self)
 
         # Inbound message processing pipeline (middleware pattern)
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
@@ -2151,330 +2937,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         logger.info("[%s] Disconnected", self.name)
 
-    def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """Return (or create) a per-chat-id lock with safe LRU eviction."""
-        return self._outbound.get_chat_lock(chat_id)
-
-    def _should_attach_reply_ref(self, inbound_msg_id: str) -> bool:
-        """
-        Determine whether to attach refMsgId to this outbound message.
-
-        Rules:
-        - replyToMode='off' → never attach
-        - replyToMode='all' → always attach
-        - replyToMode='first' (default) → only attach for the first reply to the same inbound message
-
-        With TTL cleanup to prevent memory leaks.
-        """
-        if self._reply_to_mode == "off":
-            return False
-        if self._reply_to_mode == "all":
-            return True
-        if not inbound_msg_id:
-            return False
-
-        now = time.time()
-
-        # Clean up expired entries
-        if len(self._reply_ref_used) > self.REPLY_REF_MAX_ENTRIES:
-            expired = [k for k, ts in self._reply_ref_used.items() if now - ts > REPLY_REF_TTL_S]
-            for k in expired:
-                self._reply_ref_used.pop(k, None)
-
-        # Check if already used
-        if inbound_msg_id in self._reply_ref_used:
-            return False
-
-        self._reply_ref_used[inbound_msg_id] = now
-        return True
-
-    @staticmethod
-    def _is_self_reference(from_account: str, bot_id: Optional[str]) -> bool:
-        """Detect whether the message is from the bot itself (self-reference)."""
-        if not from_account or not bot_id:
-            return False
-        return from_account == bot_id
-
-    @staticmethod
-    def _is_skippable_placeholder(text: str, media_count: int = 0) -> bool:
-        """Detect whether the message is a pure placeholder (should be skipped when no actual content)."""
-        if media_count > 0:
-            return False
-        stripped = text.strip()
-        return stripped in YuanbaoAdapter.SKIPPABLE_PLACEHOLDERS
-
-    @staticmethod
-    def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Extract quote context from cloud_custom_data, mapping to MessageEvent.reply_to_*.
-
-        Returns:
-          (reply_to_message_id, reply_to_text)
-        """
-        if not cloud_custom_data:
-            return None, None
-        try:
-            parsed = json.loads(cloud_custom_data)
-        except (json.JSONDecodeError, TypeError):
-            return None, None
-
-        quote = parsed.get("quote") if isinstance(parsed, dict) else None
-        if not isinstance(quote, dict):
-            return None, None
-
-        # type=2 corresponds to image reference; desc may be empty in some cases, provide a placeholder.
-        quote_type = int(quote.get("type") or 0)
-        desc = str(quote.get("desc") or "").strip()
-        if quote_type == 2 and not desc:
-            desc = "[image]"
-        if not desc:
-            return None, None
-
-        quote_id = str(quote.get("id") or "").strip() or None
-        sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
-        quote_text = f"{sender}: {desc}" if sender else desc
-        return quote_id, quote_text
-
-    @staticmethod
-    def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
-        """
-        Extract inbound image/file references from TIM msg_body.
-
-        Return example:
-          [{"kind": "image", "url": "https://..."}, {"kind": "file", "url": "...", "name": "a.pdf"}]
-        """
-        refs: List[Dict[str, str]] = []
-        for elem in msg_body or []:
-            if not isinstance(elem, dict):
-                continue
-            msg_type = elem.get("msg_type", "")
-            content = elem.get("msg_content", {}) or {}
-            if not isinstance(content, dict):
-                continue
-
-            if msg_type == "TIMImageElem":
-                # Align with openclaw plugin: prefer medium image (index 1), fallback to index 0.
-                image_info_array = content.get("image_info_array")
-                if not isinstance(image_info_array, list):
-                    image_info_array = []
-                image_info = None
-                if len(image_info_array) > 1 and isinstance(image_info_array[1], dict):
-                    image_info = image_info_array[1]
-                elif len(image_info_array) > 0 and isinstance(image_info_array[0], dict):
-                    image_info = image_info_array[0]
-                image_url = str((image_info or {}).get("url") or "").strip()
-                if image_url:
-                    refs.append({"kind": "image", "url": image_url})
-                continue
-
-            if msg_type == "TIMFileElem":
-                file_url = str(content.get("url") or "").strip()
-                file_name = (
-                    str(content.get("file_name") or "").strip()
-                    or str(content.get("fileName") or "").strip()
-                    or str(content.get("filename") or "").strip()
-                )
-                if file_url:
-                    ref: Dict[str, str] = {"kind": "file", "url": file_url}
-                    if file_name:
-                        ref["name"] = file_name
-                    refs.append(ref)
-        return refs
-
-    @staticmethod
-    def _guess_image_ext_from_url(url: str) -> str:
-        """Guess image extension from URL path."""
-        path = urllib.parse.urlparse(url).path
-        ext = os.path.splitext(path)[1].lower()
-        if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tiff"}:
-            return ext
-        return ".jpg"
-
-    async def _resolve_inbound_media_urls(
-        self, media_refs: List[Dict[str, str]]
-    ) -> Tuple[List[str], List[str]]:
-        """
-        Parse inbound image/file URLs (no local caching), return (media_urls, media_types).
-        """
-        media_urls: List[str] = []
-        media_types: List[str] = []
-
-        for ref in media_refs:
-            kind = str(ref.get("kind") or "").strip().lower()
-            url = str(ref.get("url") or "").strip()
-            if kind not in {"image", "file"} or not url:
-                continue
-
-            try:
-                fetch_url = await self._resolve_inbound_download_url(url)
-            except Exception as exc:
-                logger.warning("[%s] inbound media resolve failed: kind=%s url=%s err=%s", self.name, kind, url, exc)
-                continue
-
-            # Infer MIME by resource type, pass fetch_url directly to the model side.
-            if kind == "image":
-                ext = self._guess_image_ext_from_url(fetch_url)
-                mime = guess_mime_type(f"image{ext}")
-                if not mime.startswith("image/"):
-                    mime = "image/jpeg"
-                media_urls.append(fetch_url)
-                media_types.append(mime)
-                continue
-
-            file_name = str(ref.get("name") or "").strip()
-            if not file_name:
-                parsed = urllib.parse.urlparse(fetch_url)
-                file_name = os.path.basename(parsed.path) or "file"
-            mime = guess_mime_type(file_name) or "application/octet-stream"
-            media_urls.append(fetch_url)
-            media_types.append(mime)
-
-        return media_urls, media_types
-
-    async def _resolve_inbound_download_url(self, url: str) -> str:
-        """
-        Resolve Yuanbao resource placeholder download link to a directly fetchable real URL.
-
-        Common URL patterns for Yuanbao inbound images/files:
-          https://hunyuan.tencent.com/api/resource/download?resourceId=...
-        Direct GET on this URL returns 401; need to call the business API:
-          GET /api/resource/v1/download?resourceId=...
-        """
-        try:
-            parsed = urllib.parse.urlparse(url)
-        except Exception:
-            return url
-
-        query = urllib.parse.parse_qs(parsed.query)
-        resource_ids = query.get("resourceId") or query.get("resourceid") or []
-        resource_id = str(resource_ids[0]).strip() if resource_ids else ""
-        if not resource_id:
-            return url
-
-        token_data = await self._get_cached_token()
-        token = str(token_data.get("token") or "").strip()
-        source = str(token_data.get("source") or "web").strip() or "web"
-        bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
-        if not token or not bot_id:
-            return url
-
-        api_url = f"{self._api_domain}/api/resource/v1/download"
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-ID": bot_id,
-            "X-Token": token,
-            "X-Source": source,
-        }
-
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            for attempt in range(2):
-                resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
-                if resp.status_code == 401 and attempt == 0:
-                    # Force refresh token once on expiry and retry
-                    token_data = await SignManager.force_refresh(self._app_key, self._app_secret, self._api_domain)
-                    token = str(token_data.get("token") or "").strip()
-                    source = str(token_data.get("source") or source or "web").strip() or "web"
-                    bot_id = str(token_data.get("bot_id") or self._bot_id or self._app_key).strip()
-                    if not token or not bot_id:
-                        break
-                    headers["X-ID"] = bot_id
-                    headers["X-Token"] = token
-                    headers["X-Source"] = source
-                    continue
-
-                resp.raise_for_status()
-                payload = resp.json()
-                code = payload.get("code")
-                if code not in (None, 0):
-                    raise RuntimeError(
-                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
-                    )
-                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-                real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
-                if real_url:
-                    return real_url
-                raise RuntimeError("resource/v1/download missing url/realUrl")
-
-        return url
-
-    @staticmethod
-    def truncate_message(
-        content: str,
-        max_length: int = 4000,
-        len_fn: Optional[Callable[[str], int]] = None,
-    ) -> List[str]:
-        """
-        Split a long message into chunks with table-awareness.
-
-        Tables (contiguous ``| ... |`` rows) are kept as indivisible blocks.
-        Code blocks use the base-class close/reopen fence logic.
-        Page indicators like ``(1/3)`` are stripped from the output.
-
-        Falls back to ``BasePlatformAdapter.truncate_message`` for non-table
-        content and for overall text that fits in a single chunk.
-        """
-        _len = len_fn or len
-        if _len(content) <= max_length:
-            return [content]
-
-        _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
-
-        def _base_split_no_indicator(text: str) -> List[str]:
-            parts = BasePlatformAdapter.truncate_message(text, max_length, len_fn)
-            return [_INDICATOR_RE.sub('', p) for p in parts]
-
-        atoms = MarkdownProcessor.split_into_atoms(content)
-
-        chunks: List[str] = []
-        current_parts: List[str] = []
-        current_len = 0  # tracks actual merged length including separators
-
-        def _flush() -> None:
-            if current_parts:
-                merged = '\n\n'.join(current_parts)
-                if _len(merged) <= max_length:
-                    chunks.append(merged)
-                else:
-                    chunks.extend(_base_split_no_indicator(merged))
-
-        for atom in atoms:
-            atom_len = _len(atom)
-            sep_len = 2 if current_parts else 0
-            projected = current_len + sep_len + atom_len
-
-            if projected > max_length and current_parts:
-                _flush()
-                current_parts = []
-                current_len = 0
-                sep_len = 0
-
-            if not current_parts and atom_len > max_length:
-                if MarkdownProcessor.is_table_atom(atom):
-                    chunks.append(atom)
-                    continue
-                chunks.extend(_base_split_no_indicator(atom))
-                continue
-
-            current_parts.append(atom)
-            current_len += sep_len + atom_len
-
-        _flush()
-
-        # Merge small trailing/leading chunks with their neighbours
-        if len(chunks) > 1:
-            merged_chunks: List[str] = [chunks[0]]
-            for chunk in chunks[1:]:
-                prev = merged_chunks[-1]
-                combined = prev + '\n\n' + chunk
-                if _len(combined) <= max_length:
-                    merged_chunks[-1] = combined
-                else:
-                    merged_chunks.append(chunk)
-            chunks = merged_chunks
-
-        return chunks if chunks else [content]
-
     async def send(
         self,
         chat_id: str,
@@ -2484,88 +2946,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send text message with auto-chunking. Delegates to OutboundManager."""
         return await self._outbound.send_text(chat_id, content, reply_to)
-
-    async def _send_text_chunk(
-        self,
-        chat_id: str,
-        text: str,
-        reply_to: Optional[str] = None,
-        retry: int = 3,
-    ) -> SendResult:
-        """Send a single text chunk with retry. Delegates to OutboundManager."""
-        return await self._outbound.send_text_chunk(chat_id, text, reply_to, retry)
-
-    async def _send_c2c_message(self, to_account: str, text: str) -> dict:
-        """Send C2C text message. Delegates to OutboundManager."""
-        return await self._outbound.send_c2c_message(to_account, text)
-
-    # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
-    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
-
-    def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
-        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
-        members = self._member_cache.get(group_code, [])
-        if not members:
-            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
-
-        nickname_to_uid = {}
-        for m in members:
-            nick = m.get("nickname") or m.get("nick_name") or ""
-            uid = m.get("user_id") or ""
-            if nick and uid:
-                nickname_to_uid[nick.lower()] = (nick, uid)
-
-        msg_body: list = []
-        last_idx = 0
-        for match in self._AT_USER_RE.finditer(text):
-            start = match.start()
-            if start > last_idx:
-                seg = text[last_idx:start].strip()
-                if seg:
-                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
-
-            nickname = match.group(1)
-            entry = nickname_to_uid.get(nickname.lower())
-            if entry:
-                real_nick, uid = entry
-                msg_body.append({
-                    "msg_type": "TIMCustomElem",
-                    "msg_content": {
-                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
-                    },
-                })
-            else:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
-
-            last_idx = match.end()
-
-        if last_idx < len(text):
-            tail = text[last_idx:].strip()
-            if tail:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
-
-        if not msg_body:
-            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
-
-        return msg_body
-
-    async def _send_group_message(
-        self,
-        group_code: str,
-        text: str,
-        reply_to: Optional[str] = None,
-    ) -> dict:
-        """Send group text message. Delegates to OutboundManager."""
-        return await self._outbound.send_group_message(group_code, text, reply_to)
-
-    async def _send_biz_request(
-        self,
-        encoded_conn_msg: bytes,
-        req_id: str,
-        timeout: float = DEFAULT_SEND_TIMEOUT,
-    ) -> dict:
-        """Send a business-layer request. Delegates to ConnectionManager."""
-        return await self._connection.send_biz_request(encoded_conn_msg, req_id, timeout)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic chat metadata derived from the chat_id prefix.
@@ -2580,167 +2960,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return {"name": chat_id, "type": "group"}
         return {"name": chat_id, "type": "dm"}
 
-    # ------------------------------------------------------------------
-    # Internal methods
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Group chat helpers
-    # ------------------------------------------------------------------
-
-    def _is_at_bot(self, msg_body: list) -> bool:
-        """
-        Detect whether the message @Bot.
-
-        AT element format: TIMCustomElem, msg_content.data is a JSON string:
-            {"elem_type": 1002, "text": "@xxx", "user_id": "<botId>"}
-        Considered @Bot when elem_type == 1002 and user_id == self._bot_id.
-        """
-        if not self._bot_id:
-            return False
-        for elem in msg_body:
-            if elem.get("msg_type") != "TIMCustomElem":
-                continue
-            data_str = elem.get("msg_content", {}).get("data", "")
-            if not data_str:
-                continue
-            try:
-                custom = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if custom.get("elem_type") == 1002 and custom.get("user_id") == self._bot_id:
-                return True
-        return False
-
-    def _detect_owner_command(
-        self,
-        *,
-        push: dict,
-        msg_body: list,
-        chat_type: str,
-        chat_id: str,
-        from_account: str,
-    ) -> Tuple[Optional[str], Optional[str], bool]:
-        """
-        Identify "in-group allowlisted slash commands" and determine sender identity.
-
-        Match conditions (all must be met to be considered an allowlisted command):
-          - Group chat (chat_type == "group")
-          - After removing all TIMCustomElem (e.g. @Bot AT elements) from msg_body,
-              there must be exactly one TIMTextElem (i.e. only one plain text segment besides AT)
-          - The first token of that text matches the allowlist
-
-        Returns (cmd, cmd_line, is_owner):
-          - (None, None, False): Not an allowlisted command; caller proceeds with normal message dispatch
-          - (cmd,  cmd_line, True):  Owner match; caller should skip @Bot detection,
-              and set event.text to cmd_line (to avoid @Bot prefix interfering with command recognition)
-          - (cmd,  cmd_line, False): Allowlisted command but sender is not owner; caller should reject
-
-        Where `cmd` is the first token (e.g. `"/new"`), `cmd_line` is the normalized
-        full command line text (with arguments, e.g. `"/queue analyze the logs"`).
-
-        Owner identity is determined by: push.bot_owner_id == from_account.
-        bot_owner_id is injected by Tencent IM backend in each downstream message; empty means non-owner.
-
-        Note: Command recognition in GatewayRunner._handle_message uses event.get_command()
-        based on event.text; in owner scenarios, event.text must be replaced with cmd_line from this function,
-        otherwise event.text remains something like "@Bot /new" with AT prefix, causing command recognition to fail.
-        """
-        # Slash command allowlist that bot owner can execute in group without @Bot (modify here)
-        allowlist = frozenset({
-            "/new",         # Start new session
-            "/reset",       # Alias for /new
-            "/retry",       # Retry last message
-            "/undo",        # Delete last user/assistant turn
-            "/stop",        # Kill all running background processes
-            "/approve",     # Approve pending dangerous command
-            "/deny",        # Deny pending dangerous command
-            "/background",  # Run a prompt in background
-            "/bg",          # Alias for /background
-            "/btw",         # Temporary side question based on current session context
-            "/queue",       # Queue a prompt for next turn
-            "/q",           # Alias for /queue
-        })
-
-        if chat_type != "group" or not allowlist:
-            return None, None, False
-
-        # Extract TIMTextElem from msg_body: only do command recognition when there is exactly one text segment.
-        # Other types (AT / image / emoji etc.) are ignored — to prevent _extract_text from concatenating AT
-        # into "@xxx /new" which would interfere with command recognition.
-        text_elems = [
-            e for e in (msg_body or [])
-            if e.get("msg_type") == "TIMTextElem"
-        ]
-        if len(text_elems) != 1:
-            return None, None, False
-
-        text = (text_elems[0].get("msg_content") or {}).get("text", "")
-        cmd_line = self._rewrite_slash_command(text)  # Normalize full-width slash + strip
-        if not cmd_line.startswith("/"):
-            return None, None, False
-        cmd = cmd_line.split(maxsplit=1)[0].lower()
-        if cmd not in allowlist:
-            return None, None, False
-
-        # Sender identity check: bot owner ⇔ push.from_account == push.bot_owner_id
-        owner_id = (push or {}).get("bot_owner_id") or ""
-        is_owner = bool(owner_id) and owner_id == from_account
-
-        if is_owner:
-            logger.info(
-                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
-                self.name, chat_id, from_account, cmd,
-            )
-        else:
-            logger.info(
-                "[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s owner=%s",
-                self.name, chat_id, from_account, cmd, owner_id or "(empty)",
-            )
-        return cmd, cmd_line, is_owner
-
-    # ------------------------------------------------------------------
-    # Group chat: observe messages into session transcript
-    # ------------------------------------------------------------------
-
-    def _observe_group_message(
-        self, source: SessionSource, sender_display: str, text: str,
-    ) -> None:
-        """Write a group message into the session transcript without triggering the agent.
-
-        This allows the model to see the full group conversation when it is
-        eventually invoked via @bot.  Messages are stored with ``role: "user"``
-        and a ``[sender]`` prefix so the model can distinguish participants.
-
-        Requires ``group_sessions_per_user: false`` in the platform extra
-        config so that all participants share a single session transcript.
-        """
-        store = getattr(self, "_session_store", None)
-        if not store:
-            return
-        try:
-            session_entry = store.get_or_create_session(source)
-            attributed = f"[{sender_display}] {text}"
-            store.append_to_transcript(
-                session_entry.session_id,
-                {
-                    "role": "user",
-                    "content": attributed,
-                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                    "observed": True,
-                },
-            )
-        except Exception as exc:
-            logger.warning("[%s] Failed to observe group message: %s", self.name, exc)
-
-    # ------------------------------------------------------------------
-    # Reply Heartbeat state machine
-    # ------------------------------------------------------------------
-
     async def send_typing(self, chat_id: str, metadata: Optional[dict] = None) -> None:
         """Send "typing" status heartbeat (RUNNING). Delegates to OutboundManager."""
         try:
-            await self._outbound.start_reply_heartbeat(chat_id)
+            await self._outbound.start_typing(chat_id)
         except Exception:
             pass
 
@@ -2751,25 +2974,46 @@ class YuanbaoAdapter(BasePlatformAdapter):
         RUNNING... -> message arrives -> FINISH.
         """
         try:
-            await self._outbound.stop_reply_heartbeat(chat_id, send_finish=False)
+            await self._outbound.stop_typing(chat_id, send_finish=False)
         except Exception:
             pass
 
     async def _process_message_background(self, event, session_key: str) -> None:
         """Wrap base class processing with a slow-response notifier."""
         chat_id = event.source.chat_id
-        await self._outbound.start_slow_response_notifier(chat_id)
+        await self._outbound.start_slow_notifier(chat_id)
         try:
             await super()._process_message_background(event, session_key)
         finally:
-            self._outbound.cancel_slow_response_notifier(chat_id)
-
-    async def _send_heartbeat_once(self, chat_id: str, heartbeat_val: int) -> None:
-        """Send a single heartbeat. Delegates to OutboundManager."""
-        await self._outbound.send_heartbeat_once(chat_id, heartbeat_val)
+            self._outbound.cancel_slow_notifier(chat_id)
 
     # ------------------------------------------------------------------
-    # Group query methods
+    # Agent tool methods (registered as AI toolset, delegate to GroupQueryService)
+    # ------------------------------------------------------------------
+
+    async def tool_query_group_info(self, chat_id: str) -> dict:
+        """AI tool: Query current group info.
+
+        Thin delegate to :pyclass:`GroupQueryService`.
+        """
+        return await self._group_query.query_group_info(chat_id)
+
+    async def tool_query_session_members(
+        self,
+        chat_id: str,
+        action: str = "list_all",
+        name: Optional[str] = None,
+    ) -> dict:
+        """AI tool: Query group member list.
+
+        Thin delegate to :pyclass:`GroupQueryService`.
+        """
+        return await self._group_query.query_session_members(
+            chat_id, action=action, name=name,
+        )
+
+    # ------------------------------------------------------------------
+    # Group query methods (low-level WS calls)
     # ------------------------------------------------------------------
 
     async def query_group_info(self, group_code: str) -> Optional[dict]:
@@ -2796,11 +3040,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         decoded = _decode(encoded)
         req_id = decoded["head"]["msg_id"]
         try:
-            response = await self._send_biz_request(encoded, req_id=req_id)
+            response = await self._connection.send_biz_request(encoded, req_id=req_id)
             # response comes from _handle_frame; for RPC Response it returns {"head": head}
             # but for Push responses, it returns the decoded push
             # For group query RPCs, we need to decode from conn_data
-            # Actually _send_biz_request returns {"head": head} for Response cmd_type
+            # Actually send_biz_request returns {"head": head} for Response cmd_type
             # Group query response data needs to be obtained from the raw frame
             # Since _handle_frame currently only returns head for Response, group query needs improvement
             # Temporarily return response head to indicate success
@@ -2847,7 +3091,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         decoded = _decode(encoded)
         req_id = decoded["head"]["msg_id"]
         try:
-            response = await self._send_biz_request(encoded, req_id=req_id)
+            response = await self._connection.send_biz_request(encoded, req_id=req_id)
             head = response.get("head", {})
             status = head.get("status", 0)
             if status != 0:
@@ -2868,112 +3112,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.warning("[%s] get_group_member_list failed: %s", self.name, exc)
             return None
 
-    def _push_to_inbound(self, conn_data: bytes) -> None:
-        """
-        Convert push frame to MessageEvent and dispatch to AI for processing.
-
-        Delegates to the inbound middleware pipeline which processes the message
-        through a series of steps: decode → dedup → filter → access control →
-        content extraction → owner command → @bot guard → dispatch.
-
-        conn_data in Yuanbao scenario has only two forms:
-          - JSON string: callback_command format inbound message (mainstream)
-          - Protobuf binary: InboundMessagePush
-        """
-        ctx = InboundContext(adapter=self, conn_data=conn_data)
-        self._track_task(asyncio.create_task(
-            self._inbound_pipeline.execute(ctx),
-            name=f"yuanbao-pipeline-{id(conn_data)}",
-        ))
-
-    def _extract_text(self, msg_body: list) -> str:
-        """
-        Extract plain text content from MsgBody.
-        - TIMTextElem      → extract text field
-        - TIMImageElem     → "[image]"
-        - TIMFileElem      → "[file: {filename}]"
-        - TIMSoundElem     → "[voice]"
-        - TIMVideoFileElem → "[video]"
-        - TIMFaceElem      → "[emoji: {name}]" or "[emoji]"
-        - TIMCustomElem    → try to extract data field, otherwise "[custom message]"
-        - Multiple elems joined with spaces
-        """
-        parts: list[str] = []
-        for elem in msg_body:
-            elem_type: str = elem.get("msg_type", "")
-            content: dict = elem.get("msg_content", {})
-
-            if elem_type == "TIMTextElem":
-                text = content.get("text", "")
-                if text:
-                    parts.append(text)
-            elif elem_type == "TIMImageElem":
-                parts.append("[image]")
-            elif elem_type == "TIMFileElem":
-                filename = content.get("file_name", content.get("fileName", content.get("filename", "")))
-                parts.append(f"[file: {filename}]" if filename else "[file]")
-            elif elem_type == "TIMSoundElem":
-                parts.append("[voice]")
-            elif elem_type == "TIMVideoFileElem":
-                parts.append("[video]")
-            elif elem_type == "TIMCustomElem":
-                data_val = content.get("data", "")
-                if data_val:
-                    try:
-                        custom = json.loads(data_val)
-                        if isinstance(custom, dict) and custom.get("elem_type") == 1002:
-                            parts.append(custom.get("text", "[mention]"))
-                        else:
-                            parts.append("[unsupported message type]")
-                    except (json.JSONDecodeError, TypeError):
-                        parts.append(data_val)
-                else:
-                    parts.append("[unsupported message type]")
-            elif elem_type == "TIMFaceElem":
-                # Sticker/emoji: extract name from data JSON
-                raw_data = content.get("data", "")
-                face_name = ""
-                if raw_data:
-                    try:
-                        face_data = json.loads(raw_data)
-                        face_name = (face_data.get("name") or "").strip()
-                    except (json.JSONDecodeError, TypeError, AttributeError):
-                        pass
-                parts.append(f"[emoji: {face_name}]" if face_name else "[emoji]")
-            elif elem_type:
-                # Unknown element type — include type as placeholder
-                parts.append(f"[{elem_type}]")
-
-        return " ".join(parts) if parts else ""
-
-    @staticmethod
-    def _rewrite_slash_command(text: str) -> str:
-        """
-        Normalize input text: strip whitespace and convert full-width slash (Chinese
-        input method) to ASCII slash so commands are recognized correctly.
-        """
-        text = text.strip()
-        if text.startswith('\uff0f'):  # Full-width slash
-            text = '/' + text[1:]
-        return text
-
-    @staticmethod
-    def _classify_message_type(text: str, msg_body: list) -> MessageType:
-        """Determine MessageType from text content and msg_body elements."""
-        if text.startswith("/"):
-            return MessageType.COMMAND
-        for elem in msg_body:
-            etype = elem.get("msg_type", "")
-            if etype == "TIMImageElem":
-                return MessageType.PHOTO
-            if etype == "TIMSoundElem":
-                return MessageType.VOICE
-            if etype == "TIMVideoFileElem":
-                return MessageType.VIDEO
-            if etype == "TIMFileElem":
-                return MessageType.DOCUMENT
-        return MessageType.TEXT
-
     # ------------------------------------------------------------------
     # DM active private chat + access control
     # ------------------------------------------------------------------
@@ -2991,175 +3129,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
         Returns:
             SendResult
         """
-        if not self._resolve_dm_access(user_id):
+        if not self._access_policy.is_dm_allowed(user_id):
             return SendResult(success=False, error="DM access denied for this user")
         if len(text) > self.DM_MAX_CHARS:
             text = text[:self.DM_MAX_CHARS] + "\n...(truncated)"
         chat_id = f"direct:{user_id}"
         return await self.send(chat_id, text)
-
-    def _is_dm_allowed(self, sender_id: str) -> bool:
-        """Platform-level DM inbound filter (open / allowlist / disabled)."""
-        if self._dm_policy == "disabled":
-            return False
-        if self._dm_policy == "allowlist":
-            return sender_id.strip() in self._dm_allow_from
-        return True
-
-    def _is_group_allowed(self, group_code: str) -> bool:
-        """Platform-level group chat inbound filter (open / allowlist / disabled)."""
-        if self._group_policy == "disabled":
-            return False
-        if self._group_policy == "allowlist":
-            return group_code.strip() in self._group_allow_from
-        return True
-
-    def _resolve_dm_access(self, user_id: str) -> bool:
-        """Active DM send authorization, reusing _is_dm_allowed()."""
-        return self._is_dm_allowed(user_id)
-
-    # ------------------------------------------------------------------
-    # Agent tool methods (can be registered as AI toolset)
-    # ------------------------------------------------------------------
-
-    async def tool_query_group_info(self, chat_id: str) -> dict:
-        """
-        AI tool: Query current group info.
-
-        No parameters needed (group_code extracted from session context).
-        Returns group name, owner, member count, etc.
-        """
-        if not chat_id.startswith("group:"):
-            return {"error": "This command is only available in group chats"}
-        group_code = chat_id[len("group:"):]
-        result = await self.query_group_info(group_code)
-        if result is None:
-            return {"error": "Failed to query group info"}
-        return result
-
-    async def tool_query_session_members(
-        self,
-        chat_id: str,
-        action: str = "list_all",
-        name: Optional[str] = None,
-    ) -> dict:
-        """
-        AI tool: Query group member list.
-
-        Args:
-            chat_id: Chat ID (extracted from session context)
-            action: 'find' (search by name) | 'list_bots' (list bots) | 'list_all' (list all)
-            name: Search keyword when action='find'
-
-        Returns:
-            {"members": [...], "total": int, "mentionHint": str}
-        """
-        if not chat_id.startswith("group:"):
-            return {"error": "This command is only available in group chats"}
-        group_code = chat_id[len("group:"):]
-        result = await self.get_group_member_list(group_code)
-        if result is None:
-            return {"error": "Failed to query group members"}
-
-        members = result.get("members", [])
-
-        if action == "find" and name:
-            query = name.lower()
-            members = [
-                m for m in members
-                if query in (m.get("nickname", "") or "").lower()
-                or query in (m.get("name_card", "") or "").lower()
-                or query in (m.get("user_id", "") or "").lower()
-            ]
-        elif action == "list_bots":
-            # Bots typically have role=0 and user_id looks like a bot ID
-            # Simple filter here; real scenarios may need more precise detection
-            members = [m for m in members if "bot" in (m.get("nickname", "") or "").lower()]
-
-        # Construct mentionHint
-        mention_hint = ""
-        if members and len(members) <= 10:
-            names = [m.get("name_card") or m.get("nickname") or m.get("user_id", "") for m in members]
-            mention_hint = "Mention with @name: " + ", ".join(names)
-
-        return {
-            "members": members[:50],  # Limit return count
-            "total": len(members),
-            "mentionHint": mention_hint,
-        }
-
-    # ------------------------------------------------------------------
-    # Trace Context + Markdown Hint
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _generate_trace_id() -> str:
-        """Generate distributed trace ID (32-char hex)."""
-        return uuid.uuid4().hex
-
-    @staticmethod
-    def _build_traceparent(trace_id: str, span_id: Optional[str] = None) -> str:
-        """
-        Build W3C traceparent header (simplified).
-        Format: 00-{trace_id}-{span_id}-01
-        """
-        if not span_id:
-            span_id = uuid.uuid4().hex[:16]
-        return f"00-{trace_id}-{span_id}-01"
-
-    @staticmethod
-    def _markdown_hint_system_prompt() -> str:
-        """Delegate to MarkdownProcessor.markdown_hint_system_prompt()."""
-        return MarkdownProcessor.markdown_hint_system_prompt()
-
-    @staticmethod
-    def _msg_body_desensitize(msg_body: list) -> list:
-        """
-        Sanitize message body (for logging).
-
-        Truncate long text in TIMTextElem, replace URLs in TIMImageElem.
-        """
-        result = []
-        for elem in msg_body:
-            msg_type = elem.get("msg_type", "")
-            content = elem.get("msg_content", {})
-            if msg_type == "TIMTextElem":
-                text = content.get("text", "")
-                if len(text) > 100:
-                    text = text[:100] + f"...({len(text)} chars)"
-                result.append({"msg_type": msg_type, "msg_content": {"text": text}})
-            elif msg_type == "TIMImageElem":
-                result.append({"msg_type": msg_type, "msg_content": {"url": "[IMAGE_URL]"}})
-            elif msg_type == "TIMFileElem":
-                fname = content.get("file_name", content.get("fileName", ""))
-                result.append({"msg_type": msg_type, "msg_content": {"file_name": fname}})
-            else:
-                result.append({"msg_type": msg_type, "msg_content": "[REDACTED]"})
-        return result
-
-    # ------------------------------------------------------------------
-    # Media validation
-    # ------------------------------------------------------------------
-
-    MEDIA_MAX_SIZE_MB: int = 20  # aligned with openclaw plugin default
-
-    @staticmethod
-    def _validate_media_before_queue(
-        file_bytes: Optional[bytes], filename: str, max_size_mb: int = MEDIA_MAX_SIZE_MB
-    ) -> Optional[str]:
-        """
-        Media pre-validation: check file validity before sending/uploading.
-
-        Returns:
-            Error description (str) if validation fails, otherwise None.
-        """
-        if file_bytes is None or len(file_bytes) == 0:
-            return f"Empty file: {filename}"
-        max_bytes = max_size_mb * 1024 * 1024
-        if len(file_bytes) > max_bytes:
-            size_mb = len(file_bytes) / 1024 / 1024
-            return f"File too large: {filename} ({size_mb:.1f}MB > {max_size_mb}MB)"
-        return None
 
     # ------------------------------------------------------------------
     # Media send methods
@@ -3260,11 +3235,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             "ws_url": self._ws_url,
         }
 
-    def _next_seq(self) -> int:
-        """Return a monotonically increasing local sequence number."""
-        self._seq += 1
-        return self._seq
-
 
 
 
@@ -3330,7 +3300,11 @@ class MarkdownProcessor:
     # -- Paragraph boundary splitting --------------------------------------
 
     @staticmethod
-    def split_at_paragraph_boundary(text: str, max_chars: int) -> tuple[str, str]:
+    def split_at_paragraph_boundary(
+        text: str,
+        max_chars: int,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> tuple[str, str]:
         """
         Find the nearest paragraph boundary split point within max_chars, return (head, tail).
 
@@ -3343,14 +3317,29 @@ class MarkdownProcessor:
         Args:
             text: Text to split
             max_chars: Maximum character count limit
+            len_fn: Optional custom length function (e.g. UTF-16 length); defaults to built-in len
 
         Returns:
             (head, tail) tuple, head is the front part, tail is the back part, satisfying head + tail == text
         """
-        if len(text) <= max_chars:
+        _len = len_fn or len
+        if _len(text) <= max_chars:
             return text, ''
 
-        window = text[:max_chars]
+        # Build a character-index window that fits within max_chars.
+        # When len_fn != len we cannot simply slice [:max_chars], so we
+        # binary-search for the largest prefix that fits.
+        if _len is len:
+            window = text[:max_chars]
+        else:
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _len(text[:mid]) <= max_chars:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            window = text[:lo]
 
         # 1. Prefer the last blank line (\n\n) as paragraph boundary
         pos = window.rfind('\n\n')
@@ -3370,8 +3359,9 @@ class MarkdownProcessor:
         if pos > 0:
             return text[:pos + 1], text[pos + 1:]
 
-        # 4. No valid split point found, force split at max_chars
-        return text[:max_chars], text[max_chars:]
+        # 4. No valid split point found, force split at window boundary
+        cut = len(window)
+        return text[:cut], text[cut:]
 
     # -- Atomic block helpers (private) ------------------------------------
 
@@ -3448,7 +3438,12 @@ class MarkdownProcessor:
     # -- Core: chunk splitting ---------------------------------------------
 
     @classmethod
-    def chunk_markdown_text(cls, text: str, max_chars: int = 4000) -> list[str]:
+    def chunk_markdown_text(
+        cls,
+        text: str,
+        max_chars: int = 4000,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> list[str]:
         """
         Split Markdown text into multiple chunks by max_chars.
 
@@ -3457,18 +3452,22 @@ class MarkdownProcessor:
         - Code blocks (```...```) are not split in the middle
         - Table rows are not split in the middle (tables output as atomic blocks)
         - Split at paragraph boundaries (blank lines, after periods, etc.)
+        - Small trailing/leading chunks are merged with neighbours when possible
 
         Args:
             text: Markdown text to split
             max_chars: Max characters per chunk, default 4000
+            len_fn: Optional custom length function (e.g. UTF-16 length); defaults to built-in len
 
         Returns:
             List of text chunks after splitting (non-empty)
         """
+        _len = len_fn or len
+
         if not text:
             return []
 
-        if len(text) <= max_chars:
+        if _len(text) <= max_chars:
             return [text]
 
         # Phase 1: Extract atomic blocks
@@ -3485,31 +3484,32 @@ class MarkdownProcessor:
                 chunks.append('\n\n'.join(current_parts))
 
         for atom in atoms:
-            atom_len = len(atom)
-            sep_len = 2 * len(current_parts)
+            atom_len = _len(atom)
+            sep_len = 2 if current_parts else 0
             projected_len = current_len + sep_len + atom_len
 
             if projected_len > max_chars and current_parts:
                 _flush_parts()
                 current_parts = []
                 current_len = 0
+                sep_len = 0
 
             if (not current_parts
                     and atom_len > max_chars
-                and (cls.is_fence_atom(atom) or cls.is_table_atom(atom))):
+                    and (cls.is_fence_atom(atom) or cls.is_table_atom(atom))):
                 indivisible_set.add(len(chunks))
                 chunks.append(atom)
                 continue
 
             current_parts.append(atom)
-            current_len += atom_len
+            current_len += sep_len + atom_len
 
         _flush_parts()
 
         # Phase 3: Post-processing — split still-oversized chunks at paragraph boundaries
         result: list[str] = []
         for idx, chunk in enumerate(chunks):
-            if len(chunk) <= max_chars:
+            if _len(chunk) <= max_chars:
                 result.append(chunk)
                 continue
 
@@ -3522,14 +3522,28 @@ class MarkdownProcessor:
                 continue
 
             remaining = chunk
-            while len(remaining) > max_chars:
-                head, remaining = cls.split_at_paragraph_boundary(remaining, max_chars)
+            while _len(remaining) > max_chars:
+                head, remaining = cls.split_at_paragraph_boundary(
+                    remaining, max_chars, len_fn=len_fn,
+                )
                 if not head:
                     head, remaining = remaining[:max_chars], remaining[max_chars:]
                 if head:
                     result.append(head)
             if remaining:
                 result.append(remaining)
+
+        # Phase 4: Merge small trailing/leading chunks with neighbours
+        if len(result) > 1:
+            merged: list[str] = [result[0]]
+            for chunk in result[1:]:
+                prev = merged[-1]
+                combined = prev + '\n\n' + chunk
+                if _len(combined) <= max_chars:
+                    merged[-1] = combined
+                else:
+                    merged.append(chunk)
+            result = merged
 
         return [c for c in result if c]
 

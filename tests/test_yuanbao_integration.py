@@ -244,11 +244,30 @@ class TestManagerImports:
         from gateway.platforms.yuanbao import OutboundManager
         assert OutboundManager is not None
 
-    def test_adapter_has_managers(self):
+    def test_message_sender_import(self):
+        from gateway.platforms.yuanbao import MessageSender
+        assert MessageSender is not None
+
+    def test_heartbeat_manager_import(self):
+        from gateway.platforms.yuanbao import HeartbeatManager
+        assert HeartbeatManager is not None
+
+    def test_slow_response_notifier_import(self):
+        from gateway.platforms.yuanbao import SlowResponseNotifier
+        assert SlowResponseNotifier is not None
+
+    def test_adapter_has_outbound_manager(self):
         adapter = YuanbaoAdapter(make_config())
         from gateway.platforms.yuanbao import ConnectionManager, OutboundManager
         assert isinstance(adapter._connection, ConnectionManager)
         assert isinstance(adapter._outbound, OutboundManager)
+
+    def test_outbound_composes_sub_managers(self):
+        adapter = YuanbaoAdapter(make_config())
+        from gateway.platforms.yuanbao import MessageSender, HeartbeatManager, SlowResponseNotifier
+        assert isinstance(adapter._outbound.sender, MessageSender)
+        assert isinstance(adapter._outbound.heartbeat, HeartbeatManager)
+        assert isinstance(adapter._outbound.slow_notifier, SlowResponseNotifier)
 
 
 # ===========================================================
@@ -339,7 +358,7 @@ class TestP0InboundTaskTracking:
 
 
 class TestP0ChatLockEviction:
-    """P0-3: _get_chat_lock uses OrderedDict and safe eviction."""
+    """P0-3: get_chat_lock uses OrderedDict and safe eviction."""
 
     def test_chat_locks_is_ordered_dict(self):
         adapter = YuanbaoAdapter(make_config())
@@ -360,8 +379,8 @@ class TestP0ChatLockEviction:
         # Simulate a held lock by acquiring it in a non-async way (set _locked)
         # asyncio.Lock is not held until actually acquired; so we test the
         # method logic by acquiring the first lock manually.
-        # For a sync test, we check that _get_chat_lock doesn't crash.
-        new_lock = adapter._get_chat_lock("new_chat")
+        # For a sync test, we check that get_chat_lock doesn't crash.
+        new_lock = adapter._outbound.get_chat_lock("new_chat")
         assert "new_chat" in adapter._outbound._chat_locks
         assert isinstance(new_lock, asyncio.Lock)
         # The oldest unlocked entry should have been evicted
@@ -375,7 +394,7 @@ class TestP0ChatLockEviction:
         adapter._outbound._chat_locks["c"] = asyncio.Lock()
 
         # Access "a" — should move to end
-        adapter._get_chat_lock("a")
+        adapter._outbound.get_chat_lock("a")
         keys = list(adapter._outbound._chat_locks.keys())
         assert keys[-1] == "a"
         assert keys[0] == "b"

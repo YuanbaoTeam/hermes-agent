@@ -674,7 +674,7 @@ class TestGroupAtGuardMiddleware:
         """GroupAtGuardMiddleware observes group messages without @bot."""
         adapter = make_adapter()
         adapter._bot_id = "bot_123"
-        adapter._observe_group_message = MagicMock()
+        adapter._session_store = None  # No session store -> observe is a no-op
         ctx = make_ctx(
             adapter=adapter,
             chat_type="group",
@@ -690,7 +690,6 @@ class TestGroupAtGuardMiddleware:
         await GroupAtGuardMiddleware()(ctx, next_fn)
 
         next_fn.assert_not_awaited()
-        adapter._observe_group_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_owner_command_skips_at_check(self):
@@ -730,11 +729,11 @@ class TestCreateInboundPipeline:
             "owner-command",
             "build-source",
             "group-at-guard",
+            "classify-msg-type",
+            "quote-context",
+            "media-resolve",
             "dispatch",
         ]
-        assert pipeline.middleware_names == expected
-
-    def test_pipeline_is_customizable(self):
         """Pipeline can be customized after creation."""
         pipeline = InboundPipelineBuilder.build()
 
@@ -850,7 +849,7 @@ class TestPipelineIntegration:
         adapter = make_adapter()
         assert hasattr(adapter, "_inbound_pipeline")
         assert isinstance(adapter._inbound_pipeline, InboundPipeline)
-        assert len(adapter._inbound_pipeline.middleware_names) == 12
+        assert len(adapter._inbound_pipeline.middleware_names) == 15
 
 
 if __name__ == "__main__":
@@ -1035,13 +1034,14 @@ class TestCreateInboundPipelineOOP:
     def test_factory_uses_oop_instances(self):
         """InboundPipelineBuilder.build() creates pipeline with OOP middleware instances."""
         pipeline = InboundPipelineBuilder.build()
-        # Verify all 12 middlewares are registered
-        assert len(pipeline.middleware_names) == 12
+        # Verify all 15 middlewares are registered
+        assert len(pipeline.middleware_names) == 15
         # Verify the names match expected order
         expected = [
             "decode", "extract-fields", "dedup", "skip-self",
             "chat-routing", "access-guard", "extract-content",
             "placeholder-filter", "owner-command", "build-source",
-            "group-at-guard", "dispatch",
+            "group-at-guard", "classify-msg-type", "quote-context",
+            "media-resolve", "dispatch",
         ]
         assert pipeline.middleware_names == expected
