@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -1334,6 +1335,37 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    def _extract_bot_mention_text(self, msg_body: list) -> str:
+        """提取消息里 @当前 Bot 的展示文本（例如 ``@小元宝``）。"""
+        if not self._bot_id:
+            return ""
+        for elem in msg_body:
+            if elem.get("msg_type") != "TIMCustomElem":
+                continue
+            data_str = elem.get("msg_content", {}).get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if custom.get("elem_type") == 1002 and custom.get("user_id") == self._bot_id:
+                mention_text = str(custom.get("text") or "").strip()
+                if mention_text:
+                    return mention_text
+        return ""
+
+    def _build_group_channel_prompt(self, msg_body: list) -> str:
+        """构造仅当前轮生效的群聊提示，强调"当前消息才是触发请求"。"""
+        bot_id = str(self._bot_id or "unknown")
+        bot_mention = self._extract_bot_mention_text(msg_body) or "unknown"
+        return (
+            "你正在处理元宝群聊消息。\n"
+            f"- 你的身份: user_id={bot_id}，群内 @ 显示名={bot_mention}\n"
+            "- 历史中以 `[昵称|user_id]` 开头的多行条目是群聊观察上下文，并不一定是在对你说话。\n"
+            "- 仅将当前这条新消息视为明确向你发起的请求，并优先直接回答它。"
+        )
+
     def _detect_owner_command(
         self,
         *,
@@ -1432,7 +1464,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         This allows the model to see the full group conversation when it is
         eventually invoked via @bot.  Messages are stored with ``role: "user"``
-        and a ``[sender]`` prefix so the model can distinguish participants.
+        in the format ``[nickname|user_id]\\n<content>`` so the model
+        can distinguish participants and their user ids.
 
         Requires ``group_sessions_per_user: false`` in the platform extra
         config so that all participants share a single session transcript.
@@ -1442,7 +1475,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return
         try:
             session_entry = store.get_or_create_session(source)
-            attributed = f"[{sender_display}] {text}"
+            user_id = source.user_id or "unknown"
+            attributed = f"[{sender_display}|{user_id}]\n{text}"
             store.append_to_transcript(
                 session_entry.session_id,
                 {
@@ -1892,6 +1926,17 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return
 
         msg_type = self._classify_message_type(raw_text, msg_body)
+        event_channel_prompt = None
+        event_text = raw_text
+        dispatch_source = source
+        if chat_type == "group" and not owner_command:
+            event_channel_prompt = self._build_group_channel_prompt(msg_body)
+            user_id_label = from_account or "unknown"
+            nickname_label = sender_nickname or from_account or "unknown"
+            event_text = f"[{nickname_label}|{user_id_label}]\n{raw_text}"
+            # Suppress runner's default ``[user_name]`` shared-thread prefix so
+            # the text the model sees matches the observed-history format.
+            dispatch_source = dataclasses.replace(source, user_name=None)
 
         async def _dispatch_inbound_event() -> None:
             media_urls, media_types = await self._resolve_inbound_media_urls(media_refs)
@@ -1900,15 +1945,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 return
             reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
             event = MessageEvent(
-                text=raw_text,
+                text=event_text,
                 message_type=msg_type,
-                source=source,
+                source=dispatch_source,
                 message_id=msg_id_field or None,
                 raw_message=push,
                 media_urls=media_urls,
                 media_types=media_types,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
+                channel_prompt=event_channel_prompt,
             )
             await self.handle_message(event)
 
