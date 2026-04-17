@@ -1336,7 +1336,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return False
 
     def _extract_bot_mention_text(self, msg_body: list) -> str:
-        """提取消息里 @当前 Bot 的展示文本（例如 ``@小元宝``）。"""
+        """Extract the display text used to @-mention this bot (e.g. ``@yuanbao-bot``)."""
         if not self._bot_id:
             return ""
         for elem in msg_body:
@@ -1356,14 +1356,16 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return ""
 
     def _build_group_channel_prompt(self, msg_body: list) -> str:
-        """构造仅当前轮生效的群聊提示，强调"当前消息才是触发请求"。"""
+        """Build a per-turn group-chat prompt that highlights which message to respond to."""
         bot_id = str(self._bot_id or "unknown")
         bot_mention = self._extract_bot_mention_text(msg_body) or "unknown"
         return (
-            "你正在处理元宝群聊消息。\n"
-            f"- 你的身份: user_id={bot_id}，群内 @ 显示名={bot_mention}\n"
-            "- 历史中以 `[昵称|user_id]` 开头的多行条目是群聊观察上下文，并不一定是在对你说话。\n"
-            "- 仅将当前这条新消息视为明确向你发起的请求，并优先直接回答它。"
+            "You are handling a Yuanbao group chat message.\n"
+            f"- Your identity: user_id={bot_id}, @-mention name in this group={bot_mention}\n"
+            "- Lines in history prefixed with `[nickname|user_id]` are observed group context "
+            "and are not necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed at you, "
+            "and answer it directly."
         )
 
     def _detect_owner_command(
