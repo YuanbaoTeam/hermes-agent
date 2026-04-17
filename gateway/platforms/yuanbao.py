@@ -80,8 +80,6 @@ from gateway.platforms.yuanbao_proto import (
     WS_HEARTBEAT_FINISH,
     decode_conn_msg,
     decode_inbound_push,
-    decode_push_msg,
-    decode_directed_push,
     decode_query_group_info_rsp,
     decode_get_group_member_list_rsp,
     encode_auth_bind,
@@ -1300,7 +1298,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     "[%s] WS received inbound push, decoding and dispatching: cmd=%s, data_len=%d",
                     self.name, cmd, len(data),
                 )
-                self._push_to_inbound(head, data)
+                self._push_to_inbound(data)
             return
 
         logger.debug(
@@ -1335,6 +1333,93 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if custom.get("elem_type") == 1002 and custom.get("user_id") == self._bot_id:
                 return True
         return False
+
+    def _detect_owner_command(
+        self,
+        *,
+        push: dict,
+        msg_body: list,
+        chat_type: str,
+        chat_id: str,
+        from_account: str,
+    ) -> Tuple[Optional[str], Optional[str], bool]:
+        """
+        识别"群内白名单斜杠命令"并判定发送者身份。
+
+        匹配条件（全部满足才视为白名单命令）:
+          - 群聊 (chat_type == "group")
+          - msg_body 去除所有 TIMCustomElem（如 @Bot AT 元素）后，剩下
+            必须是单个 TIMTextElem（即除 AT 外只剩一段纯文本）
+          - 该文本首 token 命中 allowlist
+
+        返回 (cmd, cmd_line, is_owner):
+          - (None, None, False): 非白名单命令，调用方走正常消息分派流程
+          - (cmd,  cmd_line, True):  owner 命中，调用方应跳过 @Bot 检测，
+            并将 event.text 置为 cmd_line（避免 @Bot 前缀干扰命令识别）
+          - (cmd,  cmd_line, False): 白名单命令但发送者非 owner，调用方应拒绝
+
+        其中 `cmd` 是首 token（如 `"/new"`），`cmd_line` 是规范化后的
+        完整命令行文本（含参数，如 `"/queue 分析一下日志"`）。
+
+        Owner 身份判断依据：push.bot_owner_id == from_account。
+        bot_owner_id 由腾讯 IM 后端在每条下行消息中注入；为空时视为非 owner。
+
+        注：命令识别在 GatewayRunner._handle_message 里走 event.get_command()
+        基于 event.text；owner 场景下须把 event.text 换成本函数返回的 cmd_line，
+        否则 event.text 仍是 "@Bot /new" 之类含 AT 前缀的串，命令识别会失败。
+        """
+        # Bot owner 可在群内不 @Bot 直接执行的斜杠命令白名单（增减改这里）
+        allowlist = frozenset({
+            "/new",         # 开始新会话
+            "/reset",       # /new 别名
+            "/retry",       # 重试上一条消息
+            "/undo",        # 删除上一轮用户/助手对话
+            "/stop",        # 杀掉所有正在运行的后台进程
+            "/approve",     # 批准待处理的危险命令
+            "/deny",        # 拒绝待处理的危险命令
+            "/background",  # 在后台运行一个提示
+            "/bg",          # /background 别名
+            "/btw",         # 基于当前会话上下文的临时侧问
+            "/queue",       # 将提示加入下一轮队列
+            "/q",           # /queue 别名
+        })
+
+        if chat_type != "group" or not allowlist:
+            return None, None, False
+
+        # 提取 msg_body 中的 TIMTextElem：仅当恰好只有一段文本时才做命令识别。
+        # 其他类型（AT / 图片 / 表情等）不影响——避免 _extract_text 把 AT 拼
+        # 成 "@xxx /new" 干扰命令识别。
+        text_elems = [
+            e for e in (msg_body or [])
+            if e.get("msg_type") == "TIMTextElem"
+        ]
+        if len(text_elems) != 1:
+            return None, None, False
+
+        text = (text_elems[0].get("msg_content") or {}).get("text", "")
+        cmd_line = self._rewrite_slash_command(text)  # 规范化全角斜杠 + strip
+        if not cmd_line.startswith("/"):
+            return None, None, False
+        cmd = cmd_line.split(maxsplit=1)[0].lower()
+        if cmd not in allowlist:
+            return None, None, False
+
+        # 发送者身份校验：bot owner ⇔ push.from_account == push.bot_owner_id
+        owner_id = (push or {}).get("bot_owner_id") or ""
+        is_owner = bool(owner_id) and owner_id == from_account
+
+        if is_owner:
+            logger.info(
+                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
+                self.name, chat_id, from_account, cmd,
+            )
+        else:
+            logger.info(
+                "[%s] Reject non-owner slash command: chat=%s from=%s cmd=%s owner=%s",
+                self.name, chat_id, from_account, cmd, owner_id or "(empty)",
+            )
+        return cmd, cmd_line, is_owner
 
     # ------------------------------------------------------------------
     # Group chat: observe messages into session transcript
@@ -1650,115 +1735,63 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.warning("[%s] get_group_member_list failed: %s", self.name, exc)
             return None
 
-    def _push_to_inbound(self, head: dict, conn_data: bytes) -> None:
+    def _push_to_inbound(self, conn_data: bytes) -> None:
         """
         将推送帧转换为 MessageEvent 并分发给 AI 处理。
 
-        解码优先级（对齐 TS gateway.ts 的 wsPushToInboundMessage）:
-          1. connData protobuf: decode_inbound_push(conn_data) 直接解码
-          2. PushMsg 外层解包: decode_push_msg(conn_data) 拿 rawData,
-             再 decode_inbound_push(rawData)
-          3. rawData JSON 回退: raw_data 当 JSON 解析
-          4. DirectedPush.content: decode_directed_push(conn_data) 拿 content JSON
-          5. conn_data JSON 兜底（含 callback_command 过滤，最后才尝试）
+        conn_data 在元宝场景下只有两种形态：
+          - JSON 字符串：callback_command 格式的入站消息（主流）
+          - Protobuf 二进制：InboundMessagePush
+
+        先试 JSON，失败再当 protobuf 解。JSON 优先是为了避免把 JSON 的 ASCII
+        bytes 喂给 protobuf 解析器解出"看似合法"的垃圾字段。
+
+        注：元宝下发入站消息的 callback_command 常为 "C2C.CallbackAfterSendMsg" /
+        "Group.CallbackAfterSendMsg"——"AfterSendMsg" 字面误导，实际就是入站消息
+        （非 bot 发送回显），不要过滤。
         """
         push = None
-        raw_data = None  # PushMsg.data
+        decoded_via = ""  # "json" | "protobuf"
 
-        # Step 1: connData protobuf 解码（优先，完整 ConnMsg.data）
-        # P0: 仅当 push 非 None 且非空 dict 才停止尝试
         if conn_data:
             try:
-                push = decode_inbound_push(conn_data)
-                if not push:  # None 或空 dict {} 都视为失败，继续后续步骤
-                    push = None
-            except Exception:
-                push = None
-
-        # Step 2: PushMsg 外层解包 + rawData protobuf
-        if not push:
-            push_msg = decode_push_msg(conn_data)
-            if push_msg is not None:
-                raw_data = push_msg.get("data") or b""
-                logger.debug(
-                    "[%s] PushMsg decoded: cmd=%r module=%r raw_data_len=%d",
-                    self.name, push_msg.get("cmd"), push_msg.get("module"), len(raw_data),
-                )
-                if raw_data:
-                    try:
-                        push = decode_inbound_push(raw_data)
-                        if not push:
-                            push = None
-                    except Exception:
-                        push = None
-
-        # Step 3: rawData JSON 回退
-        if not push and raw_data:
-            try:
-                raw_json = json.loads(raw_data.decode("utf-8"))
-                logger.info("[%s] rawData JSON push: fields=%s len=%d",
-                    self.name, list(raw_json.keys()), len(json.dumps(raw_json)))
-                push = _parse_json_push(raw_json)
-            except Exception:
-                pass
-
-        # Step 4: DirectedPush.content（content 是 JSON 字符串）
-        if not push:
-            directed = decode_directed_push(conn_data)
-            if directed and directed.get("content"):
-                content_str = directed["content"]
-                logger.info("[%s] DirectedPush: type=%d content_len=%d",
-                    self.name, directed.get("type", 0), len(content_str))
-                try:
-                    content_json = json.loads(content_str)
-                    push = _parse_json_push(content_json)
-                    if push and not push.get("msg_body"):
-                        msg_body = _parse_push_content_to_msg_body(content_str)
-                        if msg_body:
-                            push["msg_body"] = msg_body
-                except Exception as _content_exc:
-                    # P2: 记录 JSON 解析失败，方便诊断
-                    logger.warning(
-                        "[%s] DirectedPush content JSON parse failed: %s",
-                        self.name, _content_exc,
-                    )
-                    if content_str.strip():
-                        push = {
-                            "from_account": "",
-                            "msg_body": [{"msg_type": "TIMTextElem",
-                                          "msg_content": {"text": content_str}}],
-                        }
-                        logger.debug(
-                            "[%s] DirectedPush fallback to plain text: %s",
-                            self.name, content_str[:200],
-                        )
-
-        # Step 5: conn_data itself is JSON (callback_command style push) — 最后兜底
-        # Yuanbao delivers inbound user messages directly as JSON in ConnMsg.data, e.g.:
-        #   {"callback_command":"C2C.CallbackAfterSendMsg", "from_account":..., "msg_body":[...]}
-        # NOTE: Despite the name "AfterSendMsg", this is the format for INBOUND user messages
-        # (not a bot send-echo). The TS original code (gateway.ts decodeFromContent) assigns
-        # C2C.CallbackAfterSendMsg as the callback_command for user messages received via
-        # DirectedPush.content — this is exactly what Yuanbao server sends as the push payload.
-        # Do NOT filter these out.
-        if not push and conn_data:
-            try:
                 conn_json = json.loads(conn_data.decode("utf-8"))
-                if not isinstance(conn_json, dict):
-                    pass
-                else:
-                    logger.info("[%s] conn_data JSON push: fields=%s len=%d",
-                        self.name, list(conn_json.keys()), len(json.dumps(conn_json)))
-                    push = _parse_json_push(conn_json)
             except Exception:
-                pass
+                conn_json = None
+            if isinstance(conn_json, dict):
+                logger.info(
+                    "[%s] conn_data is JSON: fields=%s len=%d",
+                    self.name, list(conn_json.keys()), len(conn_data),
+                )
+                push = _parse_json_push(conn_json) or None
+                if push:
+                    decoded_via = "json"
+            else:
+                try:
+                    push = decode_inbound_push(conn_data) or None
+                except Exception:
+                    push = None
+                if push:
+                    decoded_via = "protobuf"
+                    logger.info(
+                        "[%s] conn_data is Protobuf (InboundMessagePush): len=%d",
+                        self.name, len(conn_data),
+                    )
 
         if not push:
             logger.info("[%s] Push decoded but no valid message. conn_data hex(first64)=%s",
                 self.name, conn_data.hex()[:128] if conn_data else "(empty)")
             return
 
-        logger.info("[%s] Push decoded: from=%s group=%s msg_body_len=%d", self.name, push.get("from_account",""), push.get("group_code",""), len(push.get("msg_body",[])))
+        logger.info(
+            "[%s] Push decoded (via=%s): from=%s group=%s msg_id=%s msg_types=%s",
+            self.name, decoded_via,
+            push.get("from_account", ""),
+            push.get("group_code", ""),
+            push.get("msg_id", ""),
+            [e.get("msg_type", "") for e in push.get("msg_body", [])],
+        )
+        logger.debug("[%s] Push payload: %s", self.name, push)
         from_account: str = push.get("from_account", "")
         group_code: str = push.get("group_code", "")
         group_name: str = push.get("group_name", "")
@@ -1812,6 +1845,29 @@ class YuanbaoAdapter(BasePlatformAdapter):
             logger.debug("[%s] Skipping placeholder message: %r", self.name, raw_text)
             return
 
+        # Bot owner 白名单命令快速路径。
+        # - owner 命中：跳过 @Bot 检测，把 raw_text 置为纯净命令文本
+        #   （去掉 AT 前缀），让下游 event.get_command() 能正确识别
+        # - 非 owner 命中：发送拒绝提示后 return
+        # - 未命中：走正常消息分派
+        matched_cmd, cmd_line, is_owner = self._detect_owner_command(
+            push=push,
+            msg_body=msg_body,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            from_account=from_account,
+        )
+        if matched_cmd and not is_owner:
+            self._track_task(asyncio.create_task(
+                self.send(chat_id, f"⚠️ {matched_cmd} 仅限创建者并且在私聊模式下使用哦~"),
+                name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
+            ))
+            return
+        owner_command: Optional[str] = None
+        if matched_cmd and is_owner and cmd_line:
+            owner_command = matched_cmd
+            raw_text = cmd_line  # 用纯净命令文本覆盖，去掉 AT 前缀
+
         source = self.build_source(
             chat_id=chat_id,
             chat_type=chat_type,
@@ -1826,7 +1882,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
         )
 
         # ---- Group chat: observe non-@bot messages, reply only on @Bot ----
-        if chat_type == "group" and not self._is_at_bot(msg_body):
+        # Owner 命令跳过 @Bot 检测（不要求 owner @Bot）。
+        if chat_type == "group" and not owner_command and not self._is_at_bot(msg_body):
             self._observe_group_message(source, sender_nickname or from_account, raw_text)
             logger.info(
                 "[%s] Group message observed (no @bot): chat=%s from=%s",
@@ -2835,31 +2892,9 @@ def _parse_json_push(raw_json: dict) -> dict | None:
         "msg_id": raw_json.get("msg_id", "") or raw_json.get("msg_key", "") or raw_json.get("MsgKey", ""),
         "msg_body": msg_body,
         "cloud_custom_data": raw_json.get("cloud_custom_data", "") or raw_json.get("CloudCustomData", ""),
+        "bot_owner_id": raw_json.get("bot_owner_id", "") or raw_json.get("botOwnerId", ""),
         "trace_id": (raw_json.get("log_ext") or {}).get("trace_id", "") if isinstance(raw_json.get("log_ext"), dict) else "",
     }
-
-
-def _parse_push_content_to_msg_body(content: str) -> list | None:
-    """
-    将 DirectedPush.content（字符串）解析为 msg_body 列表。
-    对齐 TS 的 parsePushContentToMsgBody。
-
-    - 若是 JSON 且有 msg_body 数组 → 直接返回
-    - 若是 JSON 且有 text 字段 → 包装为 TIMTextElem
-    - 纯文本 → 包装为 TIMTextElem
-    """
-    if not content or not content.strip():
-        return None
-    try:
-        parsed = json.loads(content)
-        if parsed.get("msg_body") and isinstance(parsed["msg_body"], list):
-            return _convert_json_msg_body(parsed["msg_body"])
-        if parsed.get("text"):
-            return [{"msg_type": "TIMTextElem", "msg_content": {"text": parsed["text"]}}]
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    # 纯文本
-    return [{"msg_type": "TIMTextElem", "msg_content": {"text": content}}]
 
 
 def _convert_json_msg_body(raw_body: list) -> list:

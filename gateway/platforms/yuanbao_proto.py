@@ -621,44 +621,6 @@ def _decode_log_ext(data: bytes) -> dict:
 #   20: log_ext (message LogInfoExt)
 
 
-def decode_push_msg(data: bytes) -> Optional[dict]:
-    """
-    解析 ConnMsg.data 中的 PushMsg wrapper（conn layer）。
-
-    PushMsg 结构（来自 proto/conn.json）:
-      field 1: cmd    (string)
-      field 2: module (string)
-      field 3: msgId  (string)
-      field 4: data   (bytes)  ← 真正的 biz payload（InboundMessagePush）
-
-    Returns:
-        {
-          "cmd":    str,
-          "module": str,
-          "msg_id": str,
-          "data":   bytes,
-        }
-        或 None（解析失败或不含 cmd/module）
-    """
-    try:
-        fdict = _fields_to_dict(_parse_fields(data))
-        cmd = _get_string(fdict, 1)
-        module = _get_string(fdict, 2)
-        msg_id = _get_string(fdict, 3)
-        biz_data = _get_bytes(fdict, 4)
-        # PushMsg 应至少有 cmd 或 module，否则不是 PushMsg
-        if not cmd and not module:
-            return None
-        return {
-            "cmd": cmd,
-            "module": module,
-            "msg_id": msg_id,
-            "data": biz_data or b"",
-        }
-    except Exception:
-        return None
-
-
 def decode_inbound_push(data: bytes) -> Optional[dict]:
     """
     解析入站消息推送的 biz payload（InboundMessagePush proto bytes）。
@@ -1005,69 +967,6 @@ def encode_push_ack(original_head: dict) -> bytes:
         module=original_head.get("module", ""),
         data=b"",
     )
-
-
-# ============================================================
-# 解码 ConnMsg 并提取入站消息（一步到位）
-# ============================================================
-
-def decode_inbound_conn_msg(raw: bytes) -> Optional[dict]:
-    """
-    一步解码 WebSocket frame（ConnMsg bytes）并提取入站消息。
-    仅当 cmd_type == Push(2) 时尝试解析 biz payload。
-
-    Returns:
-        {
-          "head":    dict,           # ConnMsg.Head
-          "message": dict | None,    # decode_inbound_push 的结果（push 时）
-          "raw_data": bytes,         # ConnMsg.data 原始 bytes
-        }
-    """
-    conn = decode_conn_msg(raw)
-    head = conn["head"]
-    result = {
-        "head": head,
-        "raw_data": conn["data"],
-        "message": None,
-    }
-    if head["cmd_type"] == CMD_TYPE["Push"] and conn["data"]:
-        result["message"] = decode_inbound_push(conn["data"])
-    return result
-
-# ============================================================
-# DirectedPush 解码
-# ============================================================
-#
-# DirectedPush proto schema (conn.json):
-#   message DirectedPush {
-#     uint32 type    = 1;
-#     string content = 2;  ← JSON 字符串，结构与 InboundMessagePush 类似
-#   }
-
-
-def decode_directed_push(data: bytes) -> Optional[dict]:
-    """
-    解码 DirectedPush 帧（ConnMsg.data 中的 DirectedPush）。
-
-    Args:
-        data: ConnMsg.data 字节
-
-    Returns:
-        {
-          "type":    int,   # DirectedPush.type
-          "content": str,   # DirectedPush.content（JSON 字符串）
-        }
-        或 None（解析失败，或 type/content 均为空）
-    """
-    try:
-        fdict = _fields_to_dict(_parse_fields(data))
-        push_type = _get_varint(fdict, 1, 0)
-        content = _get_string(fdict, 2, "")
-        if not push_type and not content:
-            return None
-        return {"type": push_type, "content": content}
-    except Exception:
-        return None
 
 
 # ============================================================
