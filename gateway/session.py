@@ -280,6 +280,14 @@ def build_session_context_prompt(
             "Do not promise to perform these actions. If the user asks, explain "
             "that you can only read messages sent directly to you and respond."
         )
+    elif context.source.platform == Platform.YUANBAO:
+        lines.append("")
+        lines.append(
+            "**Platform notes:** You are running inside Yuanbao. "
+            "You CAN send private (DM) messages via the send_message tool. "
+            "Use target='yuanbao:direct:<account_id>' for DM "
+            "and target='yuanbao:group:<group_code>' for group chat."
+        )
 
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
