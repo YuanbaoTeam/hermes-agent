@@ -72,7 +72,8 @@ def make_ctx(adapter=None, conn_data=b"", **overrides) -> InboundContext:
     """Create an InboundContext with sensible defaults for testing."""
     if adapter is None:
         adapter = make_adapter()
-    ctx = InboundContext(adapter=adapter, conn_data=conn_data)
+    raw_frames = [conn_data] if conn_data else []
+    ctx = InboundContext(adapter=adapter, raw_frames=raw_frames)
     for k, v in overrides.items():
         setattr(ctx, k, v)
     return ctx
@@ -314,7 +315,7 @@ class TestInboundContext:
         """InboundContext has sensible defaults."""
         adapter = make_adapter()
         ctx = InboundContext(adapter=adapter)
-        assert ctx.conn_data == b""
+        assert ctx.raw_frames == []
         assert ctx.push is None
         assert ctx.decoded_via == ""
         assert ctx.from_account == ""
@@ -766,7 +767,7 @@ class TestPipelineIntegration:
             msg_id="msg-e2e-001",
         )
 
-        ctx = InboundContext(adapter=adapter, conn_data=push_data)
+        ctx = InboundContext(adapter=adapter, raw_frames=[push_data])
         pipeline = InboundPipelineBuilder.build()
         await pipeline.execute(ctx)
 
@@ -791,7 +792,7 @@ class TestPipelineIntegration:
             msg_id="msg-self-001",
         )
 
-        ctx = InboundContext(adapter=adapter, conn_data=push_data)
+        ctx = InboundContext(adapter=adapter, raw_frames=[push_data])
         pipeline = InboundPipelineBuilder.build()
         await pipeline.execute(ctx)
 
@@ -810,13 +811,13 @@ class TestPipelineIntegration:
             text="Hello!",
             msg_id="msg-dup-001",
         )
-        ctx1 = InboundContext(adapter=adapter, conn_data=push_data)
+        ctx1 = InboundContext(adapter=adapter, raw_frames=[push_data])
         pipeline = InboundPipelineBuilder.build()
         await pipeline.execute(ctx1)
         assert ctx1.from_account == "alice"
 
         # Second message with same msg_id is filtered
-        ctx2 = InboundContext(adapter=adapter, conn_data=push_data)
+        ctx2 = InboundContext(adapter=adapter, raw_frames=[push_data])
         await pipeline.execute(ctx2)
         # Dedup should stop pipeline before chat routing
         assert ctx2.chat_type == ""
@@ -834,7 +835,7 @@ class TestPipelineIntegration:
             msg_id="msg-blocked-001",
         )
 
-        ctx = InboundContext(adapter=adapter, conn_data=push_data)
+        ctx = InboundContext(adapter=adapter, raw_frames=[push_data])
         pipeline = InboundPipelineBuilder.build()
         await pipeline.execute(ctx)
 

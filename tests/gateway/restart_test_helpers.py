@@ -81,6 +81,9 @@ def make_restart_runner(
     runner._handle_restart_command = GatewayRunner._handle_restart_command.__get__(
         runner, GatewayRunner
     )
+    runner._send_restart_notification = GatewayRunner._send_restart_notification.__get__(
+        runner, GatewayRunner
+    )
     runner._status_action_label = GatewayRunner._status_action_label.__get__(
         runner, GatewayRunner
     )

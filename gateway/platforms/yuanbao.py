@@ -53,6 +53,8 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
 )
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
@@ -136,6 +138,17 @@ REPLY_REF_TTL_S = 300.0            # Reference dedup TTL (5 minutes)
 # Slow-response hint: push a waiting message when agent produces no data for this duration (seconds)
 SLOW_RESPONSE_TIMEOUT_S = 120.0
 SLOW_RESPONSE_MESSAGE = "The task is a bit complex, working hard on it, please wait patiently..."
+
+# Regex matching Yuanbao resource reference anchors in transcript text:
+#   [image|ybres:abc123]  [file:report.pdf|ybres:xyz789]  [voice|ybres:...]
+_YB_RES_REF_RE = re.compile(
+    r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]"
+)
+
+# Observed-media backfill: how many recent transcript messages to scan
+OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
+# Max number of resource references to resolve per inbound turn
+OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
 
 
 # ============================================================
@@ -866,7 +879,7 @@ class InboundContext:
     """
 
     adapter: Any  # YuanbaoAdapter (forward-ref avoids circular import)
-    conn_data: bytes = b""
+    raw_frames: list = dc_field(default_factory=list)  # Raw bytes frames (debounce-aggregated)
 
     # Populated by DecodeMiddleware
     push: Optional[dict] = None
@@ -1039,7 +1052,7 @@ class InboundPipeline:
 # ============================================================
 
 class DecodeMiddleware(InboundMiddleware):
-    """Decode conn_data from JSON or Protobuf into ctx.push.
+    """Decode raw inbound frames from JSON or Protobuf into ctx.push.
 
     Encapsulates JSON push parsing (aligned with TS decodeFromContent)
     and Protobuf decoding via ``decode_inbound_push``.
@@ -1122,43 +1135,67 @@ class DecodeMiddleware(InboundMiddleware):
 
     # -- Pipeline handler --------------------------------------------------
 
-    async def handle(self, ctx: InboundContext, next_fn) -> None:
-        if not ctx.conn_data:
-            return  # Stop pipeline — nothing to decode
-
-        # Try JSON first (mainstream callback_command format)
+    def _decode_single(self, adapter, data: bytes) -> tuple:
+        """Decode a single raw frame into (push_dict, decoded_via) or (None, '')."""
         try:
-            conn_json = json.loads(ctx.conn_data.decode("utf-8"))
+            conn_json = json.loads(data.decode("utf-8"))
         except Exception:
             conn_json = None
 
         if isinstance(conn_json, dict):
-            logger.info(
-                "[%s] conn_data is JSON: fields=%s len=%d",
-                ctx.adapter.name, list(conn_json.keys()), len(ctx.conn_data),
-            )
-            ctx.push = self.parse_json_push(conn_json) or None
-            if ctx.push:
-                ctx.decoded_via = "json"
+            push = self.parse_json_push(conn_json)
+            if push:
+                return push, "json"
         else:
             try:
-                ctx.push = decode_inbound_push(ctx.conn_data) or None
+                push = decode_inbound_push(data)
             except Exception:
-                ctx.push = None
-            if ctx.push:
-                ctx.decoded_via = "protobuf"
-                logger.info(
-                    "[%s] conn_data is Protobuf (InboundMessagePush): len=%d",
-                    ctx.adapter.name, len(ctx.conn_data),
-                )
+                push = None
+            if push:
+                return push, "protobuf"
 
-        if not ctx.push:
-            logger.info(
-                "[%s] Push decoded but no valid message. conn_data hex(first64)=%s",
-                ctx.adapter.name,
-                ctx.conn_data.hex()[:128] if ctx.conn_data else "(empty)",
-            )
+        return None, ""
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        data_list = ctx.raw_frames
+        if not data_list:
+            return  # Stop pipeline — nothing to decode
+
+        merged_push = None
+        decoded_via = ""
+
+        for data in data_list:
+            push, via = self._decode_single(ctx.adapter, data)
+            if not push:
+                logger.info(
+                "[%s] Push decoded but no valid message. raw hex(first64)=%s",
+                    ctx.adapter.name, data.hex()[:128] if data else "(empty)",
+                )
+                continue
+
+            if merged_push is None:
+                # First valid push becomes the base
+                merged_push = push
+                decoded_via = via
+                logger.info(
+                "[%s] Frame decoded (via=%s): len=%d",
+                    ctx.adapter.name, via, len(data),
+                )
+            else:
+                # Subsequent pushes: merge msg_body into the base
+                extra_body = push.get("msg_body", [])
+                if extra_body:
+                    merged_push["msg_body"] = merged_push.get("msg_body", []) + extra_body
+                    logger.info(
+                        "[%s] Merged %d extra msg_body elements from aggregated push",
+                        ctx.adapter.name, len(extra_body),
+                    )
+
+        if not merged_push:
             return  # Stop pipeline
+
+        ctx.push = merged_push
+        ctx.decoded_via = decoded_via
 
         logger.info(
             "[%s] Push decoded (via=%s): from=%s group=%s msg_id=%s msg_types=%s",
@@ -1478,7 +1515,6 @@ class ExtractContentMiddleware(InboundMiddleware):
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         await next_fn()
-
 
 class PlaceholderFilterMiddleware(InboundMiddleware):
     """Skip pure placeholder messages (e.g. '[image]' with no media)."""
@@ -1909,10 +1945,115 @@ class MediaResolveMiddleware(InboundMiddleware):
         return url
 
     @classmethod
+    async def _download_and_cache(
+        cls, adapter, *, fetch_url: str, kind: str,
+        file_name: Optional[str] = None, log_tag: str = "",
+    ) -> Optional[Tuple[str, str]]:
+        """Download a Yuanbao resource and cache locally. Returns ``(local_path, mime)`` or ``None``."""
+        try:
+            file_bytes, content_type = await media_download_url(
+                fetch_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] inbound media download failed: kind=%s %s err=%s",
+                adapter.name, kind, log_tag, exc,
+            )
+            return None
+
+        if kind == "image":
+            ext = cls._guess_image_ext_from_url(fetch_url)
+            try:
+                local_path = cache_image_from_bytes(file_bytes, ext=ext)
+            except ValueError as exc:
+                logger.warning(
+                    "[%s] inbound image cache rejected: %s err=%s",
+                    adapter.name, log_tag, exc,
+                )
+                return None
+            mime = guess_mime_type(f"image{ext}")
+            if not mime.startswith("image/"):
+                mime = content_type if content_type.startswith("image/") else "image/jpeg"
+            return local_path, mime
+
+        # kind == "file"
+        if not file_name:
+            parsed = urllib.parse.urlparse(fetch_url)
+            file_name = os.path.basename(parsed.path) or "file"
+        try:
+            local_path = cache_document_from_bytes(file_bytes, file_name)
+        except Exception as exc:
+            logger.warning(
+                "[%s] inbound file cache failed: %s err=%s",
+                adapter.name, log_tag, exc,
+            )
+            return None
+        mime = guess_mime_type(file_name) or content_type or "application/octet-stream"
+        return local_path, mime
+
+    @classmethod
+    async def _resolve_by_resource_id(cls, adapter, resource_id: str) -> str:
+        """Exchange a Yuanbao ``resourceId`` for a short-lived direct download URL. Raises on failure."""
+        resource_id = resource_id.strip()
+        if not resource_id:
+            raise RuntimeError("missing resource_id")
+
+        token_data = await adapter._get_cached_token()
+        token = str(token_data.get("token") or "").strip()
+        source = str(token_data.get("source") or "web").strip() or "web"
+        bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
+        if not token or not bot_id:
+            raise RuntimeError("missing token or bot_id for resource download")
+
+        api_url = f"{adapter._api_domain}/api/resource/v1/download"
+        headers = {
+            "Content-Type": "application/json",
+            "X-ID": bot_id,
+            "X-Token": token,
+            "X-Source": source,
+        }
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            for attempt in range(2):
+                resp = await client.get(api_url, params={"resourceId": resource_id}, headers=headers)
+                if resp.status_code == 401 and attempt == 0:
+                    token_data = await SignManager.force_refresh(
+                        adapter._app_key, adapter._app_secret, adapter._api_domain,
+                    )
+                    token = str(token_data.get("token") or "").strip()
+                    source = str(token_data.get("source") or source or "web").strip() or "web"
+                    bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
+                    if not token or not bot_id:
+                        break
+                    headers["X-ID"] = bot_id
+                    headers["X-Token"] = token
+                    headers["X-Source"] = source
+                    continue
+
+                resp.raise_for_status()
+                payload = resp.json()
+                code = payload.get("code")
+                if code not in (None, 0):
+                    raise RuntimeError(
+                        f"resource/v1/download failed: code={code}, msg={payload.get('msg', '')}"
+                    )
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                real_url = str((data or {}).get("url") or (data or {}).get("realUrl") or "").strip()
+                if real_url:
+                    return real_url
+                raise RuntimeError("resource/v1/download missing url/realUrl")
+
+        raise RuntimeError("resource/v1/download did not return a URL")
+
+    @classmethod
     async def _resolve_media_urls(
         cls, adapter, media_refs: List[Dict[str, str]]
     ) -> Tuple[List[str], List[str]]:
-        """Parse inbound image/file URLs, return (media_urls, media_types)."""
+        """Resolve inbound media refs: download to local cache, return (local_paths, mime_types).
+
+        Yuanbao COS hostnames resolve to private IPs, tripping the SSRF guard
+        in vision_tools. We download ourselves and return local cache paths.
+        """
         media_urls: List[str] = []
         media_types: List[str] = []
 
@@ -1931,25 +2072,91 @@ class MediaResolveMiddleware(InboundMiddleware):
                 )
                 continue
 
-            # Infer MIME by resource type
-            if kind == "image":
-                ext = cls._guess_image_ext_from_url(fetch_url)
-                mime = guess_mime_type(f"image{ext}")
-                if not mime.startswith("image/"):
-                    mime = "image/jpeg"
-                media_urls.append(fetch_url)
-                media_types.append(mime)
+            cached = await cls._download_and_cache(
+                adapter,
+                fetch_url=fetch_url,
+                kind=kind,
+                file_name=str(ref.get("name") or "").strip() or None,
+                log_tag=f"placeholder_url={url[:80]}",
+            )
+            if cached is None:
                 continue
-
-            file_name = str(ref.get("name") or "").strip()
-            if not file_name:
-                parsed = urllib.parse.urlparse(fetch_url)
-                file_name = os.path.basename(parsed.path) or "file"
-            mime = guess_mime_type(file_name) or "application/octet-stream"
-            media_urls.append(fetch_url)
+            local_path, mime = cached
+            media_urls.append(local_path)
             media_types.append(mime)
 
         return media_urls, media_types
+
+    @classmethod
+    async def _collect_observed_media(
+        cls, adapter, source,
+    ) -> Tuple[List[str], List[str]]:
+        """Resolve recent observed image/file anchors from transcript into ``(local_paths, mimes)``."""
+        store = getattr(adapter, "_session_store", None)
+        if not store:
+            return [], []
+        try:
+            session_entry = store.get_or_create_session(source)
+            history = store.load_transcript(session_entry.session_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Observed-media hydration setup failed: %s",
+                adapter.name, exc,
+            )
+            return [], []
+        if not history:
+            return [], []
+
+        start = max(0, len(history) - OBSERVED_MEDIA_BACKFILL_LOOKBACK)
+        order: List[Tuple[str, str, str]] = []  # (rid, kind, filename)
+        seen: set = set()
+        for msg in history[start:]:
+            content = msg.get("content")
+            if not isinstance(content, str) or "|ybres:" not in content:
+                continue
+            for m in _YB_RES_REF_RE.finditer(content):
+                head = m.group(1)  # "image" | "file:<name>" | "voice" | "video"
+                rid = m.group(2)
+                kind, _, filename = head.partition(":")
+                kind = kind.strip()
+                if kind not in ("image", "file"):
+                    continue
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                order.append((rid, kind, filename.strip()))
+                if len(order) >= OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN:
+                    break
+            if len(order) >= OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN:
+                break
+
+        if not order:
+            return [], []
+
+        media_paths: List[str] = []
+        mimes: List[str] = []
+        for rid, kind, filename in order:
+            try:
+                fresh_url = await cls._resolve_by_resource_id(adapter, rid)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] observed-media resolve failed: rid=%s kind=%s err=%s",
+                    adapter.name, rid, kind, exc,
+                )
+                continue
+            cached = await cls._download_and_cache(
+                adapter,
+                fetch_url=fresh_url,
+                kind=kind,
+                file_name=filename or None,
+                log_tag=f"rid={rid}",
+            )
+            if cached is None:
+                continue
+            path, mime = cached
+            media_paths.append(path)
+            mimes.append(mime)
+        return media_paths, mimes
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
@@ -1970,14 +2177,63 @@ class DispatchMiddleware(InboundMiddleware):
         adapter = ctx.adapter
 
         async def _dispatch_inbound_event() -> None:
+            media_urls = list(ctx.media_urls)
+            media_types = list(ctx.media_types)
+
+            # Backfill observed media from recent transcript history
+            extra_img_urls: List[str] = []
+            extra_img_mimes: List[str] = []
+            try:
+                extra_img_urls, extra_img_mimes = await MediaResolveMiddleware._collect_observed_media(
+                    adapter, ctx.source,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] observed-image hydration raised, continuing anyway: %s",
+                    adapter.name, exc,
+                )
+            if extra_img_urls:
+                current = set(media_urls)
+                for u, m in zip(extra_img_urls, extra_img_mimes):
+                    if u in current:
+                        continue
+                    media_urls.append(u)
+                    media_types.append(m)
+                    current.add(u)
+
+            # Replace [kind|ybres:xxx] anchors with local cache paths so
+            # the transcript records usable paths for the model.
+            _patched_event_text = ctx.raw_text
+            for u, m in zip(media_urls, media_types):
+                if not u.startswith("/"):
+                    continue
+                anchor_match = _YB_RES_REF_RE.search(_patched_event_text)
+                if not anchor_match:
+                    continue
+                head = anchor_match.group(1)
+                kind, _, filename = head.partition(":")
+                kind = kind.strip()
+                if kind == "image" and m.startswith("image/"):
+                    replacement = f"[image: {u}]"
+                elif kind == "file":
+                    label = filename.strip() or os.path.basename(u)
+                    replacement = f"[file: {label} → {u}]"
+                else:
+                    continue
+                _patched_event_text = (
+                    _patched_event_text[:anchor_match.start()]
+                    + replacement
+                    + _patched_event_text[anchor_match.end():]
+                )
+
             event = MessageEvent(
-                text=ctx.raw_text,
+                text=_patched_event_text,
                 message_type=ctx.msg_type,
                 source=ctx.source,
                 message_id=ctx.msg_id or None,
                 raw_message=ctx.push,
-                media_urls=ctx.media_urls,
-                media_types=ctx.media_types,
+                media_urls=media_urls,
+                media_types=media_types,
                 reply_to_message_id=ctx.reply_to_message_id,
                 reply_to_text=ctx.reply_to_text,
                 channel_prompt=ctx.channel_prompt,
@@ -2057,6 +2313,9 @@ class ConnectionManager:
         self._consecutive_hb_timeouts: int = 0
         self._reconnect_attempts: int = 0
         self._reconnecting: bool = False
+        # Debounce buffer for aggregating multi-part inbound messages
+        self._inbound_buffer: Dict[str, list] = {}  # key -> [raw_data_frames, ...]
+        self._inbound_timers: Dict[str, asyncio.TimerHandle] = {}  # key -> timer
 
     # -- Properties --------------------------------------------------------
 
@@ -2459,19 +2718,91 @@ class ConnectionManager:
 
     # -- Inbound dispatch ---------------------------------------------------
 
-    def _push_to_inbound(self, conn_data: bytes) -> None:
-        """Convert push frame to MessageEvent and dispatch to AI via pipeline.
+    _DEBOUNCE_WINDOW: float = 1.5  # seconds to wait for companion messages
 
-        Bridges the WS receive loop with the inbound middleware pipeline.
-        conn_data in Yuanbao scenario has only two forms:
-          - JSON string: callback_command format inbound message (mainstream)
-          - Protobuf binary: InboundMessagePush
+    def _extract_sender_key(self, raw_data: bytes) -> str:
+        """Lightweight decode to extract sender key for debounce grouping.
+
+        Returns 'from_account:group_code' or a fallback unique key.
         """
+        try:
+            parsed = json.loads(raw_data.decode("utf-8"))
+            if isinstance(parsed, dict):
+                from_account = (
+                    parsed.get("from_account", "")
+                    or parsed.get("From_Account", "")
+                )
+                group_code = (
+                    parsed.get("group_code", "")
+                    or parsed.get("GroupId", "")
+                    or parsed.get("group_id", "")
+                )
+                if from_account:
+                    return f"{from_account}:{group_code}"
+        except Exception:
+            pass
+        # Protobuf: try decode_inbound_push for sender info
+        try:
+            push = decode_inbound_push(raw_data)
+            if push:
+                return f"{push.get('from_account', '')}:{push.get('group_code', '')}"
+        except Exception:
+            pass
+        # Fallback: unique key (no aggregation)
+        return f"__unknown_{id(raw_data)}"
+
+    def _push_to_inbound(self, raw_data: bytes) -> None:
+        """Debounced inbound dispatch.
+
+        Buffers raw frames from the same sender within a short time window,
+        then dispatches all buffered data as a single aggregated pipeline
+        execution.  This merges multi-part messages (e.g. image + text sent
+        as separate WS pushes) into one pipeline run.
+        """
+        key = self._extract_sender_key(raw_data)
+
+        # Cancel existing timer for this key (reset debounce window)
+        existing_timer = self._inbound_timers.pop(key, None)
+        if existing_timer:
+            existing_timer.cancel()
+
+        # Append to buffer
+        if key not in self._inbound_buffer:
+            self._inbound_buffer[key] = []
+        self._inbound_buffer[key].append(raw_data)
+
+        logger.debug(
+            "[%s] Debounce: buffered frame for key=%s, count=%d",
+            self._adapter.name, key, len(self._inbound_buffer[key]),
+        )
+
+        # Schedule flush after debounce window
+        loop = asyncio.get_running_loop()
+        timer = loop.call_later(
+            self._DEBOUNCE_WINDOW,
+            self._flush_inbound_buffer,
+            key,
+        )
+        self._inbound_timers[key] = timer
+
+    def _flush_inbound_buffer(self, key: str) -> None:
+        """Flush the debounce buffer for a given key — execute the pipeline."""
+        self._inbound_timers.pop(key, None)
+        data_list = self._inbound_buffer.pop(key, [])
+        if not data_list:
+            return
+
         adapter = self._adapter
-        ctx = InboundContext(adapter=adapter, conn_data=conn_data)
+        logger.info(
+            "[%s] Debounce flush: key=%s, aggregated %d frames",
+            adapter.name, key, len(data_list),
+        )
+
+        ctx = InboundContext(adapter=adapter, raw_frames=data_list)
+
         adapter._track_task(asyncio.create_task(
             adapter._inbound_pipeline.execute(ctx),
-            name=f"yuanbao-pipeline-{id(conn_data)}",
+            name=f"yuanbao-pipeline-{key}",
         ))
 
     # -- Send business request ---------------------------------------------
@@ -2703,12 +3034,17 @@ class MediaSendHandler(ABC):
                 )
 
                 # 5. Build MsgBody
+                # Remove keys already passed explicitly to avoid "multiple values" TypeError
+                fwd_kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k not in ("file_uuid", "filename", "content_type")
+                }
                 msg_body = self.build_msg_body(
                     upload_result,
                     file_uuid=file_uuid,
                     filename=filename,
                     content_type=content_type,
-                    **kwargs,
+                    **fwd_kwargs,
                 )
             else:
                 # Non-COS media (e.g. sticker): build MsgBody directly
@@ -3713,6 +4049,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
+    MEDIA_MAX_SIZE_MB: int = 50  # Max media file size in MB for upload validation
     REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
 
     # -- Active instance registry (class-level singleton) -------------------
