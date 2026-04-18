@@ -847,7 +847,7 @@ class TestPipelineIntegration:
         adapter = make_adapter()
         assert hasattr(adapter, "_inbound_pipeline")
         assert isinstance(adapter._inbound_pipeline, InboundPipeline)
-        assert len(adapter._inbound_pipeline.middleware_names) == 15
+        assert len(adapter._inbound_pipeline.middleware_names) == 16
 
 
 if __name__ == "__main__":
@@ -1032,14 +1032,14 @@ class TestCreateInboundPipelineOOP:
     def test_factory_uses_oop_instances(self):
         """InboundPipelineBuilder.build() creates pipeline with OOP middleware instances."""
         pipeline = InboundPipelineBuilder.build()
-        # Verify all 15 middlewares are registered
-        assert len(pipeline.middleware_names) == 15
+        # Verify all 16 middlewares are registered
+        assert len(pipeline.middleware_names) == 16
         # Verify the names match expected order
         expected = [
             "decode", "extract-fields", "dedup", "skip-self",
             "chat-routing", "access-guard", "extract-content",
             "placeholder-filter", "owner-command", "build-source",
-            "group-at-guard", "classify-msg-type", "quote-context",
-            "media-resolve", "dispatch",
+            "group-at-guard", "group-attribution", "classify-msg-type",
+            "quote-context", "media-resolve", "dispatch",
         ]
         assert pipeline.middleware_names == expected

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -906,6 +907,9 @@ class InboundContext:
     media_urls: list = dc_field(default_factory=list)
     media_types: list = dc_field(default_factory=list)
 
+    # Populated by GroupAttributionMiddleware
+    channel_prompt: Optional[str] = None
+
 
 class InboundMiddleware(ABC):
     """Abstract base class for all inbound pipeline middlewares.
@@ -1601,18 +1605,56 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         return False
 
     @staticmethod
+    def _extract_bot_mention_text(msg_body: list, bot_id: Optional[str]) -> str:
+        """Extract the display text used to @-mention this bot (e.g. ``@yuanbao-bot``)."""
+        if not bot_id:
+            return ""
+        for elem in msg_body:
+            if elem.get("msg_type") != "TIMCustomElem":
+                continue
+            data_str = elem.get("msg_content", {}).get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if custom.get("elem_type") == 1002 and custom.get("user_id") == bot_id:
+                mention_text = str(custom.get("text") or "").strip()
+                if mention_text:
+                    return mention_text
+        return ""
+
+    @staticmethod
+    def _build_group_channel_prompt(msg_body: list, bot_id: Optional[str]) -> str:
+        """Build a per-turn group-chat prompt that highlights which message to respond to."""
+        bid = str(bot_id or "unknown")
+        bot_mention = GroupAtGuardMiddleware._extract_bot_mention_text(msg_body, bot_id) or "unknown"
+        return (
+            "You are handling a Yuanbao group chat message.\n"
+            f"- Your identity: user_id={bid}, @-mention name in this group={bot_mention}\n"
+            "- Lines in history prefixed with `[nickname|user_id]` are observed group context "
+            "and are not necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed at you, "
+            "and answer it directly."
+        )
+
+    @staticmethod
     def _observe_group_message(adapter, source, sender_display: str, text: str) -> None:
         """Write a group message into the session transcript without triggering the agent.
 
         This allows the model to see the full group conversation when it is
-        eventually invoked via @bot.
+        eventually invoked via @bot.  Messages are stored with ``role: "user"``
+        in the format ``[nickname|user_id]\\n<content>`` so the model
+        can distinguish participants and their user ids.
         """
         store = getattr(adapter, "_session_store", None)
         if not store:
             return
         try:
             session_entry = store.get_or_create_session(source)
-            attributed = f"[{sender_display}] {text}"
+            user_id = source.user_id or "unknown"
+            attributed = f"[{sender_display}|{user_id}]\n{text}"
             store.append_to_transcript(
                 session_entry.session_id,
                 {
@@ -1636,6 +1678,37 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                 adapter.name, ctx.chat_id, ctx.from_account,
             )
             return  # Stop pipeline — message observed but not dispatched
+        await next_fn()
+
+
+class GroupAttributionMiddleware(InboundMiddleware):
+    """Tag group @bot messages with [nickname|user_id] attribution and channel_prompt.
+
+    For group messages that pass the @bot guard (i.e. the bot is mentioned),
+    this middleware:
+      - Builds a per-turn channel_prompt so the model knows its identity and
+        the attribution scheme.
+      - Rewrites ctx.raw_text to ``[nickname|user_id]\\n<content>`` to match
+        the observed-history format.
+      - Suppresses the runner's default ``[user_name]`` shared-thread prefix
+        by clearing ``source.user_name``.
+    """
+
+    name = "group-attribution"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        if ctx.chat_type == "group" and not ctx.owner_command:
+            adapter = ctx.adapter
+            ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(
+                ctx.msg_body, adapter._bot_id,
+            )
+            user_id_label = ctx.from_account or "unknown"
+            nickname_label = ctx.sender_nickname or ctx.from_account or "unknown"
+            ctx.raw_text = f"[{nickname_label}|{user_id_label}]\n{ctx.raw_text}"
+            # Suppress runner's default ``[user_name]`` shared-thread prefix so
+            # the text the model sees matches the observed-history format.
+            if ctx.source is not None:
+                ctx.source = dataclasses.replace(ctx.source, user_name=None)
         await next_fn()
 
 
@@ -1862,6 +1935,7 @@ class DispatchMiddleware(InboundMiddleware):
                 media_types=ctx.media_types,
                 reply_to_message_id=ctx.reply_to_message_id,
                 reply_to_text=ctx.reply_to_text,
+                channel_prompt=ctx.channel_prompt,
             )
             await adapter.handle_message(event)
 
@@ -1895,6 +1969,7 @@ class InboundPipelineBuilder:
         OwnerCommandMiddleware,
         BuildSourceMiddleware,
         GroupAtGuardMiddleware,
+        GroupAttributionMiddleware,
         ClassifyMessageTypeMiddleware,
         QuoteContextMiddleware,
         MediaResolveMiddleware,
