@@ -204,6 +204,8 @@ TOOLSETS = {
     "yuanbao": {
         "description": "Yuanbao platform tools - group info, member queries",
         "tools": ["yb_query_group_info", "yb_query_group_members"],
+        "includes": []
+    },
 
     "feishu_doc": {
         "description": "Read Feishu/Lark document content",

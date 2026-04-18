@@ -314,6 +314,7 @@ class TestBuiltinDiscovery:
             "tools.tts_tool",
             "tools.vision_tools",
             "tools.web_tools",
+            "tools.yuanbao_tools",
         }
 
         with patch("tools.registry.importlib.import_module"):

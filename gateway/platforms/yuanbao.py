@@ -2873,15 +2873,93 @@ class StickerHandler(MediaSendHandler):
 # ============================================================
 
 class GroupQueryService:
-    """Encapsulates AI-tool-facing group query operations.
+    """Encapsulates all group query operations (both low-level WS calls and
+    higher-level AI-tool-facing wrappers).
 
-    Delegates low-level WS calls to the adapter's ``query_group_info`` and
-    ``get_group_member_list`` methods, adding chat_id parsing, error
-    wrapping and result filtering.
+    Responsibilities:
+      - Low-level WS encode/decode for group info and member list queries
+      - Chat-id parsing, error wrapping and result filtering for AI tools
+      - Member cache population on the adapter
     """
 
     def __init__(self, adapter: "YuanbaoAdapter") -> None:
         self._adapter = adapter
+
+    # ------------------------------------------------------------------
+    # Low-level WS query methods
+    # ------------------------------------------------------------------
+
+    async def query_group_info_raw(self, group_code: str) -> Optional[dict]:
+        """Query group info via WS (group name, owner, member count, etc.).
+
+        Returns:
+            Decoded dict or None on failure.
+        """
+        adapter = self._adapter
+        if adapter._connection.ws is None:
+            return None
+        encoded = encode_query_group_info(group_code)
+        from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
+        decoded = _decode(encoded)
+        req_id = decoded["head"]["msg_id"]
+        try:
+            response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
+            head = response.get("head", {})
+            status = head.get("status", 0)
+            if status != 0:
+                logger.warning("[%s] query_group_info failed: status=%d", adapter.name, status)
+                return None
+            biz_data = response.get("data", b"") or response.get("body", b"")
+            if biz_data and isinstance(biz_data, bytes):
+                return decode_query_group_info_rsp(biz_data)
+            return {"group_code": group_code}
+        except asyncio.TimeoutError:
+            logger.warning("[%s] query_group_info timeout: group=%s", adapter.name, group_code)
+            return None
+        except Exception as exc:
+            logger.warning("[%s] query_group_info failed: %s", adapter.name, exc)
+            return None
+
+    async def get_group_member_list_raw(
+        self, group_code: str, offset: int = 0, limit: int = 200
+    ) -> Optional[dict]:
+        """Query group member list via WS.
+
+        Returns:
+            Decoded dict or None on failure.  Also populates adapter._member_cache.
+        """
+        adapter = self._adapter
+        if adapter._connection.ws is None:
+            return None
+        encoded = encode_get_group_member_list(group_code, offset=offset, limit=limit)
+        from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
+        decoded = _decode(encoded)
+        req_id = decoded["head"]["msg_id"]
+        try:
+            response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
+            head = response.get("head", {})
+            status = head.get("status", 0)
+            if status != 0:
+                logger.warning("[%s] get_group_member_list failed: status=%d", adapter.name, status)
+                return None
+            biz_data = response.get("data", b"") or response.get("body", b"")
+            if biz_data and isinstance(biz_data, bytes):
+                result = decode_get_group_member_list_rsp(biz_data)
+            else:
+                result = {"members": [], "next_offset": 0, "is_complete": True}
+            if result and result.get("members"):
+                adapter._member_cache[group_code] = result["members"]
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("[%s] get_group_member_list timeout: group=%s", adapter.name, group_code)
+            return None
+        except Exception as exc:
+            logger.warning("[%s] get_group_member_list failed: %s", adapter.name, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # AI-tool-facing wrappers (chat_id parsing + filtering)
+    # ------------------------------------------------------------------
 
     async def query_group_info(self, chat_id: str) -> dict:
         """AI tool: Query current group info.
@@ -2892,7 +2970,7 @@ class GroupQueryService:
         if not chat_id.startswith("group:"):
             return {"error": "This command is only available in group chats"}
         group_code = chat_id[len("group:"):]
-        result = await self._adapter.query_group_info(group_code)
+        result = await self.query_group_info_raw(group_code)
         if result is None:
             return {"error": "Failed to query group info"}
         return result
@@ -2916,7 +2994,7 @@ class GroupQueryService:
         if not chat_id.startswith("group:"):
             return {"error": "This command is only available in group chats"}
         group_code = chat_id[len("group:"):]
-        result = await self._adapter.get_group_member_list(group_code)
+        result = await self.get_group_member_list_raw(group_code)
         if result is None:
             return {"error": "Failed to query group members"}
 
@@ -3823,129 +3901,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
             self._outbound.cancel_slow_notifier(chat_id)
 
     # ------------------------------------------------------------------
-    # Agent tool methods (registered as AI toolset, delegate to GroupQueryService)
-    # ------------------------------------------------------------------
-
-    async def tool_query_group_info(self, chat_id: str) -> dict:
-        """AI tool: Query current group info.
-
-        Thin delegate to :pyclass:`GroupQueryService`.
-        """
-        return await self._group_query.query_group_info(chat_id)
-
-    async def tool_query_session_members(
-        self,
-        chat_id: str,
-        action: str = "list_all",
-        name: Optional[str] = None,
-    ) -> dict:
-        """AI tool: Query group member list.
-
-        Thin delegate to :pyclass:`GroupQueryService`.
-        """
-        return await self._group_query.query_session_members(
-            chat_id, action=action, name=name,
-        )
-
-    # ------------------------------------------------------------------
-    # Group query methods (low-level WS calls)
+    # Group query (delegate to GroupQueryService)
     # ------------------------------------------------------------------
 
     async def query_group_info(self, group_code: str) -> Optional[dict]:
-        """
-        Query group info (group name, owner, member count, etc.).
-
-        Args:
-            group_code: Group code
-
-        Returns:
-            {
-              "group_code": str,
-              "group_name": str,
-              "owner_id": str,
-              "member_count": int,
-              "max_member": int,
-            }
-            or None (query failed)
-        """
-        if self._connection.ws is None:
-            return None
-        encoded = encode_query_group_info(group_code)
-        from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
-        decoded = _decode(encoded)
-        req_id = decoded["head"]["msg_id"]
-        try:
-            response = await self._connection.send_biz_request(encoded, req_id=req_id)
-            # response comes from _handle_frame; for RPC Response it returns {"head": head}
-            # but for Push responses, it returns the decoded push
-            # For group query RPCs, we need to decode from conn_data
-            # Actually send_biz_request returns {"head": head} for Response cmd_type
-            # Group query response data needs to be obtained from the raw frame
-            # Since _handle_frame currently only returns head for Response, group query needs improvement
-            # Temporarily return response head to indicate success
-            head = response.get("head", {})
-            status = head.get("status", 0)
-            if status != 0:
-                logger.warning("[%s] query_group_info failed: status=%d", self.name, status)
-                return None
-            # If response contains body/data (from biz layer), decode it
-            biz_data = response.get("data", b"") or response.get("body", b"")
-            if biz_data and isinstance(biz_data, bytes):
-                return decode_query_group_info_rsp(biz_data)
-            return {"group_code": group_code}
-        except asyncio.TimeoutError:
-            logger.warning("[%s] query_group_info timeout: group=%s", self.name, group_code)
-            return None
-        except Exception as exc:
-            logger.warning("[%s] query_group_info failed: %s", self.name, exc)
-            return None
+        """Query group info (delegates to GroupQueryService)."""
+        return await self._group_query.query_group_info_raw(group_code)
 
     async def get_group_member_list(
         self, group_code: str, offset: int = 0, limit: int = 200
     ) -> Optional[dict]:
-        """
-        Query group member list.
-
-        Args:
-            group_code: Group code
-            offset: Pagination offset
-            limit: Page size
-
-        Returns:
-            {
-              "members": [{"user_id": str, "nickname": str, "role": int, ...}, ...],
-              "next_offset": int,
-              "is_complete": bool,
-            }
-            or None (query failed)
-        """
-        if self._connection.ws is None:
-            return None
-        encoded = encode_get_group_member_list(group_code, offset=offset, limit=limit)
-        from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
-        decoded = _decode(encoded)
-        req_id = decoded["head"]["msg_id"]
-        try:
-            response = await self._connection.send_biz_request(encoded, req_id=req_id)
-            head = response.get("head", {})
-            status = head.get("status", 0)
-            if status != 0:
-                logger.warning("[%s] get_group_member_list failed: status=%d", self.name, status)
-                return None
-            biz_data = response.get("data", b"") or response.get("body", b"")
-            if biz_data and isinstance(biz_data, bytes):
-                result = decode_get_group_member_list_rsp(biz_data)
-            else:
-                result = {"members": [], "next_offset": 0, "is_complete": True}
-            if result and result.get("members"):
-                self._member_cache[group_code] = result["members"]
-            return result
-        except asyncio.TimeoutError:
-            logger.warning("[%s] get_group_member_list timeout: group=%s", self.name, group_code)
-            return None
-        except Exception as exc:
-            logger.warning("[%s] get_group_member_list failed: %s", self.name, exc)
-            return None
+        """Query group member list (delegates to GroupQueryService)."""
+        return await self._group_query.get_group_member_list_raw(group_code, offset=offset, limit=limit)
 
     # ------------------------------------------------------------------
     # DM active private chat + access control

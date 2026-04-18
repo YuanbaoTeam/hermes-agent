@@ -18,11 +18,6 @@ pkgs.buildNpmPackage {
 
   doCheck = false;
 
-  postPatch = ''
-    # fetchNpmDeps strips the trailing newline; match it so the diff passes
-    sed -i -z 's/\n$//' package-lock.json
-  '';
-
   installPhase = ''
     runHook preInstall
 
