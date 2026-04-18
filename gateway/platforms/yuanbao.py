@@ -564,23 +564,30 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return stripped in _SKIPPABLE_PLACEHOLDERS
 
     @staticmethod
-    def _extract_quote_context(cloud_custom_data: str) -> Tuple[Optional[str], Optional[str]]:
+    def _extract_quote_context(
+        cloud_custom_data: str,
+    ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str, str]]]:
         """
         Extract quote context from cloud_custom_data, mapping to MessageEvent.reply_to_*.
 
         Returns:
-          (reply_to_message_id, reply_to_text)
+          (reply_to_message_id, reply_to_text, quote_media_refs)
+
+        *quote_media_refs* is a list of ``(resource_id, kind, filename)`` tuples
+        extracted from ``[image|ybres:xxx]`` / ``[file:name|ybres:xxx]`` anchors
+        in the quoted message description, so the caller can resolve them directly
+        instead of falling back to historical observed-media hydration.
         """
         if not cloud_custom_data:
-            return None, None
+            return None, None, []
         try:
             parsed = json.loads(cloud_custom_data)
         except (json.JSONDecodeError, TypeError):
-            return None, None
+            return None, None, []
 
         quote = parsed.get("quote") if isinstance(parsed, dict) else None
         if not isinstance(quote, dict):
-            return None, None
+            return None, None, []
 
         # type=2 corresponds to image reference; desc may be empty in some cases, provide a placeholder.
         quote_type = int(quote.get("type") or 0)
@@ -588,12 +595,22 @@ class YuanbaoAdapter(BasePlatformAdapter):
         if quote_type == 2 and not desc:
             desc = "[image]"
         if not desc:
-            return None, None
+            return None, None, []
 
         quote_id = str(quote.get("id") or "").strip() or None
         sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
         quote_text = f"{sender}: {desc}" if sender else desc
-        return quote_id, quote_text
+
+        quote_media_refs: List[Tuple[str, str, str]] = []
+        for m in _YB_RES_REF_RE.finditer(desc):
+            head = m.group(1)
+            rid = m.group(2)
+            kind, _, filename = head.partition(":")
+            kind = kind.strip()
+            if kind in ("image", "file"):
+                quote_media_refs.append((rid, kind, filename.strip()))
+
+        return quote_id, quote_text, quote_media_refs
 
     @staticmethod
     def _extract_inbound_media_refs(msg_body: list) -> List[Dict[str, str]]:
@@ -1452,8 +1469,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     return mention_text
         return ""
 
-    def _build_group_channel_prompt(self, msg_body: list) -> str:
-        """Build a per-turn group-chat prompt that highlights which message to respond to."""
+    def _build_channel_prompt(self, chat_type: str, msg_body: list) -> str:
+        """Build a per-turn channel prompt for group chat messages."""
+        if chat_type != "group":
+            return ""
         bot_id = str(self._bot_id or "unknown")
         bot_mention = self._extract_bot_mention_text(msg_body) or "unknown"
         return (
@@ -1461,8 +1480,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
             f"- Your identity: user_id={bot_id}, @-mention name in this group={bot_mention}\n"
             "- Lines in history prefixed with `[nickname|user_id]` are observed group context "
             "and are not necessarily addressed to you.\n"
-            "- Treat only the current new message as a request explicitly directed at you, "
-            "and answer it directly."
+            "- Focus on the current new message."
         )
 
     # Owner-only group commands (no @Bot required for the creator).
@@ -2124,11 +2142,13 @@ class YuanbaoAdapter(BasePlatformAdapter):
             return
 
         msg_type = self._classify_message_type(raw_text, msg_body)
-        event_channel_prompt = None
+        reply_to_message_id, reply_to_text, quote_media_refs = (
+            self._extract_quote_context(cloud_custom_data)
+        )
+        event_channel_prompt = self._build_channel_prompt(chat_type, msg_body)
         event_text = raw_text
         dispatch_source = source
         if chat_type == "group" and not admitted_command:
-            event_channel_prompt = self._build_group_channel_prompt(msg_body)
             user_id_label = from_account or "unknown"
             nickname_label = sender_nickname or from_account or "unknown"
             event_text = f"[{nickname_label}|{user_id_label}]\n{raw_text}"
@@ -2142,25 +2162,55 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Skip placeholder after media download: %r", self.name, raw_text)
                 return
 
-            extra_img_urls: List[str] = []
-            extra_img_mimes: List[str] = []
-            try:
-                extra_img_urls, extra_img_mimes = await self._collect_observed_media(
-                    dispatch_source,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] observed-image hydration raised, continuing anyway: %s",
-                    self.name, exc,
-                )
-            if extra_img_urls:
-                current = set(media_urls)
-                for u, m in zip(extra_img_urls, extra_img_mimes):
-                    if u in current:
-                        continue
-                    media_urls.append(u)
-                    media_types.append(m)
-                    current.add(u)
+            if reply_to_message_id is not None:
+                # User is quoting a message — resolve media only from the
+                # quoted message itself; do NOT backfill from observed history
+                # to avoid injecting unrelated file resources.
+                if quote_media_refs:
+                    current = set(media_urls)
+                    for rid, kind, filename in quote_media_refs:
+                        try:
+                            fresh_url = await self._download_url_by_resource_id(rid)
+                        except Exception as exc:
+                            logger.warning(
+                                "[%s] quoted-media resolve failed: rid=%s kind=%s err=%s",
+                                self.name, rid, kind, exc,
+                            )
+                            continue
+                        cached = await self._download_and_cache_yuanbao_resource(
+                            fetch_url=fresh_url,
+                            kind=kind,
+                            file_name=filename or None,
+                            log_tag=f"quote-rid={rid}",
+                        )
+                        if cached is None:
+                            continue
+                        path, mime = cached
+                        if path not in current:
+                            media_urls.append(path)
+                            media_types.append(mime)
+                            current.add(path)
+            else:
+                # No quote — backfill from recently observed history as before.
+                extra_img_urls: List[str] = []
+                extra_img_mimes: List[str] = []
+                try:
+                    extra_img_urls, extra_img_mimes = await self._collect_observed_media(
+                        dispatch_source,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] observed-image hydration raised, continuing anyway: %s",
+                        self.name, exc,
+                    )
+                if extra_img_urls:
+                    current = set(media_urls)
+                    for u, m in zip(extra_img_urls, extra_img_mimes):
+                        if u in current:
+                            continue
+                        media_urls.append(u)
+                        media_types.append(m)
+                        current.add(u)
 
             # Replace [kind|ybres:xxx] anchors with local cache paths so
             # the transcript records usable paths for the model.
@@ -2187,8 +2237,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     + _patched_event_text[anchor_match.end():]
                 )
 
-            reply_to_message_id, reply_to_text = self._extract_quote_context(cloud_custom_data)
-
             event = MessageEvent(
                 text=_patched_event_text,
                 message_type=msg_type,
@@ -2199,7 +2247,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 media_types=media_types,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
-                channel_prompt=event_channel_prompt,
+                channel_prompt=event_channel_prompt or None,
             )
 
             # DM non-text batching: buffer photos/voice/files briefly so a
