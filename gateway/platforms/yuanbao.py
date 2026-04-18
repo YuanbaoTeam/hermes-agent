@@ -61,22 +61,14 @@ from gateway.platforms.yuanbao_media import (
     build_image_msg_body,
     build_file_msg_body,
     guess_mime_type,
-    is_image,
     md5_hex,
 )
 from gateway.platforms.yuanbao_proto import (
     CMD_TYPE,
-    _BIZ_PKG,
-    _encode_field,
-    _encode_string,
-    _encode_message,
-    _encode_varint,
     _fields_to_dict,
     _get_string,
     _get_varint,
     _parse_fields,
-    WT_LEN,
-    WT_VARINT,
     WS_HEARTBEAT_RUNNING,
     WS_HEARTBEAT_FINISH,
     decode_conn_msg,
@@ -84,7 +76,6 @@ from gateway.platforms.yuanbao_proto import (
     decode_query_group_info_rsp,
     decode_get_group_member_list_rsp,
     encode_auth_bind,
-    encode_biz_msg,
     encode_ping,
     encode_push_ack,
     encode_send_c2c_message,
@@ -146,6 +137,718 @@ SLOW_RESPONSE_TIMEOUT_S = 120.0
 SLOW_RESPONSE_MESSAGE = "The task is a bit complex, working hard on it, please wait patiently..."
 
 
+# ============================================================
+# Markdown processing (originally yuanbao_markdown.py)
+# ============================================================
+
+
+class MarkdownProcessor:
+    """Encapsulates all Markdown-related utilities for the Yuanbao platform.
+
+    Provides static methods for:
+    - Fence detection and streaming merge
+    - Table row detection and sanitization
+    - Paragraph-boundary splitting
+    - Atomic-block extraction and chunk splitting
+    - Outer markdown fence stripping
+    - Markdown hint prompt generation
+    """
+
+    # -- Fence detection ---------------------------------------------------
+
+    @staticmethod
+    def has_unclosed_fence(text: str) -> bool:
+        """
+        Detect whether the text has unclosed code block fences.
+
+        Scan line by line, toggling in/out state when encountering a line starting with ```.
+        An odd number of toggles indicates an unclosed fence.
+
+        Args:
+            text: Markdown text to check
+
+        Returns:
+            Returns True if the text ends with an unclosed fence, otherwise False
+        """
+        in_fence = False
+        for line in text.split('\n'):
+            if line.startswith('```'):
+                in_fence = not in_fence
+        return in_fence
+
+    # -- Table detection ---------------------------------------------------
+
+    @staticmethod
+    def ends_with_table_row(text: str) -> bool:
+        """
+        Detect whether the text ends with a table row (last non-empty line starts and ends with |).
+
+        Args:
+            text: Text to check
+
+        Returns:
+            Returns True if the last non-empty line is a table row
+        """
+        trimmed = text.rstrip()
+        if not trimmed:
+            return False
+        last_line = trimmed.split('\n')[-1].strip()
+        return last_line.startswith('|') and last_line.endswith('|')
+
+    # -- Paragraph boundary splitting --------------------------------------
+
+    @staticmethod
+    def split_at_paragraph_boundary(
+        text: str,
+        max_chars: int,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> tuple[str, str]:
+        """
+        Find the nearest paragraph boundary split point within max_chars, return (head, tail).
+
+        Split priority:
+        1. Blank line (paragraph boundary)
+        2. Newline after period/question mark/exclamation mark (Chinese and English)
+        3. Last newline
+        4. Force split at max_chars
+
+        Args:
+            text: Text to split
+            max_chars: Maximum character count limit
+            len_fn: Optional custom length function (e.g. UTF-16 length); defaults to built-in len
+
+        Returns:
+            (head, tail) tuple, head is the front part, tail is the back part, satisfying head + tail == text
+        """
+        _len = len_fn or len
+        if _len(text) <= max_chars:
+            return text, ''
+
+        # Build a character-index window that fits within max_chars.
+        # When len_fn != len we cannot simply slice [:max_chars], so we
+        # binary-search for the largest prefix that fits.
+        if _len is len:
+            window = text[:max_chars]
+        else:
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _len(text[:mid]) <= max_chars:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            window = text[:lo]
+
+        # 1. Prefer the last blank line (\n\n) as paragraph boundary
+        pos = window.rfind('\n\n')
+        if pos > 0:
+            return text[:pos + 2], text[pos + 2:]
+
+        # 2. Then find the last newline after a sentence-ending punctuation
+        sentence_end_re = re.compile(r'[。！？.!?]\n')
+        best_pos = -1
+        for m in sentence_end_re.finditer(window):
+            best_pos = m.end()
+        if best_pos > 0:
+            return text[:best_pos], text[best_pos:]
+
+        # 3. Fallback: find the last newline
+        pos = window.rfind('\n')
+        if pos > 0:
+            return text[:pos + 1], text[pos + 1:]
+
+        # 4. No valid split point found, force split at window boundary
+        cut = len(window)
+        return text[:cut], text[cut:]
+
+    # -- Atomic block helpers (private) ------------------------------------
+
+    @staticmethod
+    def is_fence_atom(text: str) -> bool:
+        """Determine whether an atomic block is a code block (starts with ```)."""
+        return text.lstrip().startswith('```')
+
+    @staticmethod
+    def is_table_atom(text: str) -> bool:
+        """Determine whether an atomic block is a table (first line starts with |)."""
+        first_line = text.split('\n')[0].strip()
+        return first_line.startswith('|') and first_line.endswith('|')
+
+    @staticmethod
+    def split_into_atoms(text: str) -> list[str]:
+        """
+        Split text into a list of "atomic blocks", each being an indivisible logical unit:
+
+        - Code block (fence): from opening ``` to closing ``` (including fence lines)
+        - Table: consecutive |...| lines forming a whole segment
+        - Normal paragraph: plain text segments separated by blank lines
+
+        Blank lines serve as separators and are not included in any atomic block.
+
+        Args:
+            text: Markdown text to split
+
+        Returns:
+            List of atomic block strings (all non-empty)
+        """
+        lines = text.split('\n')
+        atoms: list[str] = []
+
+        current_lines: list[str] = []
+        in_fence = False
+
+        def _is_table_line(line: str) -> bool:
+            stripped = line.strip()
+            return stripped.startswith('|') and stripped.endswith('|')
+
+        def _flush_current() -> None:
+            if current_lines:
+                atom = '\n'.join(current_lines)
+                if atom.strip():
+                    atoms.append(atom)
+                current_lines.clear()
+
+        for line in lines:
+            if in_fence:
+                current_lines.append(line)
+                if line.startswith('```') and len(current_lines) > 1:
+                    in_fence = False
+                    _flush_current()
+            elif line.startswith('```'):
+                _flush_current()
+                in_fence = True
+                current_lines.append(line)
+            elif _is_table_line(line):
+                if current_lines and not _is_table_line(current_lines[-1]):
+                    _flush_current()
+                current_lines.append(line)
+            elif line.strip() == '':
+                _flush_current()
+            else:
+                if current_lines and _is_table_line(current_lines[-1]):
+                    _flush_current()
+                current_lines.append(line)
+
+        _flush_current()
+
+        return atoms
+
+    # -- Core: chunk splitting ---------------------------------------------
+
+    @classmethod
+    def chunk_markdown_text(
+        cls,
+        text: str,
+        max_chars: int = 4000,
+        len_fn: Optional[Callable[[str], int]] = None,
+    ) -> list[str]:
+        """
+        Split Markdown text into multiple chunks by max_chars.
+
+        Guarantees:
+        - Each chunk <= max_chars characters (unless a single code block/table itself exceeds the limit)
+        - Code blocks (```...```) are not split in the middle
+        - Table rows are not split in the middle (tables output as atomic blocks)
+        - Split at paragraph boundaries (blank lines, after periods, etc.)
+        - Small trailing/leading chunks are merged with neighbours when possible
+
+        Args:
+            text: Markdown text to split
+            max_chars: Max characters per chunk, default 4000
+            len_fn: Optional custom length function (e.g. UTF-16 length); defaults to built-in len
+
+        Returns:
+            List of text chunks after splitting (non-empty)
+        """
+        _len = len_fn or len
+
+        if not text:
+            return []
+
+        if _len(text) <= max_chars:
+            return [text]
+
+        # Phase 1: Extract atomic blocks
+        atoms = cls.split_into_atoms(text)
+
+        # Phase 2: Greedy merge
+        chunks: list[str] = []
+        indivisible_set: set[int] = set()
+        current_parts: list[str] = []
+        current_len = 0
+
+        def _flush_parts() -> None:
+            if current_parts:
+                chunks.append('\n\n'.join(current_parts))
+
+        for atom in atoms:
+            atom_len = _len(atom)
+            sep_len = 2 if current_parts else 0
+            projected_len = current_len + sep_len + atom_len
+
+            if projected_len > max_chars and current_parts:
+                _flush_parts()
+                current_parts = []
+                current_len = 0
+                sep_len = 0
+
+            if (not current_parts
+                    and atom_len > max_chars
+                    and (cls.is_fence_atom(atom) or cls.is_table_atom(atom))):
+                indivisible_set.add(len(chunks))
+                chunks.append(atom)
+                continue
+
+            current_parts.append(atom)
+            current_len += sep_len + atom_len
+
+        _flush_parts()
+
+        # Phase 3: Post-processing — split still-oversized chunks at paragraph boundaries
+        result: list[str] = []
+        for idx, chunk in enumerate(chunks):
+            if _len(chunk) <= max_chars:
+                result.append(chunk)
+                continue
+
+            if idx in indivisible_set:
+                result.append(chunk)
+                continue
+
+            if cls.has_unclosed_fence(chunk):
+                result.append(chunk)
+                continue
+
+            remaining = chunk
+            while _len(remaining) > max_chars:
+                head, remaining = cls.split_at_paragraph_boundary(
+                    remaining, max_chars, len_fn=len_fn,
+                )
+                if not head:
+                    head, remaining = remaining[:max_chars], remaining[max_chars:]
+                if head:
+                    result.append(head)
+            if remaining:
+                result.append(remaining)
+
+        # Phase 4: Merge small trailing/leading chunks with neighbours
+        if len(result) > 1:
+            merged: list[str] = [result[0]]
+            for chunk in result[1:]:
+                prev = merged[-1]
+                combined = prev + '\n\n' + chunk
+                if _len(combined) <= max_chars:
+                    merged[-1] = combined
+                else:
+                    merged.append(chunk)
+            result = merged
+
+        return [c for c in result if c]
+
+    # -- Block separator inference -----------------------------------------
+
+    @classmethod
+    def infer_block_separator(cls, prev_chunk: str, next_chunk: str) -> str:
+        """
+        Infer the separator to use between two split chunks.
+
+        Rules (aligned with TS markdown-stream.ts):
+        - Previous chunk ends with code fence or next chunk starts with fence → single newline '\\n'
+        - Previous chunk ends with table row and next chunk starts with table row → single newline '\\n' (continued table)
+        - Otherwise → double newline '\\n\\n' (paragraph separator)
+
+        Args:
+            prev_chunk: Previous chunk
+            next_chunk: Next chunk
+
+        Returns:
+            '\\n' or '\\n\\n'
+        """
+        prev_trimmed = prev_chunk.rstrip()
+        next_trimmed = next_chunk.lstrip()
+
+        # Previous chunk ends with fence or next chunk starts with fence
+        if prev_trimmed.endswith('```') or next_trimmed.startswith('```'):
+            return '\n'
+
+        # Table continuation
+        if cls.ends_with_table_row(prev_chunk):
+            first_line = next_trimmed.split('\n')[0].strip() if next_trimmed else ''
+            if first_line.startswith('|') and first_line.endswith('|'):
+                return '\n'
+
+        return '\n\n'
+
+    # -- Streaming fence merge ---------------------------------------------
+
+    @classmethod
+    def merge_block_streaming_fences(cls, chunks: list[str]) -> list[str]:
+        """
+        Stream-aware fence-conscious chunk merging.
+
+        When streaming output produces multiple chunks truncated in the middle of a fence,
+        attempt to merge adjacent chunks to complete the fence.
+
+        Rules:
+        - If chunk i has an unclosed fence and chunk i+1 starts with ```,
+            merge i+1 into i (until the fence is closed or no more chunks).
+        - Use infer_block_separator to infer the separator during merging.
+
+        Args:
+            chunks: Original chunk list
+
+        Returns:
+            Merged chunk list (length <= original length)
+        """
+        if not chunks:
+            return []
+
+        result: list[str] = []
+        i = 0
+        while i < len(chunks):
+            current = chunks[i]
+            # If current chunk has unclosed fence, try merging subsequent chunks
+            while cls.has_unclosed_fence(current) and i + 1 < len(chunks):
+                sep = cls.infer_block_separator(current, chunks[i + 1])
+                current = current + sep + chunks[i + 1]
+                i += 1
+            result.append(current)
+            i += 1
+
+        return result
+
+    # -- Outer fence stripping ---------------------------------------------
+
+    @staticmethod
+    def strip_outer_markdown_fence(text: str) -> str:
+        """
+        Strip outer Markdown fence.
+
+        When AI reply is entirely wrapped in ```markdown\\n...\\n```, remove the outer fence,
+        keeping the content. Only strip when the first line is ```markdown (case-insensitive) and the last line is ```.
+
+        Args:
+            text: Text to process
+
+        Returns:
+            Text with outer fence stripped (returns original if no match)
+        """
+        if not text:
+            return text
+
+        lines = text.split('\n')
+        if len(lines) < 3:
+            return text
+
+        first_line = lines[0].strip()
+        last_line = lines[-1].strip()
+
+        # First line must be ```markdown (optional language tag md/markdown)
+        if not re.match(r'^```(?:markdown|md)?\s*$', first_line, re.IGNORECASE):
+            return text
+
+        # Last line must be plain ```
+        if last_line != '```':
+            return text
+
+        # Strip first and last lines
+        inner = '\n'.join(lines[1:-1])
+        return inner
+
+    # -- Table sanitization ------------------------------------------------
+
+    @staticmethod
+    def sanitize_markdown_table(text: str) -> str:
+        """
+        Table output sanitization.
+
+        Handle common formatting issues in AI-generated Markdown tables:
+        1. Remove extra whitespace before/after table rows
+        2. Ensure separator rows (|---|---|) are correctly formatted
+        3. Remove empty table rows
+
+        Args:
+            text: Markdown text containing tables
+
+        Returns:
+            Sanitized text
+        """
+        if '|' not in text:
+            return text
+
+        lines = text.split('\n')
+        result_lines: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Table row processing
+            if stripped.startswith('|') and stripped.endswith('|'):
+                # Separator row normalization: | --- | --- | → |---|---|
+                if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)+\|$', stripped):
+                    cells = stripped.split('|')
+                    normalized = '|'.join(
+                        cell.strip() if cell.strip() else cell
+                        for cell in cells
+                    )
+                    result_lines.append(normalized)
+                elif stripped == '||' or stripped.replace('|', '').strip() == '':
+                    # Empty table row → skip
+                    continue
+                else:
+                    result_lines.append(stripped)
+            else:
+                result_lines.append(line)
+
+        return '\n'.join(result_lines)
+
+    # -- Markdown hint prompt ----------------------------------------------
+
+    @staticmethod
+    def markdown_hint_system_prompt() -> str:
+        """
+        Markdown rendering hint (appended to system prompt).
+
+        Tell AI that Yuanbao platform supports Markdown rendering, including:
+        - Code blocks (```lang)
+        - Tables (| col | col |)
+        - Bold/italic
+        """
+        return (
+            "The current platform supports Markdown rendering. You can use the following formats:\n"
+            "- Code blocks: ```language\\ncode\\n```\n"
+            "- Tables: | col1 | col2 |\\n|---|---|\\n| val1 | val2 |\n"
+            "- Bold: **text** / Italic: *text*\n"
+            "Please use Markdown formatting when appropriate to improve readability."
+        )
+
+
+
+# ============================================================
+# Sign-ticket API (originally yuanbao_api.py)
+# ============================================================
+
+class SignManager:
+    """Encapsulates all sign-token related logic for the Yuanbao platform.
+
+    Manages token acquisition, caching, signature computation, and
+    automatic retry.  All state (cache, locks) is kept as class-level
+    attributes so that a single shared client serves the whole process.
+    """
+
+    # -- Constants ---------------------------------------------------------
+
+    TOKEN_PATH = "/api/v5/robotLogic/sign-token"
+
+    RETRYABLE_CODE = 10099
+    MAX_RETRIES = 3
+    RETRY_DELAY_S = 1.0
+
+    #: Early refresh margin (seconds), treat as expiring 60s before actual expiry
+    CACHE_REFRESH_MARGIN_S = 60
+
+    #: HTTP timeout (seconds)
+    HTTP_TIMEOUT_S = 10.0
+
+    # -- Class-level shared state ------------------------------------------
+
+    # key: app_key → {"token", "bot_id", "expire_ts", ...}
+    _cache: dict[str, dict[str, Any]] = {}
+
+    # Per-app_key refresh locks — prevents concurrent duplicate sign-token
+    # requests.  Created lazily inside get_refresh_lock() which is only called
+    # from async context, so the Lock is always bound to the correct loop.
+    # disconnect() clears this dict to prevent stale locks across reconnects.
+    _locks: dict[str, asyncio.Lock] = {}
+
+    # -- Internal helpers --------------------------------------------------
+
+    @classmethod
+    def get_refresh_lock(cls, app_key: str) -> asyncio.Lock:
+        """Return (creating if needed) the per-app_key refresh lock.
+
+        Must only be called from within a running event loop (async context).
+        """
+        if app_key not in cls._locks:
+            cls._locks[app_key] = asyncio.Lock()
+        return cls._locks[app_key]
+
+    @staticmethod
+    def compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str) -> str:
+        """Compute HMAC-SHA256 signature (aligned with TypeScript original).
+
+        plain     = nonce + timestamp + app_key + app_secret
+        signature = HMAC-SHA256(key=app_secret, msg=plain).hexdigest()
+        """
+        plain = nonce + timestamp + app_key + app_secret
+        return hmac.new(app_secret.encode(), plain.encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def build_timestamp() -> str:
+        """Build Beijing-time ISO-8601 timestamp (no milliseconds).
+
+        Format: 2006-01-02T15:04:05+08:00
+        """
+        bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
+        return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+    @classmethod
+    def is_cache_valid(cls, entry: dict[str, Any]) -> bool:
+        """Determine whether the cache entry is valid (not expired with margin)."""
+        return entry["expire_ts"] - time.time() > cls.CACHE_REFRESH_MARGIN_S
+
+    @classmethod
+    def clear_locks(cls) -> None:
+        """Clear all per-app_key refresh locks (called on disconnect)."""
+        cls._locks.clear()
+
+    # -- Core: fetch -------------------------------------------------------
+
+    @classmethod
+    async def fetch(
+        cls,
+        app_key: str,
+        app_secret: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> dict[str, Any]:
+        """Send sign-ticket HTTP request with auto-retry (up to MAX_RETRIES times)."""
+        url = f"{api_domain.rstrip('/')}{cls.TOKEN_PATH}"
+        async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
+            for attempt in range(cls.MAX_RETRIES + 1):
+                nonce = secrets.token_hex(16)
+                timestamp = cls.build_timestamp()
+                signature = cls.compute_signature(nonce, timestamp, app_key, app_secret)
+
+                payload = {
+                    "app_key": app_key,
+                    "nonce": nonce,
+                    "signature": signature,
+                    "timestamp": timestamp,
+                }
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-AppVersion": _APP_VERSION,
+                    "X-OperationSystem": _OPERATION_SYSTEM,
+                    "X-Instance-Id": "16",
+                    "X-Bot-Version": _BOT_VERSION,
+                }
+                if route_env:
+                    headers["X-Route-Env"] = route_env
+
+                logger.info(
+                    "Sign token request: url=%s%s",
+                    url,
+                    f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "",
+                )
+
+                response = await client.post(url, json=payload, headers=headers)
+
+                if response.status_code != 200:
+                    body = response.text
+                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
+
+                try:
+                    result_data: dict[str, Any] = response.json()
+                except Exception as exc:
+                    raise ValueError(f"Sign token response parse error: {exc}") from exc
+
+                code = result_data.get("code")
+                if code == 0:
+                    data = result_data.get("data")
+                    if not isinstance(data, dict):
+                        raise ValueError(f"Sign token response missing 'data' field: {result_data}")
+                    logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
+                    return data
+
+                if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
+                    logger.warning(
+                        "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
+                        code,
+                        cls.RETRY_DELAY_S,
+                        attempt + 1,
+                        cls.MAX_RETRIES,
+                    )
+                    await asyncio.sleep(cls.RETRY_DELAY_S)
+                    continue
+
+                msg = result_data.get("msg", "")
+                raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
+
+        raise RuntimeError("Sign token failed: max retries exceeded")
+
+    # -- Public API: get (with cache) --------------------------------------
+
+    @classmethod
+    async def get_token(
+        cls,
+        app_key: str,
+        app_secret: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> dict[str, Any]:
+        """Get WS auth token (with cache).
+
+        Return directly on cache hit without re-requesting; treat as expiring
+        60 seconds before actual expiry, triggering refresh.
+        """
+        cached = cls._cache.get(app_key)
+        if cached and cls.is_cache_valid(cached):
+            remain = int(cached["expire_ts"] - time.time())
+            logger.info("Using cached token (%ds remaining)", remain)
+            return dict(cached)
+
+        async with cls.get_refresh_lock(app_key):
+            cached = cls._cache.get(app_key)
+            if cached and cls.is_cache_valid(cached):
+                return dict(cached)
+
+            data = await cls.fetch(app_key, app_secret, api_domain, route_env)
+
+            duration: int = data.get("duration", 0)
+            expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
+
+            cls._cache[app_key] = {
+                "token": data.get("token", ""),
+                "bot_id": data.get("bot_id", ""),
+                "duration": duration,
+                "product": data.get("product", ""),
+                "source": data.get("source", ""),
+                "expire_ts": expire_ts,
+            }
+
+        return dict(cls._cache[app_key])
+
+    # -- Public API: force refresh -----------------------------------------
+
+    @classmethod
+    async def force_refresh(
+        cls,
+        app_key: str,
+        app_secret: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> dict[str, Any]:
+        """Force refresh token (clear cache and re-sign)."""
+        logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
+        async with cls.get_refresh_lock(app_key):
+            cls._cache.pop(app_key, None)
+            data = await cls.fetch(app_key, app_secret, api_domain, route_env)
+
+            duration: int = data.get("duration", 0)
+            expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
+
+            cls._cache[app_key] = {
+                "token": data.get("token", ""),
+                "bot_id": data.get("bot_id", ""),
+                "duration": duration,
+                "product": data.get("product", ""),
+                "source": data.get("source", ""),
+                "expire_ts": expire_ts,
+            }
+
+        return dict(cls._cache[app_key])
 # ============================================================
 # Region: Inbound Pipeline Engine & Context
 # ============================================================
@@ -2309,6 +3012,328 @@ class MessageSender:
     IMAGE_EXTS: ClassVar[frozenset] = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
     CHAT_DICT_MAX_SIZE: ClassVar[int] = 1000  # Max distinct chat IDs in _chat_locks
 
+    def __init__(self, adapter: "YuanbaoAdapter") -> None:
+        self._adapter = adapter
+        self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
+
+        # Optional hooks injected by OutboundManager for coordination
+        self._on_send_start: Optional[Callable[[str], Any]] = None   # cancel slow-notifier
+        self._on_send_finish: Optional[Callable[[str], Any]] = None  # send FINISH heartbeat
+
+        # Media send handlers (strategy pattern)
+        self._media_handlers: Dict[str, MediaSendHandler] = {
+            "image_url": ImageUrlHandler(),
+            "image_file": ImageFileHandler(),
+            "file_url": FileUrlHandler(),
+            "document": DocumentHandler(),
+            "sticker": StickerHandler(),
+        }
+
+    # -- Media handler registry ---------------------------------------------
+
+    def register_handler(self, name: str, handler: MediaSendHandler) -> None:
+        """Register (or replace) a named media send handler."""
+        self._media_handlers[name] = handler
+
+    # -- Chat lock ---------------------------------------------------------
+
+    def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return (or create) a per-chat-id lock with safe LRU eviction."""
+        if chat_id in self._chat_locks:
+            self._chat_locks.move_to_end(chat_id)
+            return self._chat_locks[chat_id]
+        if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
+            evicted = False
+            for key in list(self._chat_locks):
+                if not self._chat_locks[key].locked():
+                    self._chat_locks.pop(key)
+                    evicted = True
+                    break
+            if not evicted:
+                self._chat_locks.pop(next(iter(self._chat_locks)))
+        self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
+
+    # -- Text send ---------------------------------------------------------
+
+    async def send_text(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+    ) -> "SendResult":
+        """Send text message with auto-chunking and per-chat-id ordering guarantee."""
+        a = self._adapter
+        conn = a._connection
+        if conn.ws is None:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
+        if self._on_send_start:
+            self._on_send_start(chat_id)
+
+        lock = self.get_chat_lock(chat_id)
+        async with lock:
+            content_to_send = self.strip_cron_wrapper(content)
+            chunks = self.truncate_message(content_to_send, a.MAX_TEXT_CHUNK)
+            logger.info(
+                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
+                a.name, len(content_to_send), a.MAX_TEXT_CHUNK,
+                len(chunks), [len(c) for c in chunks],
+            )
+            for i, chunk in enumerate(chunks):
+                r_to = reply_to if i == 0 else None
+                result = await self.send_text_chunk(chat_id, chunk, r_to)
+                if not result.success:
+                    return result
+
+        # Notify outbound coordinator that send is complete (e.g. FINISH heartbeat)
+        if self._on_send_finish:
+            try:
+                await self._on_send_finish(chat_id)
+            except Exception:
+                pass
+        return SendResult(success=True)
+
+    async def send_media(
+        self,
+        chat_id: str,
+        handler_name: str,
+        reply_to: Optional[str] = None,
+        caption: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "SendResult":
+        """Dispatch media send to the named handler strategy."""
+        handler = self._media_handlers.get(handler_name)
+        if handler is None:
+            return SendResult(
+                success=False,
+                error=f"Unknown media handler: {handler_name!r}",
+            )
+        return await handler.handle(
+            self._adapter, chat_id,
+            reply_to=reply_to, caption=caption, **kwargs,
+        )
+
+    # -- Direct send (text + media, used by send_message tool) -------------
+
+    async def send_direct(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: Optional[List[Tuple[str, bool]]] = None,
+    ) -> Dict[str, Any]:
+        """Send text + media via Yuanbao (used by the ``send_message`` tool).
+
+        Unlike Weixin which creates a fresh adapter per call, Yuanbao reuses
+        the running gateway adapter (persistent WebSocket).  Logic mirrors
+        send_weixin_direct: send text first, then iterate media_files by
+        extension.
+        """
+        a = self._adapter
+        last_result: Optional["SendResult"] = None
+
+        # 1. Send text
+        if message.strip():
+            last_result = await a.send(chat_id, message)
+            if not last_result.success:
+                return {"error": f"Yuanbao send failed: {last_result.error}"}
+
+        # 2. Iterate media_files, dispatch by file extension
+        for media_path, _is_voice in media_files or []:
+            ext = Path(media_path).suffix.lower()
+            if ext in self.IMAGE_EXTS:
+                last_result = await a.send_image_file(chat_id, media_path)
+            else:
+                last_result = await a.send_document(chat_id, media_path)
+
+            if not last_result.success:
+                return {"error": f"Yuanbao media send failed: {last_result.error}"}
+
+        if last_result is None:
+            return {"error": "No deliverable text or media remained after processing"}
+
+        return {
+            "success": True,
+            "platform": "yuanbao",
+            "chat_id": chat_id,
+            "message_id": last_result.message_id if last_result else None,
+        }
+
+    async def dispatch_msg_body(
+        self,
+        chat_id: str,
+        msg_body: list,
+        reply_to: Optional[str] = None,
+    ) -> "SendResult":
+        """Lock + dispatch an arbitrary MsgBody to C2C or group."""
+        lock = self.get_chat_lock(chat_id)
+        async with lock:
+            if chat_id.startswith("group:"):
+                group_code = chat_id[len("group:"):]
+                result = await self.send_group_msg_body(group_code, msg_body, reply_to)
+            else:
+                to_account = chat_id.removeprefix("direct:")
+                result = await self.send_c2c_msg_body(to_account, msg_body)
+
+        if result.get("success"):
+            return SendResult(success=True, message_id=result.get("msg_key"))
+        return SendResult(success=False, error=result.get("error", "Unknown error"))
+
+    async def send_text_chunk(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        retry: int = 3,
+    ) -> "SendResult":
+        """Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s)."""
+        a = self._adapter
+        last_error: str = "Unknown error"
+        for attempt in range(retry):
+            try:
+                if chat_id.startswith("group:"):
+                    group_code = chat_id[len("group:"):]
+                    raw = await self.send_group_message(group_code, text, reply_to)
+                else:
+                    to_account = chat_id.removeprefix("direct:")
+                    raw = await self.send_c2c_message(to_account, text)
+
+                if raw.get("success"):
+                    return SendResult(success=True, message_id=raw.get("msg_key"))
+
+                last_error = raw.get("error", "Unknown error")
+                logger.warning(
+                    "[%s] send_text_chunk attempt %d/%d failed: %s",
+                    a.name, attempt + 1, retry, last_error,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "[%s] send_text_chunk attempt %d/%d exception: %s",
+                    a.name, attempt + 1, retry, last_error,
+                )
+
+            if attempt < retry - 1:
+                await asyncio.sleep(2 ** attempt)
+
+        logger.error(
+            "[%s] send_text_chunk max retries (%d) exceeded. Last error: %s",
+            a.name, retry, last_error,
+        )
+        return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
+
+    # -- C2C / Group message -----------------------------------------------
+
+    async def send_c2c_message(self, to_account: str, text: str) -> dict:
+        """Send C2C text message, return {success: bool, msg_key: str}."""
+        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+        return await self.send_c2c_msg_body(to_account, msg_body)
+
+    async def send_group_message(
+        self,
+        group_code: str,
+        text: str,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """Send group text message, auto-converting @nickname to TIMCustomElem."""
+        msg_body = self._build_msg_body_with_mentions(text, group_code)
+        return await self.send_group_msg_body(group_code, msg_body, reply_to)
+
+    # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
+    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
+
+    def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
+        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
+        members = self._adapter._member_cache.get(group_code, [])
+        if not members:
+            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
+
+        nickname_to_uid = {}
+        for m in members:
+            nick = m.get("nickname") or m.get("nick_name") or ""
+            uid = m.get("user_id") or ""
+            if nick and uid:
+                nickname_to_uid[nick.lower()] = (nick, uid)
+
+        msg_body: list = []
+        last_idx = 0
+        for match in self._AT_USER_RE.finditer(text):
+            start = match.start()
+            if start > last_idx:
+                seg = text[last_idx:start].strip()
+                if seg:
+                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
+
+            nickname = match.group(1)
+            entry = nickname_to_uid.get(nickname.lower())
+            if entry:
+                real_nick, uid = entry
+                msg_body.append({
+                    "msg_type": "TIMCustomElem",
+                    "msg_content": {
+                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
+                    },
+                })
+            else:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
+
+            last_idx = match.end()
+
+        if last_idx < len(text):
+            tail = text[last_idx:].strip()
+            if tail:
+                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
+
+        if not msg_body:
+            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
+
+        return msg_body
+
+    async def send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
+        """Send C2C message with arbitrary MsgBody."""
+        a = self._adapter
+        req_id = f"c2c_{next_seq_no()}"
+        encoded = encode_send_c2c_message(
+            to_account=to_account,
+            msg_body=msg_body,
+            from_account=a._bot_id or "",
+            msg_id=req_id,
+        )
+        return await self._dispatch_encoded(a, encoded, req_id)
+
+    async def send_group_msg_body(
+        self,
+        group_code: str,
+        msg_body: list,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """Send group message with arbitrary MsgBody."""
+        a = self._adapter
+        req_id = f"grp_{next_seq_no()}"
+        encoded = encode_send_group_message(
+            group_code=group_code,
+            msg_body=msg_body,
+            from_account=a._bot_id or "",
+            msg_id=req_id,
+            ref_msg_id=reply_to or "",
+        )
+        return await self._dispatch_encoded(a, encoded, req_id)
+
+    # -- Common dispatch helper --------------------------------------------
+
+    @staticmethod
+    async def _dispatch_encoded(
+        adapter: "YuanbaoAdapter", encoded: bytes, req_id: str,
+    ) -> dict:
+        """Send pre-encoded bytes via WS and return a normalised result dict."""
+        try:
+            response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
+            return {"success": True, "msg_key": response.get("msg_id", "")}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
     # -- Media validation ---------------------------------------------------
 
     @staticmethod
@@ -2383,333 +3408,11 @@ class MessageSender:
         body = content[body_start:footer_pos].strip()
         return body or content
 
-    def __init__(self, adapter: "YuanbaoAdapter") -> None:
-        self._adapter = adapter
-        self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()
-
-        # Optional hooks injected by OutboundManager for coordination
-        self._on_send_start: Optional[Callable[[str], Any]] = None   # cancel slow-notifier
-        self._on_send_finish: Optional[Callable[[str], Any]] = None  # send FINISH heartbeat
-
-        # Media send handlers (strategy pattern)
-        self._media_handlers: Dict[str, MediaSendHandler] = {
-            "image_url": ImageUrlHandler(),
-            "image_file": ImageFileHandler(),
-            "file_url": FileUrlHandler(),
-            "document": DocumentHandler(),
-            "sticker": StickerHandler(),
-        }
-
-    # -- Media handler registry ---------------------------------------------
-
-    def register_handler(self, name: str, handler: MediaSendHandler) -> None:
-        """Register (or replace) a named media send handler."""
-        self._media_handlers[name] = handler
-
-    async def send_media(
-        self,
-        chat_id: str,
-        handler_name: str,
-        reply_to: Optional[str] = None,
-        caption: Optional[str] = None,
-        **kwargs: Any,
-    ) -> "SendResult":
-        """Dispatch media send to the named handler strategy."""
-        handler = self._media_handlers.get(handler_name)
-        if handler is None:
-            return SendResult(
-                success=False,
-                error=f"Unknown media handler: {handler_name!r}",
-            )
-        return await handler.handle(
-            self._adapter, chat_id,
-            reply_to=reply_to, caption=caption, **kwargs,
-        )
-
-    async def dispatch_msg_body(
-        self,
-        chat_id: str,
-        msg_body: list,
-        reply_to: Optional[str] = None,
-    ) -> "SendResult":
-        """Lock + dispatch an arbitrary MsgBody to C2C or group."""
-        lock = self.get_chat_lock(chat_id)
-        async with lock:
-            if chat_id.startswith("group:"):
-                group_code = chat_id[len("group:"):]
-                result = await self.send_group_msg_body(group_code, msg_body, reply_to)
-            else:
-                to_account = chat_id.removeprefix("direct:")
-                result = await self.send_c2c_msg_body(to_account, msg_body)
-
-        if result.get("success"):
-            return SendResult(success=True, message_id=result.get("msg_key"))
-        return SendResult(success=False, error=result.get("error", "Unknown error"))
-
-    # -- Chat lock ---------------------------------------------------------
-
-    def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """Return (or create) a per-chat-id lock with safe LRU eviction."""
-        if chat_id in self._chat_locks:
-            self._chat_locks.move_to_end(chat_id)
-            return self._chat_locks[chat_id]
-        if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
-            evicted = False
-            for key in list(self._chat_locks):
-                if not self._chat_locks[key].locked():
-                    self._chat_locks.pop(key)
-                    evicted = True
-                    break
-            if not evicted:
-                self._chat_locks.pop(next(iter(self._chat_locks)))
-        self._chat_locks[chat_id] = asyncio.Lock()
-        return self._chat_locks[chat_id]
-
-    # -- Text send ---------------------------------------------------------
-
-    async def send_text(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-    ) -> "SendResult":
-        """Send text message with auto-chunking and per-chat-id ordering guarantee."""
-        a = self._adapter
-        conn = a._connection
-        if conn.ws is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
-
-        if self._on_send_start:
-            self._on_send_start(chat_id)
-
-        lock = self.get_chat_lock(chat_id)
-        async with lock:
-            content_to_send = self.strip_cron_wrapper(content)
-            chunks = self.truncate_message(content_to_send, a.MAX_TEXT_CHUNK)
-            logger.info(
-                "[%s] truncate_message: input=%d chars, max=%d, output=%d chunk(s) sizes=%s",
-                a.name, len(content_to_send), a.MAX_TEXT_CHUNK,
-                len(chunks), [len(c) for c in chunks],
-            )
-            for i, chunk in enumerate(chunks):
-                r_to = reply_to if i == 0 else None
-                result = await self.send_text_chunk(chat_id, chunk, r_to)
-                if not result.success:
-                    return result
-
-        # Notify outbound coordinator that send is complete (e.g. FINISH heartbeat)
-        if self._on_send_finish:
-            try:
-                await self._on_send_finish(chat_id)
-            except Exception:
-                pass
-        return SendResult(success=True)
-
-    async def send_text_chunk(
-        self,
-        chat_id: str,
-        text: str,
-        reply_to: Optional[str] = None,
-        retry: int = 3,
-    ) -> "SendResult":
-        """Send a single text chunk with retry (exponential backoff: 1s, 2s, 4s)."""
-        a = self._adapter
-        last_error: str = "Unknown error"
-        for attempt in range(retry):
-            try:
-                if chat_id.startswith("group:"):
-                    group_code = chat_id[len("group:"):]
-                    raw = await self.send_group_message(group_code, text, reply_to)
-                else:
-                    to_account = chat_id.removeprefix("direct:")
-                    raw = await self.send_c2c_message(to_account, text)
-
-                if raw.get("success"):
-                    return SendResult(success=True, message_id=raw.get("msg_key"))
-
-                last_error = raw.get("error", "Unknown error")
-                logger.warning(
-                    "[%s] send_text_chunk attempt %d/%d failed: %s",
-                    a.name, attempt + 1, retry, last_error,
-                )
-            except Exception as exc:
-                last_error = str(exc)
-                logger.warning(
-                    "[%s] send_text_chunk attempt %d/%d exception: %s",
-                    a.name, attempt + 1, retry, last_error,
-                )
-
-            if attempt < retry - 1:
-                await asyncio.sleep(2 ** attempt)
-
-        logger.error(
-            "[%s] send_text_chunk max retries (%d) exceeded. Last error: %s",
-            a.name, retry, last_error,
-        )
-        return SendResult(success=False, error=f"Max retries exceeded: {last_error}")
-
-    # -- C2C / Group message -----------------------------------------------
-
-    async def send_c2c_message(self, to_account: str, text: str) -> dict:
-        """Send C2C text message, return {success: bool, msg_key: str}."""
-        msg_body = [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
-        return await self.send_c2c_msg_body(to_account, msg_body)
-
-    # @mention pattern: (whitespace or start) + @ + nickname + (whitespace or end)
-    _AT_USER_RE = re.compile(r'(?:(?<=\s)|(?<=^))@(\S+?)(?=\s|$)', re.MULTILINE)
-
-    def _build_msg_body_with_mentions(self, text: str, group_code: str) -> list:
-        """Parse @nickname patterns and build mixed TIMTextElem + TIMCustomElem msg_body."""
-        members = self._adapter._member_cache.get(group_code, [])
-        if not members:
-            return [{"msg_type": "TIMTextElem", "msg_content": {"text": text}}]
-
-        nickname_to_uid = {}
-        for m in members:
-            nick = m.get("nickname") or m.get("nick_name") or ""
-            uid = m.get("user_id") or ""
-            if nick and uid:
-                nickname_to_uid[nick.lower()] = (nick, uid)
-
-        msg_body: list = []
-        last_idx = 0
-        for match in self._AT_USER_RE.finditer(text):
-            start = match.start()
-            if start > last_idx:
-                seg = text[last_idx:start].strip()
-                if seg:
-                    msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": seg}})
-
-            nickname = match.group(1)
-            entry = nickname_to_uid.get(nickname.lower())
-            if entry:
-                real_nick, uid = entry
-                msg_body.append({
-                    "msg_type": "TIMCustomElem",
-                    "msg_content": {
-                        "data": json.dumps({"elem_type": 1002, "text": f"@{real_nick}", "user_id": uid}),
-                    },
-                })
-            else:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": f"@{nickname}"}})
-
-            last_idx = match.end()
-
-        if last_idx < len(text):
-            tail = text[last_idx:].strip()
-            if tail:
-                msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": tail}})
-
-        if not msg_body:
-            msg_body.append({"msg_type": "TIMTextElem", "msg_content": {"text": text}})
-
-        return msg_body
-
-    async def send_group_message(
-        self,
-        group_code: str,
-        text: str,
-        reply_to: Optional[str] = None,
-    ) -> dict:
-        """Send group text message, auto-converting @nickname to TIMCustomElem."""
-        msg_body = self._build_msg_body_with_mentions(text, group_code)
-        return await self.send_group_msg_body(group_code, msg_body, reply_to)
-
-    async def send_c2c_msg_body(self, to_account: str, msg_body: list) -> dict:
-        """Send C2C message with arbitrary MsgBody."""
-        a = self._adapter
-        req_id = f"c2c_{next_seq_no()}"
-        encoded = encode_send_c2c_message(
-            to_account=to_account,
-            msg_body=msg_body,
-            from_account=a._bot_id or "",
-            msg_id=req_id,
-        )
-        return await self._dispatch_encoded(a, encoded, req_id)
-
-    async def send_group_msg_body(
-        self,
-        group_code: str,
-        msg_body: list,
-        reply_to: Optional[str] = None,
-    ) -> dict:
-        """Send group message with arbitrary MsgBody."""
-        a = self._adapter
-        req_id = f"grp_{next_seq_no()}"
-        encoded = encode_send_group_message(
-            group_code=group_code,
-            msg_body=msg_body,
-            from_account=a._bot_id or "",
-            msg_id=req_id,
-            ref_msg_id=reply_to or "",
-        )
-        return await self._dispatch_encoded(a, encoded, req_id)
-
-    # -- Common dispatch helper --------------------------------------------
-
-    @staticmethod
-    async def _dispatch_encoded(
-        adapter: "YuanbaoAdapter", encoded: bytes, req_id: str,
-    ) -> dict:
-        """Send pre-encoded bytes via WS and return a normalised result dict."""
-        try:
-            response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
     # -- Cleanup on disconnect ---------------------------------------------
 
     async def close(self) -> None:
         """Release chat locks (no-op for now; placeholder for future cleanup)."""
         self._chat_locks.clear()
-
-    # -- Direct send (text + media, used by send_message tool) -------------
-
-    async def send_direct(
-        self,
-        chat_id: str,
-        message: str,
-        media_files: Optional[List[Tuple[str, bool]]] = None,
-    ) -> Dict[str, Any]:
-        """Send text + media via Yuanbao (used by the ``send_message`` tool).
-
-        Unlike Weixin which creates a fresh adapter per call, Yuanbao reuses
-        the running gateway adapter (persistent WebSocket).  Logic mirrors
-        send_weixin_direct: send text first, then iterate media_files by
-        extension.
-        """
-        a = self._adapter
-        last_result: Optional["SendResult"] = None
-
-        # 1. Send text
-        if message.strip():
-            last_result = await a.send(chat_id, message)
-            if not last_result.success:
-                return {"error": f"Yuanbao send failed: {last_result.error}"}
-
-        # 2. Iterate media_files, dispatch by file extension
-        for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in self.IMAGE_EXTS:
-                last_result = await a.send_image_file(chat_id, media_path)
-            else:
-                last_result = await a.send_document(chat_id, media_path)
-
-            if not last_result.success:
-                return {"error": f"Yuanbao media send failed: {last_result.error}"}
-
-        if last_result is None:
-            return {"error": "No deliverable text or media remained after processing"}
-
-        return {
-            "success": True,
-            "platform": "yuanbao",
-            "chat_id": chat_id,
-            "message_id": last_result.message_id if last_result else None,
-        }
 
 
 class OutboundManager:
@@ -3234,723 +3937,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
             "reconnect_attempts": conn.reconnect_attempts,
             "ws_url": self._ws_url,
         }
-
-
-
-
-
-# ============================================================
-# Markdown processing (originally yuanbao_markdown.py)
-# ============================================================
-
-
-class MarkdownProcessor:
-    """Encapsulates all Markdown-related utilities for the Yuanbao platform.
-
-    Provides static methods for:
-    - Fence detection and streaming merge
-    - Table row detection and sanitization
-    - Paragraph-boundary splitting
-    - Atomic-block extraction and chunk splitting
-    - Outer markdown fence stripping
-    - Markdown hint prompt generation
-    """
-
-    # -- Fence detection ---------------------------------------------------
-
-    @staticmethod
-    def has_unclosed_fence(text: str) -> bool:
-        """
-        Detect whether the text has unclosed code block fences.
-
-        Scan line by line, toggling in/out state when encountering a line starting with ```.
-        An odd number of toggles indicates an unclosed fence.
-
-        Args:
-            text: Markdown text to check
-
-        Returns:
-            Returns True if the text ends with an unclosed fence, otherwise False
-        """
-        in_fence = False
-        for line in text.split('\n'):
-            if line.startswith('```'):
-                in_fence = not in_fence
-        return in_fence
-
-    # -- Table detection ---------------------------------------------------
-
-    @staticmethod
-    def ends_with_table_row(text: str) -> bool:
-        """
-        Detect whether the text ends with a table row (last non-empty line starts and ends with |).
-
-        Args:
-            text: Text to check
-
-        Returns:
-            Returns True if the last non-empty line is a table row
-        """
-        trimmed = text.rstrip()
-        if not trimmed:
-            return False
-        last_line = trimmed.split('\n')[-1].strip()
-        return last_line.startswith('|') and last_line.endswith('|')
-
-    # -- Paragraph boundary splitting --------------------------------------
-
-    @staticmethod
-    def split_at_paragraph_boundary(
-        text: str,
-        max_chars: int,
-        len_fn: Optional[Callable[[str], int]] = None,
-    ) -> tuple[str, str]:
-        """
-        Find the nearest paragraph boundary split point within max_chars, return (head, tail).
-
-        Split priority:
-        1. Blank line (paragraph boundary)
-        2. Newline after period/question mark/exclamation mark (Chinese and English)
-        3. Last newline
-        4. Force split at max_chars
-
-        Args:
-            text: Text to split
-            max_chars: Maximum character count limit
-            len_fn: Optional custom length function (e.g. UTF-16 length); defaults to built-in len
-
-        Returns:
-            (head, tail) tuple, head is the front part, tail is the back part, satisfying head + tail == text
-        """
-        _len = len_fn or len
-        if _len(text) <= max_chars:
-            return text, ''
-
-        # Build a character-index window that fits within max_chars.
-        # When len_fn != len we cannot simply slice [:max_chars], so we
-        # binary-search for the largest prefix that fits.
-        if _len is len:
-            window = text[:max_chars]
-        else:
-            lo, hi = 0, len(text)
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
-                if _len(text[:mid]) <= max_chars:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            window = text[:lo]
-
-        # 1. Prefer the last blank line (\n\n) as paragraph boundary
-        pos = window.rfind('\n\n')
-        if pos > 0:
-            return text[:pos + 2], text[pos + 2:]
-
-        # 2. Then find the last newline after a sentence-ending punctuation
-        sentence_end_re = re.compile(r'[。！？.!?]\n')
-        best_pos = -1
-        for m in sentence_end_re.finditer(window):
-            best_pos = m.end()
-        if best_pos > 0:
-            return text[:best_pos], text[best_pos:]
-
-        # 3. Fallback: find the last newline
-        pos = window.rfind('\n')
-        if pos > 0:
-            return text[:pos + 1], text[pos + 1:]
-
-        # 4. No valid split point found, force split at window boundary
-        cut = len(window)
-        return text[:cut], text[cut:]
-
-    # -- Atomic block helpers (private) ------------------------------------
-
-    @staticmethod
-    def is_fence_atom(text: str) -> bool:
-        """Determine whether an atomic block is a code block (starts with ```)."""
-        return text.lstrip().startswith('```')
-
-    @staticmethod
-    def is_table_atom(text: str) -> bool:
-        """Determine whether an atomic block is a table (first line starts with |)."""
-        first_line = text.split('\n')[0].strip()
-        return first_line.startswith('|') and first_line.endswith('|')
-
-    @staticmethod
-    def split_into_atoms(text: str) -> list[str]:
-        """
-        Split text into a list of "atomic blocks", each being an indivisible logical unit:
-
-        - Code block (fence): from opening ``` to closing ``` (including fence lines)
-        - Table: consecutive |...| lines forming a whole segment
-        - Normal paragraph: plain text segments separated by blank lines
-
-        Blank lines serve as separators and are not included in any atomic block.
-
-        Args:
-            text: Markdown text to split
-
-        Returns:
-            List of atomic block strings (all non-empty)
-        """
-        lines = text.split('\n')
-        atoms: list[str] = []
-
-        current_lines: list[str] = []
-        in_fence = False
-
-        def _is_table_line(line: str) -> bool:
-            stripped = line.strip()
-            return stripped.startswith('|') and stripped.endswith('|')
-
-        def _flush_current() -> None:
-            if current_lines:
-                atom = '\n'.join(current_lines)
-                if atom.strip():
-                    atoms.append(atom)
-                current_lines.clear()
-
-        for line in lines:
-            if in_fence:
-                current_lines.append(line)
-                if line.startswith('```') and len(current_lines) > 1:
-                    in_fence = False
-                    _flush_current()
-            elif line.startswith('```'):
-                _flush_current()
-                in_fence = True
-                current_lines.append(line)
-            elif _is_table_line(line):
-                if current_lines and not _is_table_line(current_lines[-1]):
-                    _flush_current()
-                current_lines.append(line)
-            elif line.strip() == '':
-                _flush_current()
-            else:
-                if current_lines and _is_table_line(current_lines[-1]):
-                    _flush_current()
-                current_lines.append(line)
-
-        _flush_current()
-
-        return atoms
-
-    # -- Core: chunk splitting ---------------------------------------------
-
-    @classmethod
-    def chunk_markdown_text(
-        cls,
-        text: str,
-        max_chars: int = 4000,
-        len_fn: Optional[Callable[[str], int]] = None,
-    ) -> list[str]:
-        """
-        Split Markdown text into multiple chunks by max_chars.
-
-        Guarantees:
-        - Each chunk <= max_chars characters (unless a single code block/table itself exceeds the limit)
-        - Code blocks (```...```) are not split in the middle
-        - Table rows are not split in the middle (tables output as atomic blocks)
-        - Split at paragraph boundaries (blank lines, after periods, etc.)
-        - Small trailing/leading chunks are merged with neighbours when possible
-
-        Args:
-            text: Markdown text to split
-            max_chars: Max characters per chunk, default 4000
-            len_fn: Optional custom length function (e.g. UTF-16 length); defaults to built-in len
-
-        Returns:
-            List of text chunks after splitting (non-empty)
-        """
-        _len = len_fn or len
-
-        if not text:
-            return []
-
-        if _len(text) <= max_chars:
-            return [text]
-
-        # Phase 1: Extract atomic blocks
-        atoms = cls.split_into_atoms(text)
-
-        # Phase 2: Greedy merge
-        chunks: list[str] = []
-        indivisible_set: set[int] = set()
-        current_parts: list[str] = []
-        current_len = 0
-
-        def _flush_parts() -> None:
-            if current_parts:
-                chunks.append('\n\n'.join(current_parts))
-
-        for atom in atoms:
-            atom_len = _len(atom)
-            sep_len = 2 if current_parts else 0
-            projected_len = current_len + sep_len + atom_len
-
-            if projected_len > max_chars and current_parts:
-                _flush_parts()
-                current_parts = []
-                current_len = 0
-                sep_len = 0
-
-            if (not current_parts
-                    and atom_len > max_chars
-                    and (cls.is_fence_atom(atom) or cls.is_table_atom(atom))):
-                indivisible_set.add(len(chunks))
-                chunks.append(atom)
-                continue
-
-            current_parts.append(atom)
-            current_len += sep_len + atom_len
-
-        _flush_parts()
-
-        # Phase 3: Post-processing — split still-oversized chunks at paragraph boundaries
-        result: list[str] = []
-        for idx, chunk in enumerate(chunks):
-            if _len(chunk) <= max_chars:
-                result.append(chunk)
-                continue
-
-            if idx in indivisible_set:
-                result.append(chunk)
-                continue
-
-            if cls.has_unclosed_fence(chunk):
-                result.append(chunk)
-                continue
-
-            remaining = chunk
-            while _len(remaining) > max_chars:
-                head, remaining = cls.split_at_paragraph_boundary(
-                    remaining, max_chars, len_fn=len_fn,
-                )
-                if not head:
-                    head, remaining = remaining[:max_chars], remaining[max_chars:]
-                if head:
-                    result.append(head)
-            if remaining:
-                result.append(remaining)
-
-        # Phase 4: Merge small trailing/leading chunks with neighbours
-        if len(result) > 1:
-            merged: list[str] = [result[0]]
-            for chunk in result[1:]:
-                prev = merged[-1]
-                combined = prev + '\n\n' + chunk
-                if _len(combined) <= max_chars:
-                    merged[-1] = combined
-                else:
-                    merged.append(chunk)
-            result = merged
-
-        return [c for c in result if c]
-
-    # -- Block separator inference -----------------------------------------
-
-    @classmethod
-    def infer_block_separator(cls, prev_chunk: str, next_chunk: str) -> str:
-        """
-        Infer the separator to use between two split chunks.
-
-        Rules (aligned with TS markdown-stream.ts):
-        - Previous chunk ends with code fence or next chunk starts with fence → single newline '\\n'
-        - Previous chunk ends with table row and next chunk starts with table row → single newline '\\n' (continued table)
-        - Otherwise → double newline '\\n\\n' (paragraph separator)
-
-        Args:
-            prev_chunk: Previous chunk
-            next_chunk: Next chunk
-
-        Returns:
-            '\\n' or '\\n\\n'
-        """
-        prev_trimmed = prev_chunk.rstrip()
-        next_trimmed = next_chunk.lstrip()
-
-        # Previous chunk ends with fence or next chunk starts with fence
-        if prev_trimmed.endswith('```') or next_trimmed.startswith('```'):
-            return '\n'
-
-        # Table continuation
-        if cls.ends_with_table_row(prev_chunk):
-            first_line = next_trimmed.split('\n')[0].strip() if next_trimmed else ''
-            if first_line.startswith('|') and first_line.endswith('|'):
-                return '\n'
-
-        return '\n\n'
-
-    # -- Streaming fence merge ---------------------------------------------
-
-    @classmethod
-    def merge_block_streaming_fences(cls, chunks: list[str]) -> list[str]:
-        """
-        Stream-aware fence-conscious chunk merging.
-
-        When streaming output produces multiple chunks truncated in the middle of a fence,
-        attempt to merge adjacent chunks to complete the fence.
-
-        Rules:
-        - If chunk i has an unclosed fence and chunk i+1 starts with ```,
-            merge i+1 into i (until the fence is closed or no more chunks).
-        - Use infer_block_separator to infer the separator during merging.
-
-        Args:
-            chunks: Original chunk list
-
-        Returns:
-            Merged chunk list (length <= original length)
-        """
-        if not chunks:
-            return []
-
-        result: list[str] = []
-        i = 0
-        while i < len(chunks):
-            current = chunks[i]
-            # If current chunk has unclosed fence, try merging subsequent chunks
-            while cls.has_unclosed_fence(current) and i + 1 < len(chunks):
-                sep = cls.infer_block_separator(current, chunks[i + 1])
-                current = current + sep + chunks[i + 1]
-                i += 1
-            result.append(current)
-            i += 1
-
-        return result
-
-    # -- Outer fence stripping ---------------------------------------------
-
-    @staticmethod
-    def strip_outer_markdown_fence(text: str) -> str:
-        """
-        Strip outer Markdown fence.
-
-        When AI reply is entirely wrapped in ```markdown\\n...\\n```, remove the outer fence,
-        keeping the content. Only strip when the first line is ```markdown (case-insensitive) and the last line is ```.
-
-        Args:
-            text: Text to process
-
-        Returns:
-            Text with outer fence stripped (returns original if no match)
-        """
-        if not text:
-            return text
-
-        lines = text.split('\n')
-        if len(lines) < 3:
-            return text
-
-        first_line = lines[0].strip()
-        last_line = lines[-1].strip()
-
-        # First line must be ```markdown (optional language tag md/markdown)
-        if not re.match(r'^```(?:markdown|md)?\s*$', first_line, re.IGNORECASE):
-            return text
-
-        # Last line must be plain ```
-        if last_line != '```':
-            return text
-
-        # Strip first and last lines
-        inner = '\n'.join(lines[1:-1])
-        return inner
-
-    # -- Table sanitization ------------------------------------------------
-
-    @staticmethod
-    def sanitize_markdown_table(text: str) -> str:
-        """
-        Table output sanitization.
-
-        Handle common formatting issues in AI-generated Markdown tables:
-        1. Remove extra whitespace before/after table rows
-        2. Ensure separator rows (|---|---|) are correctly formatted
-        3. Remove empty table rows
-
-        Args:
-            text: Markdown text containing tables
-
-        Returns:
-            Sanitized text
-        """
-        if '|' not in text:
-            return text
-
-        lines = text.split('\n')
-        result_lines: list[str] = []
-
-        for line in lines:
-            stripped = line.strip()
-
-            # Table row processing
-            if stripped.startswith('|') and stripped.endswith('|'):
-                # Separator row normalization: | --- | --- | → |---|---|
-                if re.match(r'^\|[\s\-:]+(\|[\s\-:]+)+\|$', stripped):
-                    cells = stripped.split('|')
-                    normalized = '|'.join(
-                        cell.strip() if cell.strip() else cell
-                        for cell in cells
-                    )
-                    result_lines.append(normalized)
-                elif stripped == '||' or stripped.replace('|', '').strip() == '':
-                    # Empty table row → skip
-                    continue
-                else:
-                    result_lines.append(stripped)
-            else:
-                result_lines.append(line)
-
-        return '\n'.join(result_lines)
-
-    # -- Markdown hint prompt ----------------------------------------------
-
-    @staticmethod
-    def markdown_hint_system_prompt() -> str:
-        """
-        Markdown rendering hint (appended to system prompt).
-
-        Tell AI that Yuanbao platform supports Markdown rendering, including:
-        - Code blocks (```lang)
-        - Tables (| col | col |)
-        - Bold/italic
-        """
-        return (
-            "The current platform supports Markdown rendering. You can use the following formats:\n"
-            "- Code blocks: ```language\\ncode\\n```\n"
-            "- Tables: | col1 | col2 |\\n|---|---|\\n| val1 | val2 |\n"
-            "- Bold: **text** / Italic: *text*\n"
-            "Please use Markdown formatting when appropriate to improve readability."
-        )
-
-
-
-# ============================================================
-# Sign-ticket API (originally yuanbao_api.py)
-# ============================================================
-
-class SignManager:
-    """Encapsulates all sign-token related logic for the Yuanbao platform.
-
-    Manages token acquisition, caching, signature computation, and
-    automatic retry.  All state (cache, locks) is kept as class-level
-    attributes so that a single shared client serves the whole process.
-    """
-
-    # -- Constants ---------------------------------------------------------
-
-    TOKEN_PATH = "/api/v5/robotLogic/sign-token"
-
-    RETRYABLE_CODE = 10099
-    MAX_RETRIES = 3
-    RETRY_DELAY_S = 1.0
-
-    #: Early refresh margin (seconds), treat as expiring 60s before actual expiry
-    CACHE_REFRESH_MARGIN_S = 60
-
-    #: HTTP timeout (seconds)
-    HTTP_TIMEOUT_S = 10.0
-
-    # -- Class-level shared state ------------------------------------------
-
-    # key: app_key → {"token", "bot_id", "expire_ts", ...}
-    _cache: dict[str, dict[str, Any]] = {}
-
-    # Per-app_key refresh locks — prevents concurrent duplicate sign-token
-    # requests.  Created lazily inside get_refresh_lock() which is only called
-    # from async context, so the Lock is always bound to the correct loop.
-    # disconnect() clears this dict to prevent stale locks across reconnects.
-    _locks: dict[str, asyncio.Lock] = {}
-
-    # -- Internal helpers --------------------------------------------------
-
-    @classmethod
-    def get_refresh_lock(cls, app_key: str) -> asyncio.Lock:
-        """Return (creating if needed) the per-app_key refresh lock.
-
-        Must only be called from within a running event loop (async context).
-        """
-        if app_key not in cls._locks:
-            cls._locks[app_key] = asyncio.Lock()
-        return cls._locks[app_key]
-
-    @staticmethod
-    def compute_signature(nonce: str, timestamp: str, app_key: str, app_secret: str) -> str:
-        """Compute HMAC-SHA256 signature (aligned with TypeScript original).
-
-        plain     = nonce + timestamp + app_key + app_secret
-        signature = HMAC-SHA256(key=app_secret, msg=plain).hexdigest()
-        """
-        plain = nonce + timestamp + app_key + app_secret
-        return hmac.new(app_secret.encode(), plain.encode(), hashlib.sha256).hexdigest()
-
-    @staticmethod
-    def build_timestamp() -> str:
-        """Build Beijing-time ISO-8601 timestamp (no milliseconds).
-
-        Format: 2006-01-02T15:04:05+08:00
-        """
-        bjtime = datetime.now(tz=timezone(timedelta(hours=8)))
-        return bjtime.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-
-    @classmethod
-    def is_cache_valid(cls, entry: dict[str, Any]) -> bool:
-        """Determine whether the cache entry is valid (not expired with margin)."""
-        return entry["expire_ts"] - time.time() > cls.CACHE_REFRESH_MARGIN_S
-
-    @classmethod
-    def clear_locks(cls) -> None:
-        """Clear all per-app_key refresh locks (called on disconnect)."""
-        cls._locks.clear()
-
-    # -- Core: fetch -------------------------------------------------------
-
-    @classmethod
-    async def fetch(
-        cls,
-        app_key: str,
-        app_secret: str,
-        api_domain: str,
-        route_env: str = "",
-    ) -> dict[str, Any]:
-        """Send sign-ticket HTTP request with auto-retry (up to MAX_RETRIES times)."""
-        url = f"{api_domain.rstrip('/')}{cls.TOKEN_PATH}"
-        async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
-            for attempt in range(cls.MAX_RETRIES + 1):
-                nonce = secrets.token_hex(16)
-                timestamp = cls.build_timestamp()
-                signature = cls.compute_signature(nonce, timestamp, app_key, app_secret)
-
-                payload = {
-                    "app_key": app_key,
-                    "nonce": nonce,
-                    "signature": signature,
-                    "timestamp": timestamp,
-                }
-
-                headers = {
-                    "Content-Type": "application/json",
-                    "X-AppVersion": _APP_VERSION,
-                    "X-OperationSystem": _OPERATION_SYSTEM,
-                    "X-Instance-Id": "16",
-                    "X-Bot-Version": _BOT_VERSION,
-                }
-                if route_env:
-                    headers["X-Route-Env"] = route_env
-
-                logger.info(
-                    "Sign token request: url=%s%s",
-                    url,
-                    f" (retry {attempt}/{cls.MAX_RETRIES})" if attempt > 0 else "",
-                )
-
-                response = await client.post(url, json=payload, headers=headers)
-
-                if response.status_code != 200:
-                    body = response.text
-                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
-
-                try:
-                    result_data: dict[str, Any] = response.json()
-                except Exception as exc:
-                    raise ValueError(f"Sign token response parse error: {exc}") from exc
-
-                code = result_data.get("code")
-                if code == 0:
-                    data = result_data.get("data")
-                    if not isinstance(data, dict):
-                        raise ValueError(f"Sign token response missing 'data' field: {result_data}")
-                    logger.info("Sign token success: bot_id=%s", data.get("bot_id"))
-                    return data
-
-                if code == cls.RETRYABLE_CODE and attempt < cls.MAX_RETRIES:
-                    logger.warning(
-                        "Sign token retryable: code=%s, retrying in %ss (attempt=%d/%d)",
-                        code,
-                        cls.RETRY_DELAY_S,
-                        attempt + 1,
-                        cls.MAX_RETRIES,
-                    )
-                    await asyncio.sleep(cls.RETRY_DELAY_S)
-                    continue
-
-                msg = result_data.get("msg", "")
-                raise RuntimeError(f"Sign token error: code={code}, msg={msg}")
-
-        raise RuntimeError("Sign token failed: max retries exceeded")
-
-    # -- Public API: get (with cache) --------------------------------------
-
-    @classmethod
-    async def get_token(
-        cls,
-        app_key: str,
-        app_secret: str,
-        api_domain: str,
-        route_env: str = "",
-    ) -> dict[str, Any]:
-        """Get WS auth token (with cache).
-
-        Return directly on cache hit without re-requesting; treat as expiring
-        60 seconds before actual expiry, triggering refresh.
-        """
-        cached = cls._cache.get(app_key)
-        if cached and cls.is_cache_valid(cached):
-            remain = int(cached["expire_ts"] - time.time())
-            logger.info("Using cached token (%ds remaining)", remain)
-            return dict(cached)
-
-        async with cls.get_refresh_lock(app_key):
-            cached = cls._cache.get(app_key)
-            if cached and cls.is_cache_valid(cached):
-                return dict(cached)
-
-            data = await cls.fetch(app_key, app_secret, api_domain, route_env)
-
-            duration: int = data.get("duration", 0)
-            expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
-
-            cls._cache[app_key] = {
-                "token": data.get("token", ""),
-                "bot_id": data.get("bot_id", ""),
-                "duration": duration,
-                "product": data.get("product", ""),
-                "source": data.get("source", ""),
-                "expire_ts": expire_ts,
-            }
-
-        return dict(cls._cache[app_key])
-
-    # -- Public API: force refresh -----------------------------------------
-
-    @classmethod
-    async def force_refresh(
-        cls,
-        app_key: str,
-        app_secret: str,
-        api_domain: str,
-        route_env: str = "",
-    ) -> dict[str, Any]:
-        """Force refresh token (clear cache and re-sign)."""
-        logger.warning("[force-refresh] Clearing cache and re-signing token: app_key=****%s", app_key[-4:])
-        async with cls.get_refresh_lock(app_key):
-            cls._cache.pop(app_key, None)
-            data = await cls.fetch(app_key, app_secret, api_domain, route_env)
-
-            duration: int = data.get("duration", 0)
-            expire_ts = time.time() + duration if duration > 0 else time.time() + 3600
-
-            cls._cache[app_key] = {
-                "token": data.get("token", ""),
-                "bot_id": data.get("bot_id", ""),
-                "duration": duration,
-                "product": data.get("product", ""),
-                "source": data.get("source", ""),
-                "expire_ts": expire_ts,
-            }
-
-        return dict(cls._cache[app_key])
 
 
 # ---------------------------------------------------------------------------

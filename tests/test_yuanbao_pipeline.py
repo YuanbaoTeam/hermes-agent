@@ -32,6 +32,7 @@ from gateway.platforms.yuanbao import (
     DedupMiddleware,
     SkipSelfMiddleware,
     ChatRoutingMiddleware,
+    AccessPolicy,
     AccessGuardMiddleware,
     ExtractContentMiddleware,
     PlaceholderFilterMiddleware,
@@ -513,7 +514,7 @@ class TestAccessGuardMiddleware:
     async def test_open_policy_passes(self):
         """AccessGuardMiddleware passes with open policy."""
         adapter = make_adapter()
-        adapter._dm_policy = "open"
+        adapter._access_policy = AccessPolicy(dm_policy="open", dm_allow_from=[], group_policy="open", group_allow_from=[])
         ctx = make_ctx(adapter=adapter, chat_type="dm", from_account="alice")
         next_fn = AsyncMock()
 
@@ -524,7 +525,7 @@ class TestAccessGuardMiddleware:
     async def test_disabled_dm_stops(self):
         """AccessGuardMiddleware stops DM when dm_policy=disabled."""
         adapter = make_adapter()
-        adapter._dm_policy = "disabled"
+        adapter._access_policy = AccessPolicy(dm_policy="disabled", dm_allow_from=[], group_policy="open", group_allow_from=[])
         ctx = make_ctx(adapter=adapter, chat_type="dm", from_account="alice")
         next_fn = AsyncMock()
 
@@ -535,8 +536,7 @@ class TestAccessGuardMiddleware:
     async def test_allowlist_dm_allowed(self):
         """AccessGuardMiddleware passes DM when sender is in allowlist."""
         adapter = make_adapter()
-        adapter._dm_policy = "allowlist"
-        adapter._dm_allow_from = ["alice"]
+        adapter._access_policy = AccessPolicy(dm_policy="allowlist", dm_allow_from=["alice"], group_policy="open", group_allow_from=[])
         ctx = make_ctx(adapter=adapter, chat_type="dm", from_account="alice")
         next_fn = AsyncMock()
 
@@ -547,8 +547,7 @@ class TestAccessGuardMiddleware:
     async def test_allowlist_dm_blocked(self):
         """AccessGuardMiddleware blocks DM when sender is not in allowlist."""
         adapter = make_adapter()
-        adapter._dm_policy = "allowlist"
-        adapter._dm_allow_from = ["bob"]
+        adapter._access_policy = AccessPolicy(dm_policy="allowlist", dm_allow_from=["bob"], group_policy="open", group_allow_from=[])
         ctx = make_ctx(adapter=adapter, chat_type="dm", from_account="alice")
         next_fn = AsyncMock()
 
@@ -559,7 +558,7 @@ class TestAccessGuardMiddleware:
     async def test_disabled_group_stops(self):
         """AccessGuardMiddleware stops group when group_policy=disabled."""
         adapter = make_adapter()
-        adapter._group_policy = "disabled"
+        adapter._access_policy = AccessPolicy(dm_policy="open", dm_allow_from=[], group_policy="disabled", group_allow_from=[])
         ctx = make_ctx(adapter=adapter, chat_type="group", group_code="grp-1")
         next_fn = AsyncMock()
 
@@ -570,8 +569,7 @@ class TestAccessGuardMiddleware:
     async def test_allowlist_group_allowed(self):
         """AccessGuardMiddleware passes group when group_code is in allowlist."""
         adapter = make_adapter()
-        adapter._group_policy = "allowlist"
-        adapter._group_allow_from = ["grp-1"]
+        adapter._access_policy = AccessPolicy(dm_policy="open", dm_allow_from=[], group_policy="allowlist", group_allow_from=["grp-1"])
         ctx = make_ctx(adapter=adapter, chat_type="group", group_code="grp-1")
         next_fn = AsyncMock()
 
@@ -757,7 +755,7 @@ class TestPipelineIntegration:
         """Full pipeline processes a DM message end-to-end."""
         adapter = make_adapter()
         adapter._bot_id = "bot_123"
-        adapter._dm_policy = "open"
+        adapter._access_policy = AccessPolicy(dm_policy="open", dm_allow_from=[], group_policy="open", group_allow_from=[])
         adapter.handle_message = AsyncMock()
         adapter._resolve_inbound_media_urls = AsyncMock(return_value=([], []))
 
@@ -828,7 +826,7 @@ class TestPipelineIntegration:
         """Pipeline stops when DM is blocked by policy."""
         adapter = make_adapter()
         adapter._bot_id = "bot_123"
-        adapter._dm_policy = "disabled"
+        adapter._access_policy = AccessPolicy(dm_policy="disabled", dm_allow_from=[], group_policy="open", group_allow_from=[])
 
         push_data = make_json_push(
             from_account="alice",
