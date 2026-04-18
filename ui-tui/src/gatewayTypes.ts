@@ -47,6 +47,7 @@ export type CommandDispatchResponse =
   | { output?: string; type: 'exec' | 'plugin' }
   | { target: string; type: 'alias' }
   | { message?: string; name: string; type: 'skill' }
+  | { message: string; type: 'send' }
 
 // ── Config ───────────────────────────────────────────────────────────
 
@@ -150,6 +151,11 @@ export interface SessionCloseResponse {
 
 export interface SessionInterruptResponse {
   ok?: boolean
+}
+
+export interface SessionSteerResponse {
+  status?: 'queued' | 'rejected'
+  text?: string
 }
 
 // ── Prompt / submission ──────────────────────────────────────────────
