@@ -204,6 +204,19 @@ TOOLSETS = {
     "yuanbao": {
         "description": "Yuanbao platform tools - group info, member queries",
         "tools": ["yb_query_group_info", "yb_query_group_members"],
+
+    "feishu_doc": {
+        "description": "Read Feishu/Lark document content",
+        "tools": ["feishu_doc_read"],
+        "includes": []
+    },
+
+    "feishu_drive": {
+        "description": "Feishu/Lark document comment operations (list, reply, add)",
+        "tools": [
+            "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
+            "feishu_drive_reply_comment", "feishu_drive_add_comment",
+        ],
         "includes": []
     },
 
