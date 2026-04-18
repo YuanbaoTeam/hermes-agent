@@ -164,6 +164,26 @@ _REPLY_REF_MAX_ENTRIES = 500       # Max capacity of reference dedup dict
 SLOW_RESPONSE_TIMEOUT_S = 120.0
 SLOW_RESPONSE_MESSAGE = "任务有点复杂，正在努力处理中，请耐心等待..."
 
+# Unified message debounce: buffer all inbound messages (DM + group, all
+# types except COMMAND) for this many seconds before dispatching.  Each new
+# message from the same user resets the timer (debounce semantics).
+MSG_BATCH_DEBOUNCE_SECONDS = 2.0
+
+
+@dataclasses.dataclass
+class _MsgBatchEntry:
+    """Accumulated state for one debounce window."""
+
+    event: MessageEvent
+    chat_type: str
+    has_at_bot: bool
+    # Each fragment: (msg_seq, content_text, media_urls, media_types)
+    fragments: list
+    nickname_label: str
+    user_id_label: str
+    observe_source: Optional[SessionSource]
+    observe_sender: str
+
 # Placeholder message filter (skip these pure placeholders when no actual media content)
 _SKIPPABLE_PLACEHOLDERS = frozenset({
     "[image]", "[图片]", "[file]", "[文件]",
@@ -228,14 +248,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Inbound dispatch tasks — tracked so disconnect() can cancel them
         self._inbound_tasks: set[asyncio.Task] = set()
 
-        # DM message batching: when a non-text message (photo/voice/file)
-        # arrives in a private chat, delay dispatch for a short window so a
-        # follow-up text caption can be merged into the same turn.
-        self._dm_batch_delay_seconds: float = float(
-            os.getenv("HERMES_YUANBAO_DM_BATCH_DELAY_SECONDS", "2.0")
-        )
-        self._dm_pending_batches: Dict[str, MessageEvent] = {}
-        self._dm_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Unified message debounce: buffer all non-COMMAND messages for a
+        # short window so near-simultaneous messages (photo bursts, caption
+        # follow-ups, bursty texts) are merged into a single turn.
+        self._msg_pending_batches: Dict[str, _MsgBatchEntry] = {}
+        self._msg_batch_tasks: Dict[str, asyncio.Task] = {}
 
         # Reconnection state
         self._reconnect_attempts: int = 0
@@ -482,12 +499,12 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 task.cancel()
         self._inbound_tasks.clear()
 
-        # Cancel DM batch flush timers and discard buffered events
-        for task in list(self._dm_batch_tasks.values()):
+        # Cancel message-batch debounce timers and discard buffered events
+        for task in list(self._msg_batch_tasks.values()):
             if not task.done():
                 task.cancel()
-        self._dm_batch_tasks.clear()
-        self._dm_pending_batches.clear()
+        self._msg_batch_tasks.clear()
+        self._msg_pending_batches.clear()
 
         # Clear module-level refresh locks to avoid stale locks from a previous event loop
         _refresh_locks.clear()
@@ -2008,6 +2025,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         sender_nickname: str = push.get("sender_nickname", "")
         msg_body: list = push.get("msg_body", [])
         msg_id_field: str = push.get("msg_id", "")
+        msg_seq: int = push.get("msg_seq", 0) or 0
         cloud_custom_data: str = push.get("cloud_custom_data", "")
 
         # ---- Inbound dedup ----
@@ -2133,28 +2151,32 @@ class YuanbaoAdapter(BasePlatformAdapter):
             thread_id="main" if chat_type == "group" else None,
         )
 
-        if chat_type == "group" and not admitted_command and not self._is_at_bot(msg_body):
-            self._observe_group_message(source, sender_nickname or from_account, raw_text)
-            logger.info(
-                "[%s] Group message observed (no @bot): chat=%s from=%s",
-                self.name, chat_id, from_account,
-            )
-            return
+        is_at_bot = bool(
+            chat_type == "group" and (admitted_command or self._is_at_bot(msg_body))
+        )
 
         msg_type = self._classify_message_type(raw_text, msg_body)
         reply_to_message_id, reply_to_text, quote_media_refs = (
             self._extract_quote_context(cloud_custom_data)
         )
         event_channel_prompt = self._build_channel_prompt(chat_type, msg_body)
-        event_text = raw_text
+        user_id_label = from_account or "unknown"
+        nickname_label = sender_nickname or from_account or "unknown"
         dispatch_source = source
         if chat_type == "group" and not admitted_command:
-            user_id_label = from_account or "unknown"
-            nickname_label = sender_nickname or from_account or "unknown"
-            event_text = f"[{nickname_label}|{user_id_label}]\n{raw_text}"
             # Suppress runner's default ``[user_name]`` shared-thread prefix so
             # the text the model sees matches the observed-history format.
             dispatch_source = dataclasses.replace(source, user_name=None)
+
+        # Batch key: per-user isolation for debounce merging.
+        if chat_type == "group":
+            _batch_key = f"group:{group_code}:user:{from_account}"
+        else:
+            _batch_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
 
         async def _dispatch_inbound_event() -> None:
             media_urls, media_types = await self._resolve_inbound_media_urls(media_refs)
@@ -2214,11 +2236,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
             # Replace [kind|ybres:xxx] anchors with local cache paths so
             # the transcript records usable paths for the model.
-            _patched_event_text = event_text
+            _patched_content = raw_text
             for u, m in zip(media_urls, media_types):
                 if not u.startswith("/"):
                     continue
-                anchor_match = _YB_RES_REF_RE.search(_patched_event_text)
+                anchor_match = _YB_RES_REF_RE.search(_patched_content)
                 if not anchor_match:
                     continue
                 head = anchor_match.group(1)
@@ -2231,14 +2253,20 @@ class YuanbaoAdapter(BasePlatformAdapter):
                     replacement = f"[file: {label} → {u}]"
                 else:
                     continue
-                _patched_event_text = (
-                    _patched_event_text[:anchor_match.start()]
+                _patched_content = (
+                    _patched_content[:anchor_match.start()]
                     + replacement
-                    + _patched_event_text[anchor_match.end():]
+                    + _patched_content[anchor_match.end():]
                 )
 
+            # Build full event text (group messages get a [nick|uid] prefix).
+            if chat_type == "group" and not admitted_command:
+                _full_event_text = f"[{nickname_label}|{user_id_label}]\n{_patched_content}"
+            else:
+                _full_event_text = _patched_content
+
             event = MessageEvent(
-                text=_patched_event_text,
+                text=_full_event_text,
                 message_type=msg_type,
                 source=dispatch_source,
                 message_id=msg_id_field or None,
@@ -2250,24 +2278,21 @@ class YuanbaoAdapter(BasePlatformAdapter):
                 channel_prompt=event_channel_prompt or None,
             )
 
-            # DM non-text batching: buffer photos/voice/files briefly so a
-            # follow-up text caption can be merged into the same turn.
-            if (
-                chat_type == "dm"
-                and self._dm_batch_delay_seconds > 0
-                and msg_type not in (MessageType.TEXT, MessageType.COMMAND)
-            ):
-                self._enqueue_dm_nontext(event)
-                return
-
-            # DM text arriving while a non-text message is buffered — merge
-            # and flush immediately so the model sees both together.
-            if (
-                chat_type == "dm"
-                and self._dm_batch_delay_seconds > 0
-                and msg_type == MessageType.TEXT
-                and self._try_merge_text_into_dm_batch(event)
-            ):
+            # Unified message debounce: buffer all non-COMMAND messages so
+            # near-simultaneous messages are merged into a single turn.
+            if msg_type != MessageType.COMMAND:
+                self._enqueue_message(
+                    _batch_key, event,
+                    msg_seq=msg_seq,
+                    is_at_bot=is_at_bot,
+                    chat_type=chat_type,
+                    content_text=_patched_content,
+                    nickname_label=nickname_label,
+                    user_id_label=user_id_label,
+                    observe_source=source,
+                    observe_sender=sender_nickname or from_account,
+                    admitted_command=admitted_command,
+                )
                 return
 
             await self.handle_message(event)
@@ -2376,82 +2401,111 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return MessageType.TEXT
 
     # ------------------------------------------------------------------
-    # DM non-text message batching (wait for follow-up text caption)
+    # Unified message debounce batching (DM + group, all types)
     # ------------------------------------------------------------------
 
-    def _dm_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for DM message batching."""
-        return build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
-
-    def _enqueue_dm_nontext(self, event: MessageEvent) -> None:
-        """Buffer a DM non-text event and start/reset the flush timer."""
-        key = self._dm_batch_key(event)
-        existing = self._dm_pending_batches.get(key)
+    def _enqueue_message(
+        self,
+        key: str,
+        event: MessageEvent,
+        *,
+        msg_seq: int,
+        is_at_bot: bool,
+        chat_type: str,
+        content_text: str,
+        nickname_label: str,
+        user_id_label: str,
+        observe_source: SessionSource,
+        observe_sender: str,
+        admitted_command: Optional[str],
+    ) -> None:
+        """Buffer a message and start/reset the debounce timer."""
+        fragment = (msg_seq, content_text, list(event.media_urls), list(event.media_types))
+        existing = self._msg_pending_batches.get(key)
         if existing is not None:
-            if event.text:
-                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            if event.media_urls:
-                existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
+            existing.has_at_bot = existing.has_at_bot or is_at_bot
+            existing.fragments.append(fragment)
+            logger.debug(
+                "[%s] Batch merge: key=%s frags=%d at_bot=%s",
+                self.name, key[:30], len(existing.fragments), existing.has_at_bot,
+            )
         else:
-            self._dm_pending_batches[key] = event
+            self._msg_pending_batches[key] = _MsgBatchEntry(
+                event=event,
+                chat_type=chat_type,
+                has_at_bot=is_at_bot,
+                fragments=[fragment],
+                nickname_label=nickname_label,
+                user_id_label=user_id_label,
+                observe_source=observe_source,
+                observe_sender=observe_sender,
+            )
 
-        prior = self._dm_batch_tasks.get(key)
+        # (Re)start debounce timer — each new message resets the clock.
+        prior = self._msg_batch_tasks.get(key)
         if prior and not prior.done():
             prior.cancel()
-        task = asyncio.create_task(self._flush_dm_batch(key))
-        self._dm_batch_tasks[key] = task
+        task = asyncio.create_task(self._flush_message_batch(key, admitted_command))
+        self._msg_batch_tasks[key] = task
         self._inbound_tasks.add(task)
         task.add_done_callback(self._inbound_tasks.discard)
 
-    def _try_merge_text_into_dm_batch(self, event: MessageEvent) -> bool:
-        """Merge a DM text event into a pending non-text batch if one exists.
-
-        Returns True if merged (caller should skip normal dispatch).
-        """
-        key = self._dm_batch_key(event)
-        pending = self._dm_pending_batches.get(key)
-        if pending is None:
-            return False
-
-        if event.text:
-            pending.text = f"{pending.text}\n{event.text}" if pending.text else event.text
-
-        prior = self._dm_batch_tasks.get(key)
-        if prior and not prior.done():
-            prior.cancel()
-        self._dm_batch_tasks.pop(key, None)
-
-        merged = self._dm_pending_batches.pop(key, None)
-        if merged:
-            logger.info(
-                "[%s] DM batch: merged follow-up text into buffered %s message for %s",
-                self.name, getattr(merged.message_type, "value", merged.message_type), key[:30],
-            )
-            task = asyncio.create_task(self.handle_message(merged))
-            self._inbound_tasks.add(task)
-            task.add_done_callback(self._inbound_tasks.discard)
-        return True
-
-    async def _flush_dm_batch(self, key: str) -> None:
-        """Timer expired — dispatch the buffered non-text message as-is."""
+    async def _flush_message_batch(
+        self, key: str, admitted_command: Optional[str],
+    ) -> None:
+        """Debounce timer expired — dispatch or observe the merged batch."""
         try:
-            await asyncio.sleep(self._dm_batch_delay_seconds)
+            await asyncio.sleep(MSG_BATCH_DEBOUNCE_SECONDS)
         except asyncio.CancelledError:
             return
-        event = self._dm_pending_batches.pop(key, None)
-        self._dm_batch_tasks.pop(key, None)
-        if event:
-            logger.info(
-                "[%s] DM batch: flushing %s message (no follow-up text within %.1fs) for %s",
-                self.name, getattr(event.message_type, "value", event.message_type),
-                self._dm_batch_delay_seconds, key[:30],
+        entry = self._msg_pending_batches.pop(key, None)
+        self._msg_batch_tasks.pop(key, None)
+        if not entry:
+            return
+
+        # Sort fragments by msg_seq so merged content preserves send order
+        # even when async media resolution caused out-of-order arrival.
+        sorted_frags = sorted(entry.fragments, key=lambda f: f[0])
+
+        merged_content = "\n".join(text for _, text, _, _ in sorted_frags)
+        merged_media_urls: List[str] = []
+        merged_media_types: List[str] = []
+        merged_msg_type = MessageType.TEXT
+        for _, _, urls, types in sorted_frags:
+            merged_media_urls.extend(urls)
+            merged_media_types.extend(types)
+            if urls:
+                merged_msg_type = MessageType.PHOTO
+
+        entry.event.media_urls = merged_media_urls
+        entry.event.media_types = merged_media_types
+        if merged_msg_type != MessageType.TEXT:
+            entry.event.message_type = merged_msg_type
+
+        # Rebuild event text with the merged content.
+        if entry.chat_type == "group" and not admitted_command:
+            entry.event.text = (
+                f"[{entry.nickname_label}|{entry.user_id_label}]\n{merged_content}"
             )
-            await self.handle_message(event)
+        else:
+            entry.event.text = merged_content
+
+        if entry.chat_type == "group" and not entry.has_at_bot:
+            self._observe_group_message(
+                entry.observe_source, entry.observe_sender, merged_content,
+            )
+            logger.info(
+                "[%s] Batch observe (no @bot): key=%s frags=%d",
+                self.name, key[:30], len(sorted_frags),
+            )
+            return
+
+        logger.info(
+            "[%s] Batch flush: key=%s frags=%d media=%d at_bot=%s",
+            self.name, key[:30], len(sorted_frags),
+            len(merged_media_urls), entry.has_at_bot,
+        )
+        await self.handle_message(entry.event)
 
     # ------------------------------------------------------------------
     # DM active private chat + access control
