@@ -394,7 +394,18 @@ PLATFORM_HINTS = {
         "(max 50 MB). You can also include image URLs in markdown format ![alt](url) and "
         "they will be downloaded and sent as native photos. "
         "Do NOT tell the user you lack file-sending capability — use MEDIA: syntax "
-        "whenever a file delivery is appropriate."
+        "whenever a file delivery is appropriate.\n\n"
+        "Stickers (贴纸 / 表情包 / TIM face): Yuanbao has a built-in sticker catalogue. "
+        "When the user sends a sticker (you see '[emoji: 名称]' in their message) or asks "
+        "you to send/reply-with a 贴纸/表情/表情包, you MUST use the sticker tools:\n"
+        "  1. Call yb_search_sticker with a Chinese keyword (e.g. '666', '比心', '吃瓜', "
+        "     '捂脸', '合十') to discover matching sticker_ids.\n"
+        "  2. Call yb_send_sticker with the chosen sticker_id or name — this sends a real "
+        "     TIMFaceElem that renders as a native sticker in the chat.\n"
+        "DO NOT draw sticker-like PNGs with execute_code/Pillow/matplotlib and then send "
+        "them via MEDIA: or send_image_file. That produces a fake low-quality 'sticker' "
+        "image and is the WRONG path. Bare Unicode emoji in text is also not a substitute "
+        "— when a sticker is the right response, use yb_send_sticker."
     ),
 }
 

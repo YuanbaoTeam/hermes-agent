@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import random
+import re
+import unicodedata
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -334,6 +336,7 @@ def get_sticker_by_name(name: str) -> Optional[dict]:
       1. 完全相等（name）
       2. name 包含查询词（前缀/子串）
       3. description 包含查询词（同义词搜索）
+      4. 通用模糊评分（与 sticker-search 同算法），命中即返回得分最高的一条
 
     返回 sticker dict，找不到返回 None。
     """
@@ -342,22 +345,20 @@ def get_sticker_by_name(name: str) -> Optional[dict]:
 
     query = name.strip()
 
-    # 1. 精确匹配
     if query in STICKER_MAP:
         return STICKER_MAP[query]
 
-    # 2. name 子串匹配
     for key, sticker in STICKER_MAP.items():
         if query in key or key in query:
             return sticker
 
-    # 3. description 子串匹配（同义词）
     for sticker in STICKER_MAP.values():
         desc = sticker.get("description", "")
         if query in desc:
             return sticker
 
-    return None
+    matches = search_stickers(query, limit=1)
+    return matches[0] if matches else None
 
 
 def get_random_sticker(category: str = None) -> dict:
@@ -375,6 +376,136 @@ def get_random_sticker(category: str = None) -> dict:
         if candidates:
             return random.choice(candidates)
     return random.choice(list(STICKER_MAP.values()))
+
+
+def get_sticker_by_id(sticker_id: str) -> Optional[dict]:
+    """按 sticker_id 精确查找贴纸。"""
+    if not sticker_id:
+        return None
+    sid = str(sticker_id).strip()
+    for sticker in STICKER_MAP.values():
+        if sticker.get("sticker_id") == sid:
+            return sticker
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 模糊搜索（对齐 chatbot-web yuanbao-openclaw-plugin/sticker-cache.ts.searchStickers）
+# ---------------------------------------------------------------------------
+
+_PUNCT_RE = re.compile(r"[\s\u3000\-_·.,，。!！?？\"“”'‘’、/\\]+")
+
+
+def _normalize_text(raw: str) -> str:
+    return unicodedata.normalize("NFKC", str(raw or "")).strip().lower()
+
+
+def _compact_text(raw: str) -> str:
+    return _PUNCT_RE.sub("", _normalize_text(raw))
+
+
+def _multiset_char_hit_ratio(needle: str, haystack: str) -> float:
+    if not needle:
+        return 0.0
+    bag: dict[str, int] = {}
+    for ch in haystack:
+        bag[ch] = bag.get(ch, 0) + 1
+    hits = 0
+    for ch in needle:
+        n = bag.get(ch, 0)
+        if n > 0:
+            hits += 1
+            bag[ch] = n - 1
+    return hits / len(needle)
+
+
+def _bigram_jaccard(a: str, b: str) -> float:
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    A = {a[i:i + 2] for i in range(len(a) - 1)}
+    B = {b[i:i + 2] for i in range(len(b) - 1)}
+    inter = len(A & B)
+    union = len(A) + len(B) - inter
+    return inter / union if union else 0.0
+
+
+def _longest_subsequence_ratio(needle: str, haystack: str) -> float:
+    if not needle:
+        return 0.0
+    j = 0
+    for ch in haystack:
+        if j >= len(needle):
+            break
+        if ch == needle[j]:
+            j += 1
+    return j / len(needle)
+
+
+def _score_field(haystack: str, query: str) -> float:
+    hay = _normalize_text(haystack)
+    q = _normalize_text(query)
+    if not hay or not q:
+        return 0.0
+    hay_c = _compact_text(haystack)
+    q_c = _compact_text(query)
+    best = 0.0
+    if hay == q:
+        best = max(best, 100.0)
+    if q in hay:
+        best = max(best, 92 + min(6, len(q)))
+    if len(q) >= 2 and hay.startswith(q):
+        best = max(best, 88.0)
+    if q_c and q_c in hay_c:
+        best = max(best, 86.0)
+    best = max(best, _multiset_char_hit_ratio(q_c, hay_c) * 62)
+    best = max(best, _bigram_jaccard(q_c, hay_c) * 58)
+    best = max(best, _longest_subsequence_ratio(q_c, hay_c) * 52)
+    if len(q) == 1 and q in hay:
+        best = max(best, 68.0)
+    return best
+
+
+def search_stickers(query: str, limit: int = 10) -> list[dict]:
+    """
+    在内置贴纸表中按模糊匹配排序返回前 N 条结果。
+
+    评分综合 name/description 字段的子串、字符多重集覆盖、bigram Jaccard、子序列比例。
+    name 权重略高于 description（×0.88）。空 query 时按字典顺序返回前 N 条。
+    """
+    safe_limit = max(1, min(500, int(limit) if limit else 10))
+    if not query or not _normalize_text(query):
+        return list(STICKER_MAP.values())[:safe_limit]
+
+    scored: list[tuple[float, dict]] = []
+    for sticker in STICKER_MAP.values():
+        name_s = _score_field(sticker.get("name", ""), query)
+        desc_s = _score_field(sticker.get("description", ""), query) * 0.88
+        sid = str(sticker.get("sticker_id", "")).strip()
+        q_norm = _normalize_text(query)
+        id_s = 0.0
+        if sid and q_norm:
+            sid_norm = _normalize_text(sid)
+            if sid_norm == q_norm:
+                id_s = 100.0
+            elif q_norm in sid_norm:
+                id_s = 84.0
+        scored.append((max(name_s, desc_s, id_s), sticker))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[0][0] if scored else 0
+    if top <= 0:
+        return [s for _, s in scored[:safe_limit]]
+
+    if top >= 22:
+        floor = 18.0
+    elif top >= 12:
+        floor = max(10.0, top * 0.5)
+    else:
+        floor = max(6.0, top * 0.35)
+
+    filtered = [pair for pair in scored if pair[0] >= floor]
+    out = filtered if filtered else scored
+    return [s for _, s in out[:safe_limit]]
 
 
 def build_face_msg_body(
