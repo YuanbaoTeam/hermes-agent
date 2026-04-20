@@ -381,20 +381,14 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _dequeue_pending_text(adapter, session_key: str) -> str | None:
-    """Consume and return the text of a pending queued message.
+def _dequeue_pending_event(adapter, session_key: str) -> "MessageEvent | None":
+    """Consume and return the full pending event for a session.
 
-    Preserves media context for captionless photo/document events by
-    building a placeholder so the message isn't silently dropped.
+    Queued follow-ups must preserve their media metadata so they can re-enter
+    the normal image/STT/document preprocessing path instead of being reduced
+    to a placeholder string.
     """
-    event = adapter.get_pending_message(session_key)
-    if not event:
-        return None
-    text = event.text
-    if not text and getattr(event, "media_urls", None):
-        text = _build_media_placeholder(event)
-    return text
-
+    return adapter.get_pending_message(session_key)
 
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"

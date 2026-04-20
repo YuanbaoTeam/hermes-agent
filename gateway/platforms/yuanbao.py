@@ -2974,12 +2974,15 @@ class MediaSendHandler(ABC):
                 adapter, **kwargs,
             )
 
-            # 2. Validate
-            validation_err = MessageSender.validate_media(
-                file_bytes, filename, adapter.MEDIA_MAX_SIZE_MB,
-            )
-            if validation_err:
-                return SendResult(success=False, error=validation_err)
+            # 2. Validate (only for handlers that upload to COS; stickers use
+            # TIMFaceElem and legitimately carry no file bytes, so skipping
+            # validate_media here avoids a spurious "Empty file: sticker").
+            if self.needs_cos_upload():
+                validation_err = MessageSender.validate_media(
+                    file_bytes, filename, adapter.MEDIA_MAX_SIZE_MB,
+                )
+                if validation_err:
+                    return SendResult(success=False, error=validation_err)
 
             if self.needs_cos_upload():
                 file_uuid = md5_hex(file_bytes)
