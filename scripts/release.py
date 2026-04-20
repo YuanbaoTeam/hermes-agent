@@ -104,6 +104,8 @@ AUTHOR_MAP = {
     "xiewenxuan462@gmail.com": "yule975",
     "yiweimeng.dlut@hotmail.com": "meng93",
     "hakanerten02@hotmail.com": "teyrebaz33",
+    "linux2010@users.noreply.github.com": "Linux2010",
+    "elmatadorgh@users.noreply.github.com": "elmatadorgh",
     "ruzzgarcn@gmail.com": "Ruzzgar",
     "alireza78.crypto@gmail.com": "alireza78a",
     "brooklyn.bb.nicholson@gmail.com": "brooklynnicholson",
@@ -305,6 +307,7 @@ AUTHOR_MAP = {
     "jarvischer@gmail.com": "maxchernin",
     "levantam.98.2324@gmail.com": "LVT382009",
     "zhurongcheng@rcrai.com": "heykb",
+    "withapurpose37@gmail.com": "StefanIsMe",
 }
 
 
