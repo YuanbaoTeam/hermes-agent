@@ -715,6 +715,11 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                ignored_threads = telegram_cfg.get("ignored_threads")
+                if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
+                    if isinstance(ignored_threads, list):
+                        ignored_threads = ",".join(str(v) for v in ignored_threads)
+                    os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
                 if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
@@ -729,11 +734,6 @@ def load_gateway_config() -> GatewayConfig:
                         extra = {}
                         plat_data["extra"] = extra
                     extra["disable_link_previews"] = telegram_cfg["disable_link_previews"]
-                ignored_threads = telegram_cfg.get("ignored_threads")
-                if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
-                    if isinstance(ignored_threads, list):
-                        ignored_threads = ",".join(str(v) for v in ignored_threads)
-                    os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
 
             whatsapp_cfg = yaml_cfg.get("whatsapp", {})
             if isinstance(whatsapp_cfg, dict):
@@ -793,6 +793,7 @@ def load_gateway_config() -> GatewayConfig:
     # Override with environment variables
     _apply_env_overrides(config)
     
+    # --- Validate loaded values ---
     _validate_gateway_config(config)
 
     return config
@@ -804,7 +805,6 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
     Called by ``load_gateway_config()`` after all config sources are merged.
     Extracted as a separate function for testability.
     """
-    # --- Validate loaded values ---
     policy = config.default_reset_policy
 
     if not (0 <= policy.at_hour <= 23):
@@ -842,10 +842,13 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
             )
 
     # Reject known-weak placeholder tokens.
+    # Ported from openclaw/openclaw#64586: users who copy .env.example
+    # without changing placeholder values get a clear startup error instead
+    # of a confusing "auth failed" from the platform API.
     try:
         from hermes_cli.auth import has_usable_secret
     except ImportError:
-        has_usable_secret = None
+        has_usable_secret = None  # type: ignore[assignment]
 
     if has_usable_secret is not None:
         for platform, pconfig in config.platforms.items():
