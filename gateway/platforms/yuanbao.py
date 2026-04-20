@@ -906,6 +906,9 @@ class InboundContext:
     media_urls: list = dc_field(default_factory=list)
     media_types: list = dc_field(default_factory=list)
 
+    # Populated by ExtractContentMiddleware
+    link_urls: list = dc_field(default_factory=list)
+
     # Populated by GroupAttributionMiddleware
     channel_prompt: Optional[str] = None
 
@@ -1375,8 +1378,43 @@ class ExtractContentMiddleware(InboundMiddleware):
 
     name = "extract-content"
 
+    _CARD_CONTENT_MAX_LENGTH = 1000
+
     @staticmethod
-    def _extract_text(msg_body: list) -> str:
+    def _format_shared_link(custom: dict) -> str:
+        """Format elem_type 1010 (share card) into bracket-placeholder text."""
+        title = custom.get("title", "")
+        link = custom.get("link", "")
+        header = f"[share_card: {title} | {link}]" if link else f"[share_card: {title}]"
+        lines = [header]
+        max_len = ExtractContentMiddleware._CARD_CONTENT_MAX_LENGTH
+        for field in ("card_content", "wechat_des"):
+            val = custom.get(field)
+            if val and isinstance(val, str):
+                preview = val[:max_len] + "...(truncated)" if len(val) > max_len else val
+                lines.append(f"Preview: {preview}")
+                break
+        if link:
+            lines.append("[visit link for full content]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_link_understanding(custom: dict) -> Optional[str]:
+        """Format elem_type 1007 (link understanding card) into bracket-placeholder text."""
+        content = custom.get("content")
+        if not content:
+            return None
+        try:
+            parsed = json.loads(content)
+            link = parsed.get("link") if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            link = None
+        if not link or not isinstance(link, str):
+            return None
+        return f"[link: {link} | visit link for full content]"
+
+    @classmethod
+    def _extract_text(cls, msg_body: list) -> str:
         """Extract plain text content from MsgBody.
 
         - TIMTextElem      -> text field
@@ -1411,8 +1449,20 @@ class ExtractContentMiddleware(InboundMiddleware):
                 if data_val:
                     try:
                         custom = json.loads(data_val)
-                        if isinstance(custom, dict) and custom.get("elem_type") == 1002:
+                        if not isinstance(custom, dict):
+                            parts.append("[unsupported message type]")
+                            continue
+                        ctype = custom.get("elem_type")
+                        if ctype == 1002:
                             parts.append(custom.get("text", "[mention]"))
+                        elif ctype == 1010:
+                            parts.append(cls._format_shared_link(custom))
+                        elif ctype == 1007:
+                            text = cls._format_link_understanding(custom)
+                            if text:
+                                parts.append(text)
+                            else:
+                                parts.append("[unsupported message type]")
                         else:
                             parts.append("[unsupported message type]")
                     except (json.JSONDecodeError, TypeError):
@@ -1491,9 +1541,43 @@ class ExtractContentMiddleware(InboundMiddleware):
                     refs.append(ref)
         return refs
 
+    @staticmethod
+    def _extract_link_urls(msg_body: list) -> list:
+        """Extract link URLs from share-card (1010) and link-understanding (1007) custom elems."""
+        urls: list[str] = []
+        for elem in msg_body or []:
+            if not isinstance(elem, dict) or elem.get("msg_type") != "TIMCustomElem":
+                continue
+            data_str = (elem.get("msg_content") or {}).get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(custom, dict):
+                continue
+            ctype = custom.get("elem_type")
+            if ctype == 1010:
+                link = custom.get("link")
+                if link and isinstance(link, str):
+                    urls.append(link)
+            elif ctype == 1007:
+                content = custom.get("content")
+                if content:
+                    try:
+                        parsed = json.loads(content)
+                        link = parsed.get("link") if isinstance(parsed, dict) else None
+                        if link and isinstance(link, str):
+                            urls.append(link)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        return urls
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
+        ctx.link_urls = self._extract_link_urls(ctx.msg_body)
         await next_fn()
 
 class PlaceholderFilterMiddleware(InboundMiddleware):
