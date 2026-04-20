@@ -1175,7 +1175,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
             )
-    
+
     # WeCom callback mode (self-built apps)
     wecom_callback_corp_id = os.getenv("WECOM_CALLBACK_CORP_ID")
     wecom_callback_corp_secret = os.getenv("WECOM_CALLBACK_CORP_SECRET")
