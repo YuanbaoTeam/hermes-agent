@@ -86,7 +86,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write
+from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -206,6 +206,8 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
             if "gateway_timeout_warning" in _agent_cfg and "HERMES_AGENT_TIMEOUT_WARNING" not in os.environ:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
+            if "gateway_notify_interval" in _agent_cfg and "HERMES_AGENT_NOTIFY_INTERVAL" not in os.environ:
+                os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg and "HERMES_RESTART_DRAIN_TIMEOUT" not in os.environ:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
         _display_cfg = _cfg.get("display", {})
@@ -225,6 +227,15 @@ if _config_path.exists():
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
     except Exception:
         pass  # Non-fatal; gateway can still run with .env values
+
+# Apply IPv4 preference if configured (before any HTTP clients are created).
+try:
+    from hermes_constants import apply_ipv4_preference
+    _network_cfg = (_cfg if '_cfg' in dir() else {}).get("network", {})
+    if isinstance(_network_cfg, dict) and _network_cfg.get("force_ipv4"):
+        apply_ipv4_preference(force=True)
+except Exception:
+    pass
 
 # Validate config structure early — log warnings so gateway operators see problems
 try:
@@ -381,7 +392,7 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _dequeue_pending_event(adapter, session_key: str) -> "MessageEvent | None":
+def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     """Consume and return the full pending event for a session.
 
     Queued follow-ups must preserve their media metadata so they can re-enter
@@ -389,6 +400,7 @@ def _dequeue_pending_event(adapter, session_key: str) -> "MessageEvent | None":
     to a placeholder string.
     """
     return adapter.get_pending_message(session_key)
+
 
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
@@ -1044,13 +1056,47 @@ class GatewayRunner:
                 "api_mode": override.get("api_mode"),
             }
             if override_runtime.get("api_key"):
+                logger.debug(
+                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
+                    (resolved_session_key or "")[:30], model, override_model,
+                    override_runtime.get("provider"),
+                )
                 return override_model, override_runtime
+            # Override exists but has no api_key — fall through to env-based
+            # resolution and apply model/provider from the override on top.
+            logger.debug(
+                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
+                (resolved_session_key or "")[:30], model, override_model,
+            )
+        else:
+            logger.debug(
+                "No session model override: session=%s config_model=%s override_keys=%s",
+                (resolved_session_key or "")[:30], model,
+                list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
+            )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+
+        # When the config has no model.default but a provider was resolved
+        # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
+        # fall back to the provider's first catalog model so the API call
+        # doesn't fail with "model must be a non-empty string".
+        if not model and runtime_kwargs.get("provider"):
+            try:
+                from hermes_cli.models import get_default_model_for_provider
+                model = get_default_model_for_provider(runtime_kwargs["provider"])
+                if model:
+                    logger.info(
+                        "No model configured — defaulting to %s for provider %s",
+                        model, runtime_kwargs["provider"],
+                    )
+            except Exception:
+                pass
+
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
@@ -1108,6 +1154,12 @@ class GatewayRunner:
             adapter.platform.value,
             adapter.fatal_error_code or "unknown",
             adapter.fatal_error_message or "unknown error",
+        )
+        self._update_platform_runtime_status(
+            adapter.platform.value,
+            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+            error_code=adapter.fatal_error_code,
+            error_message=adapter.fatal_error_message,
         )
 
         existing = self.adapters.get(adapter.platform)
@@ -1183,6 +1235,25 @@ class GatewayRunner:
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
                 active_agents=self._running_agent_count(),
+            )
+        except Exception:
+            pass
+
+    def _update_platform_runtime_status(
+        self,
+        platform: str,
+        *,
+        platform_state: Optional[str] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(
+                platform=platform,
+                platform_state=platform_state,
+                error_code=error_code,
+                error_message=error_message,
             )
         except Exception:
             pass
@@ -1943,12 +2014,24 @@ class GatewayRunner:
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="connecting",
+                error_code=None,
+                error_message=None,
+            )
             try:
                 success = await adapter.connect()
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="connected",
+                        error_code=None,
+                        error_message=None,
+                    )
                     logger.info("✓ %s connected", platform.value)
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
@@ -1962,6 +2045,12 @@ class GatewayRunner:
                     # partial-init state.
                     await self._safe_adapter_disconnect(adapter, platform)
                     if adapter.has_fatal_error:
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+                            error_code=adapter.fatal_error_code,
+                            error_message=adapter.fatal_error_message,
+                        )
                         target = (
                             startup_retryable_errors
                             if adapter.fatal_error_retryable
@@ -1978,6 +2067,12 @@ class GatewayRunner:
                                 "next_retry": time.monotonic() + 30,
                             }
                     else:
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying",
+                            error_code=None,
+                            error_message="failed to connect",
+                        )
                         startup_retryable_errors.append(
                             f"{platform.value}: failed to connect"
                         )
@@ -2067,6 +2162,9 @@ class GatewayRunner:
             )
         ):
             self._schedule_update_notification_watch()
+
+        # Notify the chat that initiated /restart that the gateway is back.
+        await self._send_restart_notification()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -2311,6 +2409,12 @@ class GatewayRunner:
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="connected",
+                            error_code=None,
+                            error_message=None,
+                        )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
@@ -2322,6 +2426,12 @@ class GatewayRunner:
                     else:
                         # Check if the failure is non-retryable
                         if adapter.has_fatal_error and not adapter.fatal_error_retryable:
+                            self._update_platform_runtime_status(
+                                platform.value,
+                                platform_state="fatal",
+                                error_code=adapter.fatal_error_code,
+                                error_message=adapter.fatal_error_message,
+                            )
                             logger.warning(
                                 "Reconnect %s: non-retryable error (%s), removing from retry queue",
                                 platform.value, adapter.fatal_error_message,
