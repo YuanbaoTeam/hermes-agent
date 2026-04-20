@@ -9470,18 +9470,6 @@ class AIAgent:
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
-            # Lnguage consistency: detect the user's language from
-            # recent messages and append a reminder to the last user message
-            # so the model replies in the same language.  This is injected
-            # into api_messages only (not persisted) and does not break the
-            # system prompt cache prefix.
-            _lang_hint = detect_user_language_hint(messages, self.platform)
-            if _lang_hint:
-                for _ami in reversed(api_messages):
-                    if _ami.get("role") == "user" and isinstance(_ami.get("content"), str):
-                        _ami["content"] = _ami["content"] + "\n\n" + _lang_hint
-                        break
-
             # Inject ephemeral prefill messages right after the system prompt
             # but before conversation history. Same API-call-time-only pattern.
             if self.prefill_messages:

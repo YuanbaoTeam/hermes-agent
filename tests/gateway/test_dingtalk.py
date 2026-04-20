@@ -753,19 +753,6 @@ class TestCardLifecycle:
     @pytest.fixture
     def adapter_with_card(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
-        import gateway.platforms.dingtalk as dt_mod
-
-        # Mock the alibabacloud SDK models that may not be installed in test env
-        _orig_tea = dt_mod.tea_util_models
-        _orig_card = dt_mod.dingtalk_card_models
-        if _orig_tea is None:
-            dt_mod.tea_util_models = MagicMock()
-        if _orig_card is None:
-            mock_card_models = MagicMock()
-            # Make StreamingUpdateRequest return a SimpleNamespace that
-            # preserves kwargs so tests can assert on is_finalize, etc.
-            mock_card_models.StreamingUpdateRequest = lambda **kw: SimpleNamespace(**kw)
-            dt_mod.dingtalk_card_models = mock_card_models
 
         a = DingTalkAdapter(PlatformConfig(
             enabled=True,
@@ -788,12 +775,7 @@ class TestCardLifecycle:
         a._session_webhooks["chat-1"] = (
             "https://api.dingtalk.com/x", 9999999999999,
         )
-
-        yield a
-
-        # Restore originals
-        dt_mod.tea_util_models = _orig_tea
-        dt_mod.dingtalk_card_models = _orig_card
+        return a
 
     @pytest.mark.asyncio
     async def test_final_reply_finalizes_card(self, adapter_with_card):
@@ -963,40 +945,27 @@ class TestDingTalkAdapterAICards:
     @pytest.mark.asyncio
     async def test_send_uses_ai_card_if_configured(self, config, mock_stream_client, mock_http_client, mock_message):
         from gateway.platforms.dingtalk import DingTalkAdapter
-        import gateway.platforms.dingtalk as dt_mod
 
-        # Mock alibabacloud SDK models if not installed
-        _orig_tea = dt_mod.tea_util_models
-        _orig_card = dt_mod.dingtalk_card_models
-        if _orig_tea is None:
-            dt_mod.tea_util_models = MagicMock()
-        if _orig_card is None:
-            dt_mod.dingtalk_card_models = MagicMock()
+        adapter = DingTalkAdapter(config)
+        adapter._stream_client = mock_stream_client
+        adapter._http_client = mock_http_client
+        adapter._message_contexts["test_conv_id"] = mock_message
+        adapter._session_webhooks = {"test_conv_id": ("https://api.dingtalk.com/robot/sendBySession?session=test", 9999999999999)}
+        adapter._card_template_id = "test_card_template"
 
-        try:
-            adapter = DingTalkAdapter(config)
-            adapter._stream_client = mock_stream_client
-            adapter._http_client = mock_http_client
-            adapter._message_contexts["test_conv_id"] = mock_message
-            adapter._session_webhooks = {"test_conv_id": ("https://api.dingtalk.com/robot/sendBySession?session=test", 9999999999999)}
-            adapter._card_template_id = "test_card_template"
+        # Mock the card SDK with proper async methods
+        mock_card_sdk = MagicMock()
+        mock_card_sdk.create_card_with_options_async = AsyncMock()
+        mock_card_sdk.deliver_card_with_options_async = AsyncMock()
+        mock_card_sdk.streaming_update_with_options_async = AsyncMock()
+        adapter._card_sdk = mock_card_sdk
 
-            # Mock the card SDK with proper async methods
-            mock_card_sdk = MagicMock()
-            mock_card_sdk.create_card_with_options_async = AsyncMock()
-            mock_card_sdk.deliver_card_with_options_async = AsyncMock()
-            mock_card_sdk.streaming_update_with_options_async = AsyncMock()
-            adapter._card_sdk = mock_card_sdk
+        # Mock access token
+        adapter._get_access_token = AsyncMock(return_value="test_token")
 
-            # Mock access token
-            adapter._get_access_token = AsyncMock(return_value="test_token")
+        result = await adapter.send("test_conv_id", "Hello World")
 
-            result = await adapter.send("test_conv_id", "Hello World")
-
-            mock_card_sdk.create_card_with_options_async.assert_called_once()
-            mock_card_sdk.deliver_card_with_options_async.assert_called_once()
-            mock_card_sdk.streaming_update_with_options_async.assert_called_once()
-            assert result.success is True
-        finally:
-            dt_mod.tea_util_models = _orig_tea
-            dt_mod.dingtalk_card_models = _orig_card
+        mock_card_sdk.create_card_with_options_async.assert_called_once()
+        mock_card_sdk.deliver_card_with_options_async.assert_called_once()
+        mock_card_sdk.streaming_update_with_options_async.assert_called_once()
+        assert result.success is True
