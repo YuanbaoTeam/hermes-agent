@@ -73,6 +73,7 @@ from gateway.platforms.yuanbao_proto import (
     _parse_fields,
     WS_HEARTBEAT_RUNNING,
     WS_HEARTBEAT_FINISH,
+    HERMES_INSTANCE_ID,
     decode_conn_msg,
     decode_inbound_push,
     decode_query_group_info_rsp,
@@ -100,8 +101,9 @@ try:
 except ImportError:
     _HERMES_VERSION = "0.0.0"
 
-_APP_VERSION = f"hermes-agent/{_HERMES_VERSION}"
-_BOT_VERSION = f"hermes-agent/{_HERMES_VERSION}"
+_APP_VERSION = _HERMES_VERSION
+_BOT_VERSION = _HERMES_VERSION
+_YUANBAO_INSTANCE_ID = str(HERMES_INSTANCE_ID)  # single source: yuanbao_proto.HERMES_INSTANCE_ID
 _OPERATION_SYSTEM = sys.platform
 
 # ---------------------------------------------------------------------------
@@ -732,7 +734,7 @@ class SignManager:
                     "Content-Type": "application/json",
                     "X-AppVersion": _APP_VERSION,
                     "X-OperationSystem": _OPERATION_SYSTEM,
-                    "X-Instance-Id": "16",
+                    "X-Instance-Id": _YUANBAO_INSTANCE_ID,
                     "X-Bot-Version": _BOT_VERSION,
                 }
                 if route_env:
