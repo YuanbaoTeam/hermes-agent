@@ -2624,6 +2624,40 @@ class ConnectionManager:
       - Reconnect with exponential backoff
     """
 
+    @staticmethod
+    def _resolve_future(fut: "asyncio.Future", result=None, *, exception=None) -> None:
+        """Set result/exception on a Future, safely across event loops.
+
+        Tool handlers may run in a thread with a different event loop
+        (via _run_async → asyncio.run).  A plain fut.set_result() from
+        the main loop won't wake the await in the other loop's context.
+        Using call_soon_threadsafe posts the callback to the future's
+        own loop so the await resolves immediately.
+        """
+        if fut.done():
+            return
+
+        def _do():
+            if fut.done():
+                return
+            try:
+                if exception is not None:
+                    fut.set_exception(exception)
+                else:
+                    fut.set_result(result)
+            except asyncio.InvalidStateError:
+                pass
+
+        try:
+            fut_loop = fut.get_loop()
+            current_loop = asyncio.get_running_loop()
+            if fut_loop is not current_loop:
+                fut_loop.call_soon_threadsafe(_do)
+                return
+        except (RuntimeError, AttributeError):
+            pass
+        _do()
+
     def __init__(self, adapter: "YuanbaoAdapter") -> None:
         self._adapter = adapter
         self._ws = None  # websockets connection
@@ -2789,8 +2823,7 @@ class ConnectionManager:
         # Fail any pending ACK futures
         disc_exc = RuntimeError("YuanbaoAdapter disconnected")
         for fut in self._pending_acks.values():
-            if not fut.done():
-                fut.set_exception(disc_exc)
+            self._resolve_future(fut, exception=disc_exc)
         self._pending_acks.clear()
 
         # Clear refresh locks to avoid stale locks from a previous event loop
@@ -2979,11 +3012,10 @@ class ConnectionManager:
         # HEARTBEAT_ACK
         if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
             if self._pending_pong is not None and not self._pending_pong.done():
-                self._pending_pong.set_result(True)
+                self._resolve_future(self._pending_pong, True)
             elif msg_id and msg_id in self._pending_acks:
                 fut = self._pending_acks.pop(msg_id)
-                if not fut.done():
-                    fut.set_result(True)
+                self._resolve_future(fut, True)
             return
 
         # Fire-and-forget heartbeat ACKs — server always responds but callers don't
@@ -3004,11 +3036,10 @@ class ConnectionManager:
             )
             if matched:
                 fut = self._pending_acks.pop(msg_id)
-                if not fut.done():
-                    result = {"head": head}
-                    if data:
-                        result["data"] = data
-                    fut.set_result(result)
+                result = {"head": head}
+                if data:
+                    result["data"] = data
+                self._resolve_future(fut, result)
             else:
                 logger.debug(
                     "[%s] Unmatched Response: cmd=%s msg_id=%s",
@@ -3028,12 +3059,11 @@ class ConnectionManager:
 
             if msg_id and msg_id in self._pending_acks:
                 fut = self._pending_acks.pop(msg_id)
-                if not fut.done():
-                    try:
-                        decoded = decode_inbound_push(data) if data else {"head": head}
-                        fut.set_result(decoded)
-                    except Exception as exc:
-                        fut.set_exception(exc)
+                try:
+                    decoded = decode_inbound_push(data) if data else {"head": head}
+                    self._resolve_future(fut, decoded)
+                except Exception as exc:
+                    self._resolve_future(fut, exception=exc)
                 return
 
             # Genuine inbound message — dispatch to AI
@@ -3167,7 +3197,7 @@ class ConnectionManager:
         self._pending_acks[req_id] = future
         try:
             await self._ws.send(encoded_conn_msg)
-            result = await asyncio.wait_for(future, timeout=timeout)
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
             logger.debug(
                 "[%s] send_biz_request OK: req_id=%s response_keys=%s",
                 self._adapter.name, req_id, list(result.keys()) if isinstance(result, dict) else type(result).__name__,
