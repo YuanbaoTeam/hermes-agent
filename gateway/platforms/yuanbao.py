@@ -2908,7 +2908,6 @@ class ConnectionManager:
                     self._pending_pong = pong_future
                     self._pending_acks[msg_id] = pong_future
                     await self._ws.send(ping_bytes)
-                    logger.debug("[%s] PING sent (msg_id=%s)", adapter.name, msg_id)
                     try:
                         await asyncio.wait_for(pong_future, timeout=10.0)
                         self._consecutive_hb_timeouts = 0
@@ -2979,7 +2978,6 @@ class ConnectionManager:
 
         # HEARTBEAT_ACK
         if cmd_type == CMD_TYPE["Response"] and cmd == "ping":
-            logger.debug("[%s] HEARTBEAT_ACK received (msg_id=%s)", adapter.name, msg_id)
             if self._pending_pong is not None and not self._pending_pong.done():
                 self._pending_pong.set_result(True)
             elif msg_id and msg_id in self._pending_acks:
@@ -2994,12 +2992,17 @@ class ConnectionManager:
             "send_group_heartbeat",
             "send_private_heartbeat",
         ):
-            logger.debug("[%s] Heartbeat ACK received: cmd=%s msg_id=%s", adapter.name, cmd, msg_id)
             return
 
         # Response to an outbound RPC call
         if cmd_type == CMD_TYPE["Response"]:
-            if msg_id and msg_id in self._pending_acks:
+            matched = msg_id and msg_id in self._pending_acks
+            logger.debug(
+                "[%s] Biz Response received: cmd=%s msg_id=%s status=%s data_len=%d matched=%s pending_keys=[%s]",
+                adapter.name, cmd, msg_id, head.get("status", "?"), len(data),
+                matched, ", ".join(list(self._pending_acks.keys())[:5]),
+            )
+            if matched:
                 fut = self._pending_acks.pop(msg_id)
                 if not fut.done():
                     result = {"head": head}
@@ -3154,14 +3157,27 @@ class ConnectionManager:
         if self._ws is None:
             raise RuntimeError("Not connected")
 
+        logger.debug(
+            "[%s] send_biz_request: req_id=%s payload_len=%d timeout=%.1fs pending_acks=%d",
+            self._adapter.name, req_id, len(encoded_conn_msg), timeout,
+            len(self._pending_acks),
+        )
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending_acks[req_id] = future
         try:
             await self._ws.send(encoded_conn_msg)
-            result = await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            result = await asyncio.wait_for(future, timeout=timeout)
+            logger.debug(
+                "[%s] send_biz_request OK: req_id=%s response_keys=%s",
+                self._adapter.name, req_id, list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+            )
             return result
         except asyncio.TimeoutError:
+            logger.debug(
+                "[%s] send_biz_request TIMEOUT: req_id=%s (%.1fs elapsed)",
+                self._adapter.name, req_id, timeout,
+            )
             raise
         except Exception:
             raise
@@ -3558,24 +3574,37 @@ class GroupQueryService:
         """
         adapter = self._adapter
         if adapter._connection.ws is None:
+            logger.debug("[%s] query_group_info_raw: ws is None, skipping", adapter.name)
             return None
         encoded = encode_query_group_info(group_code)
         from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
         decoded = _decode(encoded)
         req_id = decoded["head"]["msg_id"]
+        logger.debug(
+            "[%s] query_group_info_raw: group=%s req_id=%s cmd=%s module=%s",
+            adapter.name, group_code, req_id,
+            decoded["head"].get("cmd", ""), decoded["head"].get("module", ""),
+        )
         try:
             response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
             head = response.get("head", {})
             status = head.get("status", 0)
+            logger.debug(
+                "[%s] query_group_info_raw response: group=%s req_id=%s status=%d head=%s data_len=%d",
+                adapter.name, group_code, req_id, status, head,
+                len(response.get("data", b"")),
+            )
             if status != 0:
                 logger.warning("[%s] query_group_info failed: status=%d", adapter.name, status)
                 return None
             biz_data = response.get("data", b"") or response.get("body", b"")
             if biz_data and isinstance(biz_data, bytes):
-                return decode_query_group_info_rsp(biz_data)
+                result = decode_query_group_info_rsp(biz_data)
+                logger.debug("[%s] query_group_info_raw decoded: %s", adapter.name, result)
+                return result
             return {"group_code": group_code}
         except asyncio.TimeoutError:
-            logger.warning("[%s] query_group_info timeout: group=%s", adapter.name, group_code)
+            logger.warning("[%s] query_group_info timeout: group=%s req_id=%s", adapter.name, group_code, req_id)
             return None
         except Exception as exc:
             logger.warning("[%s] query_group_info failed: %s", adapter.name, exc)
@@ -3591,15 +3620,26 @@ class GroupQueryService:
         """
         adapter = self._adapter
         if adapter._connection.ws is None:
+            logger.debug("[%s] get_group_member_list_raw: ws is None, skipping", adapter.name)
             return None
         encoded = encode_get_group_member_list(group_code, offset=offset, limit=limit)
         from gateway.platforms.yuanbao_proto import decode_conn_msg as _decode
         decoded = _decode(encoded)
         req_id = decoded["head"]["msg_id"]
+        logger.debug(
+            "[%s] get_group_member_list_raw: group=%s offset=%d limit=%d req_id=%s cmd=%s module=%s",
+            adapter.name, group_code, offset, limit, req_id,
+            decoded["head"].get("cmd", ""), decoded["head"].get("module", ""),
+        )
         try:
             response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
             head = response.get("head", {})
             status = head.get("status", 0)
+            logger.debug(
+                "[%s] get_group_member_list_raw response: group=%s req_id=%s status=%d head=%s data_len=%d",
+                adapter.name, group_code, req_id, status, head,
+                len(response.get("data", b"")),
+            )
             if status != 0:
                 logger.warning("[%s] get_group_member_list failed: status=%d", adapter.name, status)
                 return None
@@ -3608,11 +3648,18 @@ class GroupQueryService:
                 result = decode_get_group_member_list_rsp(biz_data)
             else:
                 result = {"members": [], "next_offset": 0, "is_complete": True}
+            member_count = len(result.get("members", [])) if result else 0
+            logger.debug(
+                "[%s] get_group_member_list_raw decoded: group=%s members=%d next_offset=%s is_complete=%s",
+                adapter.name, group_code, member_count,
+                result.get("next_offset") if result else "N/A",
+                result.get("is_complete") if result else "N/A",
+            )
             if result and result.get("members"):
                 adapter._member_cache[group_code] = (time.time(), result["members"])
             return result
         except asyncio.TimeoutError:
-            logger.warning("[%s] get_group_member_list timeout: group=%s", adapter.name, group_code)
+            logger.warning("[%s] get_group_member_list timeout: group=%s req_id=%s", adapter.name, group_code, req_id)
             return None
         except Exception as exc:
             logger.warning("[%s] get_group_member_list failed: %s", adapter.name, exc)
@@ -3722,12 +3769,10 @@ class HeartbeatManager:
                 )
             await conn.ws.send(encoded)
             status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
-            logger.debug(
-                "[%s] Reply heartbeat %s sent: chat=%s",
-                adapter.name, status_name, chat_id,
-            )
+            logger.debug("[%s] Reply heartbeat %s OK: chat=%s", adapter.name, status_name, chat_id)
         except Exception as exc:
-            logger.debug("[%s] send_heartbeat_once failed: %s", adapter.name, exc)
+            status_name = "RUNNING" if heartbeat_val == WS_HEARTBEAT_RUNNING else "FINISH"
+            logger.warning("[%s] Reply heartbeat %s failed: chat=%s %s", adapter.name, status_name, chat_id, exc)
 
     async def start(self, chat_id: str) -> None:
         """Start or renew the Reply Heartbeat periodic sender (RUNNING, every 2s)."""
@@ -4194,12 +4239,20 @@ class MessageSender:
         adapter: "YuanbaoAdapter", encoded: bytes, req_id: str,
     ) -> dict:
         """Send pre-encoded bytes via WS and return a normalised result dict."""
+        logger.debug(
+            "[%s] _dispatch_encoded: req_id=%s payload_len=%d",
+            adapter.name, req_id, len(encoded),
+        )
         try:
             response = await adapter._connection.send_biz_request(encoded, req_id=req_id)
-            return {"success": True, "msg_key": response.get("msg_id", "")}
+            result = {"success": True, "msg_key": response.get("msg_id", "")}
+            logger.debug("[%s] _dispatch_encoded OK: req_id=%s result=%s", adapter.name, req_id, result)
+            return result
         except asyncio.TimeoutError:
+            logger.debug("[%s] _dispatch_encoded TIMEOUT: req_id=%s", adapter.name, req_id)
             return {"success": False, "error": f"Request timeout after {DEFAULT_SEND_TIMEOUT}s"}
         except Exception as exc:
+            logger.debug("[%s] _dispatch_encoded ERROR: req_id=%s %s", adapter.name, req_id, exc)
             return {"success": False, "error": str(exc)}
 
     # -- Media validation ---------------------------------------------------
