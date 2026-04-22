@@ -1971,10 +1971,7 @@ class BuildSourceMiddleware(InboundMiddleware):
 
 
 class GroupAtGuardMiddleware(InboundMiddleware):
-    """In group chat, observe non-@bot messages; only reply on @Bot.
-
-    Owner commands skip @Bot detection (owner doesn't need to @Bot).
-    """
+    """In group chat, observe non-@bot messages; only reply on @Bot."""
 
     name = "group-at-guard"
 
@@ -2073,7 +2070,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
-        if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
+        if ctx.chat_type == "group" and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
             self._observe_group_message(
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
                 msg_id=ctx.msg_id or None,
@@ -2619,9 +2616,9 @@ class InboundPipelineBuilder:
         AccessGuardMiddleware,
         ExtractContentMiddleware,
         PlaceholderFilterMiddleware,
-        OwnerCommandMiddleware,
         BuildSourceMiddleware,
         GroupAtGuardMiddleware,
+        OwnerCommandMiddleware,
         GroupAttributionMiddleware,
         ClassifyMessageTypeMiddleware,
         QuoteContextMiddleware,
