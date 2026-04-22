@@ -487,6 +487,20 @@ automatically scope to the active profile.
 
 ## Known Pitfalls
 
+### ⚠️ Rebasing onto upstream/main: verify Yuanbao adapter integration afterwards
+
+When rebasing a fork onto `NousResearch/hermes-agent` main, conflict resolution routinely
+drops Yuanbao-specific code. After every rebase, verify all FOUR integration points:
+
+1. `gateway/platforms/__init__.py` exports `YuanbaoAdapter`
+2. `gateway/run.py::_create_adapter()` has the `Platform.YUANBAO` branch (with `WEBSOCKETS` availability check)
+3. `gateway/config.py::Platform` enum contains `YUANBAO = "yuanbao"` plus the `yuanbao_*` config fields
+4. `hermes_cli/setup.py::_setup_yuanbao` exists and is called from the setup wizard
+
+Historical incidents: commit `f4cb0b09 fix(gateway): restore _setup_yuanbao() lost during rebase`.
+Use 3-way merge (not "accept upstream") on these files. When in doubt, diff against the
+last green commit on `feature/yuanbao-channel-refactor`.
+
 ### DO NOT hardcode `~/.hermes` paths
 Use `get_hermes_home()` from `hermes_constants` for code paths. Use `display_hermes_home()`
 for user-facing print/log messages. Hardcoding `~/.hermes` breaks profiles — each profile

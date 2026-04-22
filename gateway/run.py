@@ -3181,6 +3181,15 @@ class GatewayRunner:
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
+
+        if canonical == "search":
+            return await self._handle_search_command(event)
+
+        if canonical == "note":
+            return await self._handle_note_command(event)
+
+        if canonical == "sync":
+            return await self._handle_sync_command(event)
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
@@ -6435,6 +6444,293 @@ class GatewayRunner:
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=f"❌ /btw failed: {e}",
+                    metadata=_thread_meta,
+                )
+            except Exception:
+                pass
+
+    async def _handle_search_command(self, event: MessageEvent) -> str:
+        """Handle /search <query> — search Obsidian knowledge base (via H1 obsidian-enhanced skill).
+
+        Dispatches an async Agent task that loads obsidian-enhanced skill, runs the
+        cross-source search (Obsidian → Session FTS5 → iWiki), and replies in-channel.
+        """
+        query = event.get_command_args().strip()
+        if not query:
+            return (
+                "Usage: /search <query>\n"
+                "Example: /search 元宝登录流程\n\n"
+                "Searches Obsidian knowledge base + Session history. "
+                "Loads obsidian-enhanced skill for channel-aware reply formatting."
+            )
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        import uuid as _uuid
+        task_id = f"search_{datetime.now().strftime('%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+
+        search_prompt = (
+            "[Triggered by /search command. Use the obsidian-enhanced skill to search "
+            "the knowledge base at ~/knowledge across: (1) Obsidian files, "
+            "(2) Session history via FTS5, (3) iWiki via iwiki-doc skill if local results "
+            "are insufficient. Format reply per the channel convention in obsidian-enhanced "
+            "SKILL.md section 2.3.]\n\n"
+            f"Query: {query}"
+        )
+
+        _task = asyncio.create_task(
+            self._run_knowledge_task(
+                prompt=search_prompt,
+                source=source,
+                session_key=session_key,
+                task_id=task_id,
+                header_emoji="🔎",
+                command_label="/search",
+                preview_text=query,
+                toolsets=["file", "skills"],
+            )
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        preview = query[:60] + ("..." if len(query) > 60 else "")
+        return f'🔎 /search: "{preview}"\nResults will appear shortly.'
+
+    async def _handle_note_command(self, event: MessageEvent) -> str:
+        """Handle /note <content> — append a quick note to Obsidian (via H1 obsidian-enhanced skill).
+
+        Uses the decision table in obsidian-enhanced SKILL.md section 3.1 to pick the
+        target file (daily log / inbox / planning / pitfalls), then commits via git.
+        """
+        content = event.get_command_args().strip()
+        if not content:
+            return (
+                "Usage: /note <content>\n"
+                "Example: /note 今天讨论了元宝派双通道命令分发\n\n"
+                "Appends to the Obsidian vault. Destination is decided by content keywords "
+                "(daily log / inbox / planning / pitfalls). Auto-commits after write."
+            )
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        import uuid as _uuid
+        task_id = f"note_{datetime.now().strftime('%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+
+        channel_label = getattr(source, "platform", None)
+        channel_str = channel_label.value if hasattr(channel_label, "value") else str(channel_label or "unknown")
+
+        note_prompt = (
+            "[Triggered by /note command. Use the obsidian-enhanced skill section 3 "
+            "to decide the destination file (daily log / inbox / planning / pitfalls) "
+            "based on content keywords, apply the append template from section 3.2, "
+            "then git add + commit locally (do NOT push — H2 obsidian-sync handles that). "
+            f"Source channel: {channel_str}. "
+            "Reply with a short '✅ 已记录到 <relative path>' confirmation.]\n\n"
+            f"Content: {content}"
+        )
+
+        _task = asyncio.create_task(
+            self._run_knowledge_task(
+                prompt=note_prompt,
+                source=source,
+                session_key=session_key,
+                task_id=task_id,
+                header_emoji="📝",
+                command_label="/note",
+                preview_text=content,
+                toolsets=["file", "terminal", "skills"],
+            )
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        preview = content[:60] + ("..." if len(content) > 60 else "")
+        return f'📝 /note: "{preview}"\nSaving...'
+
+    async def _handle_sync_command(self, event: MessageEvent) -> str:
+        """Handle /sync — run the obsidian-sync bash script synchronously.
+
+        Calls ~/.hermes/scripts/obsidian-sync.sh, which does pull --rebase --autostash,
+        commits any local changes, and pushes. Returns a summary of what changed.
+        """
+        import subprocess as _subprocess
+
+        script_path = _hermes_home / "scripts" / "obsidian-sync.sh"
+        if not script_path.exists():
+            return (
+                "❌ /sync failed: obsidian-sync.sh not found.\n"
+                f"Expected at: `{script_path}`\n"
+                "See the obsidian-sync Hermes skill for setup."
+            )
+
+        try:
+            # Run in executor to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: _subprocess.run(
+                    ["bash", str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                ),
+            )
+        except _subprocess.TimeoutExpired:
+            return "⏱️ /sync timed out after 120s. Run manually: `bash ~/.hermes/scripts/obsidian-sync.sh`"
+        except Exception as e:
+            logger.exception("/sync failed")
+            return f"❌ /sync failed: {e}"
+
+        output = (result.stdout or "") + (result.stderr or "")
+        # Parse known markers from the script
+        lines = output.splitlines()
+        markers = {}
+        for line in lines:
+            if "=" in line and line.split("=", 1)[0] in ("CHANGES", "CONFLICT_DETECTED", "PUSH_FAILED"):
+                k, _, v = line.partition("=")
+                markers[k.strip()] = v.strip()
+
+        if markers.get("CONFLICT_DETECTED") == "true":
+            return "⚠️ /sync: Git conflict detected. Manual resolution needed in ~/knowledge."
+        if markers.get("PUSH_FAILED") == "true":
+            return "⚠️ /sync: Push failed. Check network/credentials. Local commits preserved."
+
+        changes = markers.get("CHANGES", "?")
+        if changes == "0":
+            return "✅ /sync: Already up to date. No changes."
+        if changes.isdigit():
+            return f"✅ /sync: Synced {changes} file(s) to ~/knowledge."
+        # Fallback: exit code only
+        if result.returncode == 0:
+            return "✅ /sync: Completed."
+        tail = "\n".join(lines[-6:]) if lines else "(no output)"
+        return f"⚠️ /sync: exit={result.returncode}\n```\n{tail}\n```"
+
+    async def _run_knowledge_task(
+        self,
+        *,
+        prompt: str,
+        source,
+        session_key: str,
+        task_id: str,
+        header_emoji: str,
+        command_label: str,
+        preview_text: str,
+        toolsets: list,
+    ) -> None:
+        """Shared async runner for /search and /note (H1 obsidian-enhanced skill flows).
+
+        Modelled on _run_btw_task but with file/skill tools enabled so the Agent can
+        actually read/write the Obsidian vault and load the obsidian-enhanced skill.
+        """
+        from run_agent import AIAgent
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in %s task %s",
+                           source.platform, command_label, task_id)
+            return
+
+        _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
+        preview = preview_text[:60] + ("..." if len(preview_text) > 60 else "")
+        header = f'{header_emoji} {command_label}: "{preview}"\n\n'
+
+        try:
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+            )
+            if not runtime_kwargs.get("api_key"):
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ {command_label} failed: no provider credentials configured.",
+                    metadata=_thread_meta,
+                )
+                return
+
+            platform_key = _platform_config_key(source.platform)
+            reasoning_config = self._load_reasoning_config()
+            self._service_tier = self._load_service_tier()
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            pr = self._provider_routing
+
+            def run_sync():
+                agent = AIAgent(
+                    model=turn_route["model"],
+                    **turn_route["runtime"],
+                    max_iterations=12,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=toolsets,
+                    reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=task_id,
+                    platform=platform_key,
+                    session_db=None,
+                    fallback_model=self._fallback_model,
+                    skip_memory=False,       # need memory for knowledge base conventions
+                    skip_context_files=False,
+                    persist_session=False,
+                )
+                try:
+                    return agent.run_conversation(
+                        user_message=prompt,
+                        task_id=task_id,
+                    )
+                finally:
+                    self._cleanup_agent_resources(agent)
+
+            result = await self._run_in_executor_with_context(run_sync)
+
+            response = (result.get("final_response") or "") if result else ""
+            if not response and result and result.get("error"):
+                response = f"Error: {result['error']}"
+            if not response:
+                response = "(No response generated)"
+
+            media_files, response = adapter.extract_media(response)
+            images, text_content = adapter.extract_images(response)
+
+            if text_content:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + text_content,
+                    metadata=_thread_meta,
+                )
+            elif not images and not media_files:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=_thread_meta,
+                )
+
+            for image_url, alt_text in (images or []):
+                try:
+                    await adapter.send_image(chat_id=source.chat_id, image_url=image_url, caption=alt_text)
+                except Exception:
+                    pass
+
+            for media_path, _is_voice in (media_files or []):
+                try:
+                    await adapter.send_file(chat_id=source.chat_id, file_path=media_path)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.exception("%s task %s failed", command_label, task_id)
+            try:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ {command_label} failed: {e}",
                     metadata=_thread_meta,
                 )
             except Exception:

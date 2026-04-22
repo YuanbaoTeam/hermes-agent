@@ -148,6 +148,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 
+    # Knowledge — AI 数字员工 M1 知识闭环（通过 Hermes Skills H1/H2/H3 提供服务）
+    CommandDef("search", "Search your knowledge base (Obsidian + Session history + iWiki)",
+               "Knowledge", args_hint="<query>"),
+    CommandDef("note", "Create a quick note in your Obsidian knowledge base",
+               "Knowledge", args_hint="<content>"),
+    CommandDef("sync", "Sync the Obsidian knowledge base to Git (pull/commit/push)",
+               "Knowledge"),
+
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]"),

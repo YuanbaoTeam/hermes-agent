@@ -1555,6 +1555,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
         "/new", "/reset", "/retry", "/undo", "/stop",
         "/approve", "/deny", "/background", "/bg",
         "/btw", "/queue", "/q",
+        # Knowledge commands (M1 AI 数字员工) — owner 群聊内可直接触发
+        "/search", "/note", "/sync",
     })
 
     @staticmethod
