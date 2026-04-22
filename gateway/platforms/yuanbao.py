@@ -1559,6 +1559,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
         "/search", "/note", "/sync",
         # Development commands (M2 AI 数字员工) — owner 群聊内可直接委派研发任务
         "/task",
+        # Autoresearch (M4 AI 数字员工) — owner 群聊内可直接触发 skill 优化
+        "/optimize",
     })
 
     @staticmethod

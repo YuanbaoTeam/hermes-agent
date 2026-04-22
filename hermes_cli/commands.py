@@ -160,6 +160,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("task", "Create a development task — decompose into DAG and delegate to Claude Code",
                "Development", args_hint="<description>",
                subcommands=("list", "cancel", "retry")),
+    CommandDef("optimize", "Autoresearch — iteratively optimize a Hermes skill against binary evals (M4)",
+               "Development", args_hint="<skill-name>",
+               subcommands=("list", "cancel", "status")),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

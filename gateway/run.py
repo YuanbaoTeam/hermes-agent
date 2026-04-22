@@ -3193,6 +3193,9 @@ class GatewayRunner:
 
         if canonical == "task":
             return await self._handle_task_command(event)
+
+        if canonical == "optimize":
+            return await self._handle_optimize_command(event)
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
@@ -6610,6 +6613,396 @@ class GatewayRunner:
             return f"🛑 /task {task_id} cancelled."
         # Fallback: at least clear the registry entry
         return f"🛑 /task {task_id} marked cancelled (best-effort; may finish its current iteration)."
+
+    async def _handle_optimize_command(self, event: MessageEvent) -> str:
+        """Handle /optimize <skill> — AI 数字员工 M4 autoresearch.
+
+        Subcommands:
+          /optimize <skill-name>   Start autoresearch run for <skill>
+          /optimize list           List active + recent runs
+          /optimize status <id>    Show status.json for a run
+          /optimize cancel <id>    Cancel a running optimization
+
+        Start-mode requires a config at:
+          <hermes_home>/autoresearch-configs/<skill-name>.yaml
+
+        See docs/autoresearch-config-example.yaml for the schema.
+        """
+        raw_args = event.get_command_args().strip()
+
+        if not raw_args:
+            return (
+                "Usage: /optimize <skill-name>\n"
+                "Example: /optimize obsidian-enhanced\n\n"
+                "Subcommands:\n"
+                "  /optimize list              List active + recent runs\n"
+                "  /optimize status <run-id>   Show run progress\n"
+                "  /optimize cancel <run-id>   Cancel a running optimization\n\n"
+                "Before running, create a config at:\n"
+                f"  {_hermes_home}/autoresearch-configs/<skill-name>.yaml\n\n"
+                "The config defines test_inputs and evals. See\n"
+                "~/knowledge/hermes-skills/autoresearch/SKILL.md §3 for the schema."
+            )
+
+        parts = raw_args.split(maxsplit=1)
+        sub = parts[0].lower()
+
+        if sub == "list":
+            return self._list_optimize_runs()
+        if sub == "status":
+            target = parts[1].strip() if len(parts) > 1 else ""
+            return self._optimize_status(target)
+        if sub == "cancel":
+            target = parts[1].strip() if len(parts) > 1 else ""
+            return self._cancel_optimize(target)
+
+        # Start mode: raw_args is the skill name
+        skill_name = raw_args
+        return await self._start_optimize_run(event, skill_name)
+
+    async def _start_optimize_run(self, event: MessageEvent, skill_name: str) -> str:
+        """Validate config, spawn async autoresearch task, return user ack."""
+        import yaml
+
+        cfg_dir = _hermes_home / "autoresearch-configs"
+        cfg_file = cfg_dir / f"{skill_name}.yaml"
+        if not cfg_file.exists():
+            return (
+                f"❌ No autoresearch config for `{skill_name}`.\n"
+                f"Expected: `{cfg_file}`\n\n"
+                "Create one with: test_inputs, evals, (optional) runs_per_experiment, max_experiments.\n"
+                "See ~/knowledge/hermes-skills/autoresearch/SKILL.md §3 for the schema."
+            )
+
+        try:
+            cfg_data = yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            return f"❌ Failed to parse {cfg_file}: {e}"
+
+        # Build AutoresearchConfig
+        try:
+            from agent.autoresearch import AutoresearchConfig, EvalDef
+        except Exception as e:
+            logger.exception("failed to import autoresearch")
+            return f"❌ autoresearch module unavailable: {e}"
+
+        try:
+            evals = [
+                EvalDef(
+                    id=str(e["id"]),
+                    name=str(e["name"]),
+                    kind=str(e["kind"]),
+                    check=str(e.get("check", "")),
+                    question=str(e.get("question", "")),
+                )
+                for e in (cfg_data.get("evals") or [])
+            ]
+            ar_cfg = AutoresearchConfig(
+                target_skill=skill_name,
+                test_inputs=list(cfg_data.get("test_inputs") or []),
+                evals=evals,
+                runs_per_experiment=int(cfg_data.get("runs_per_experiment", 5)),
+                max_experiments=int(cfg_data.get("max_experiments", 20)),
+                stop_threshold=float(cfg_data.get("stop_threshold", 0.95)),
+                mode=str(cfg_data.get("mode", "autonomous")),
+            )
+            ar_cfg.validate()
+        except Exception as e:
+            return f"❌ Config validation failed: {e}"
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        import uuid as _uuid
+        run_id = f"{skill_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{_uuid.uuid4().hex[:4]}"
+
+        # Register for /optimize list
+        if not hasattr(self, "_active_optimize_runs"):
+            self._active_optimize_runs: dict = {}
+        self._active_optimize_runs[run_id] = {
+            "skill": skill_name,
+            "started_at": datetime.now(),
+            "source_chat": source.chat_id,
+            "source_platform": getattr(source, "platform", None),
+            "runner": None,  # set once the runner object is constructed
+            "task": None,    # asyncio.Task handle
+        }
+
+        _task = asyncio.create_task(
+            self._run_autoresearch_task(
+                event=event,
+                session_key=session_key,
+                ar_cfg=ar_cfg,
+                run_id=run_id,
+            )
+        )
+        self._background_tasks.add(_task)
+        self._active_optimize_runs[run_id]["task"] = _task
+
+        def _cleanup(task):
+            self._background_tasks.discard(task)
+            # Keep the registry entry for `/optimize list` history (status.json shows final state)
+
+        _task.add_done_callback(_cleanup)
+
+        return (
+            f'🔬 /optimize started — `{skill_name}`\n'
+            f'Run ID: `{run_id}`\n'
+            f'Config: {ar_cfg.runs_per_experiment} runs × {len(ar_cfg.test_inputs)} inputs × '
+            f'{len(ar_cfg.evals)} evals, max {ar_cfg.max_experiments} experiments\n'
+            f'Progress will appear here. Cancel with: `/optimize cancel {run_id}`'
+        )
+
+    async def _run_autoresearch_task(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        ar_cfg,
+        run_id: str,
+    ) -> None:
+        """Async wrapper that builds the runner, wires callables, and runs the loop.
+
+        Runs the autoresearch loop in an executor (it's CPU/subprocess-heavy, not
+        naturally async). Progress messages are marshalled back to the adapter
+        from the executor thread using call_soon_threadsafe.
+        """
+        from agent.autoresearch import AutoresearchRunner
+        from run_agent import AIAgent
+
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for %s in /optimize run %s", source.platform, run_id)
+            return
+
+        _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
+
+        try:
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source, session_key=session_key,
+            )
+            if not runtime_kwargs.get("api_key"):
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ /optimize {run_id}: no provider credentials configured.",
+                    metadata=_thread_meta,
+                )
+                return
+
+            platform_key = _platform_config_key(source.platform)
+            reasoning_config = self._load_reasoning_config()
+            pr = self._provider_routing
+            fallback_model = self._fallback_model
+
+            loop = asyncio.get_running_loop()
+
+            def _progress_sync(msg: str) -> None:
+                # Called from executor thread — marshal back to loop
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        adapter.send(source.chat_id, msg, metadata=_thread_meta),
+                        loop,
+                    )
+                    fut.result(timeout=15)
+                except Exception as e:
+                    logger.debug("progress send failed: %s", e)
+
+            def _spawn_child_agent(toolsets, max_iter, task_id_suffix):
+                """Helper: build a one-shot AIAgent for a single output run."""
+                return AIAgent(
+                    model=model,
+                    **runtime_kwargs,
+                    max_iterations=max_iter,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=toolsets,
+                    reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=f"{run_id}-{task_id_suffix}",
+                    platform=platform_key,
+                    session_db=None,
+                    fallback_model=fallback_model,
+                    skip_memory=True,
+                    skip_context_files=True,
+                    persist_session=False,
+                )
+
+            def run_agent_for_output(skill_name: str, test_input: str) -> str:
+                prompt = (
+                    f"[Autoresearch experiment — target skill: {skill_name}.] "
+                    f"Load the '{skill_name}' skill and produce output for the request below. "
+                    f"Do not explain your process — output only the artefact the skill produces."
+                    f"\n\nRequest: {test_input}"
+                )
+                ag = _spawn_child_agent(toolsets=["skills"], max_iter=10, task_id_suffix="run")
+                try:
+                    result = ag.run_conversation(user_message=prompt, task_id=ag.session_id)
+                    return (result.get("final_response") or "") if result else ""
+                finally:
+                    self._cleanup_agent_resources(ag)
+
+            def run_agent_for_judge(output: str, question: str) -> bool:
+                prompt = (
+                    "You are an impartial judge. Answer ONLY with YES or NO (single word).\n\n"
+                    f"Question: {question}\n\n"
+                    f"Output to evaluate:\n---\n{output[:4000]}\n---"
+                )
+                ag = _spawn_child_agent(toolsets=[], max_iter=2, task_id_suffix="judge")
+                try:
+                    result = ag.run_conversation(user_message=prompt, task_id=ag.session_id)
+                    resp = (result.get("final_response") or "").strip().upper() if result else ""
+                    return resp.startswith("YES")
+                finally:
+                    self._cleanup_agent_resources(ag)
+
+            def propose_mutation(skill_body: str, failures: str, changelog: list) -> tuple[str, str]:
+                # Summarize past mutations to avoid repeating
+                past = "\n".join(
+                    f"- exp {c['exp']} [{c['status']}] {c['description']} (pass={c['pass_rate']*100:.0f}%)"
+                    for c in changelog[-10:]
+                )
+                prompt = (
+                    "You are optimizing a Hermes skill SKILL.md via autoresearch methodology "
+                    "(single-point mutation, binary evals). Your task: propose ONE targeted "
+                    "change to increase pass_rate. Do NOT rewrite; make a minimal diff.\n\n"
+                    f"=== CURRENT SKILL.md ===\n{skill_body}\n=== END ===\n\n"
+                    f"=== FAILURE SUMMARY ===\n{failures}\n=== END ===\n\n"
+                    f"=== RECENT MUTATIONS (avoid repeating) ===\n{past or '(none)'}\n=== END ===\n\n"
+                    "Respond in this EXACT format:\n"
+                    "CHANGE_DESCRIPTION: <one sentence describing the mutation>\n"
+                    "---BEGIN_NEW_SKILL_MD---\n"
+                    "<full new SKILL.md body>\n"
+                    "---END_NEW_SKILL_MD---\n"
+                )
+                ag = _spawn_child_agent(toolsets=[], max_iter=3, task_id_suffix="proposer")
+                try:
+                    result = ag.run_conversation(user_message=prompt, task_id=ag.session_id)
+                    resp = (result.get("final_response") or "") if result else ""
+                finally:
+                    self._cleanup_agent_resources(ag)
+
+                # Parse response
+                desc = ""
+                body = skill_body  # fallback: no-op if parse fails
+                for line in resp.splitlines():
+                    if line.startswith("CHANGE_DESCRIPTION:"):
+                        desc = line.split(":", 1)[1].strip()
+                        break
+                if "---BEGIN_NEW_SKILL_MD---" in resp and "---END_NEW_SKILL_MD---" in resp:
+                    body = resp.split("---BEGIN_NEW_SKILL_MD---", 1)[1]
+                    body = body.split("---END_NEW_SKILL_MD---", 1)[0].strip()
+                    if not body:
+                        body = skill_body
+                if not desc:
+                    desc = "proposer returned unstructured response"
+                return body, desc
+
+            runner = AutoresearchRunner(
+                ar_cfg,
+                run_agent_for_output=run_agent_for_output,
+                run_agent_for_judge=run_agent_for_judge,
+                propose_mutation=propose_mutation,
+                progress_cb=_progress_sync,
+                run_id=run_id,
+            )
+            self._active_optimize_runs[run_id]["runner"] = runner
+
+            # Run the heavy loop in executor
+            summary = await loop.run_in_executor(None, runner.run)
+
+            await adapter.send(
+                source.chat_id,
+                self._format_optimize_summary(summary),
+                metadata=_thread_meta,
+            )
+        except Exception as e:
+            logger.exception("/optimize run %s failed", run_id)
+            try:
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ /optimize {run_id} failed: {e}",
+                    metadata=_thread_meta,
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _format_optimize_summary(summary: dict) -> str:
+        return (
+            f"🎯 /optimize complete — `{summary['target_skill']}`\n\n"
+            f"**Run:** `{summary['run_id']}`\n"
+            f"**Status:** {summary['status']}\n"
+            f"**Baseline:** {summary['baseline_score']*100:.1f}% → "
+            f"**Final:** {summary['final_score']*100:.1f}% "
+            f"(Δ {summary['improvement_pct']:+.1f}pp)\n"
+            f"**Experiments:** {summary['experiments_run']} "
+            f"(kept={summary['kept']}, discarded={summary['discarded']})\n\n"
+            f"📄 Changelog: `{summary['changelog_md']}`\n"
+            f"📊 Results TSV: `{summary['results_tsv']}`"
+        )
+
+    def _list_optimize_runs(self) -> str:
+        runs = getattr(self, "_active_optimize_runs", {}) or {}
+        if not runs:
+            return "📋 No active /optimize runs."
+        lines = ["📋 **Active /optimize runs:**", ""]
+        now = datetime.now()
+        for rid, meta in list(runs.items()):
+            elapsed = int((now - meta["started_at"]).total_seconds())
+            task = meta.get("task")
+            done = task.done() if task is not None else True
+            state = "done" if done else "running"
+            lines.append(f"• `{rid}` — {meta['skill']} · {state} · {elapsed}s")
+        return "\n".join(lines)
+
+    def _optimize_status(self, run_id: str) -> str:
+        if not run_id:
+            return "Usage: /optimize status <run-id>\nUse /optimize list to find ids."
+        status_file = _hermes_home / "autoresearch" / run_id / "status.json"
+        if not status_file.exists():
+            return f"⚠️ Run `{run_id}` not found (expected {status_file})."
+        try:
+            import json
+            data = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            return f"❌ Failed to read status: {e}"
+        lines = [
+            f"🔬 **/optimize status — `{data.get('target_skill')}`**",
+            "",
+            f"**Run ID:** `{data.get('run_id')}`",
+            f"**Status:** {data.get('status')}",
+            f"**Experiment:** {data.get('current_experiment')} / {data.get('max_experiments')}",
+            f"**Baseline:** {(data.get('baseline_score') or 0)*100:.1f}% → "
+            f"**Best:** {(data.get('best_score') or 0)*100:.1f}%",
+            f"**Kept / Discarded:** {data.get('kept_count', 0)} / {data.get('discarded_count', 0)}",
+            f"**Updated:** {data.get('updated_at')}",
+            "",
+            f"📄 `{_hermes_home}/autoresearch/{run_id}/changelog.md`",
+        ]
+        return "\n".join(lines)
+
+    def _cancel_optimize(self, run_id: str) -> str:
+        if not run_id:
+            return "Usage: /optimize cancel <run-id>\nUse /optimize list to find ids."
+        runs = getattr(self, "_active_optimize_runs", {}) or {}
+        meta = runs.get(run_id)
+        if not meta:
+            return f"⚠️ Run `{run_id}` not found in active list."
+        runner = meta.get("runner")
+        if runner is not None:
+            runner.cancel()
+        task = meta.get("task")
+        if task is not None and not task.done():
+            # Best-effort: the runner itself checks self.cancelled at loop boundaries
+            pass
+        return f"🛑 /optimize {run_id} cancellation requested (will exit at next safe point)."
 
     async def _handle_search_command(self, event: MessageEvent) -> str:
         """Handle /search <query> — search Obsidian knowledge base (via H1 obsidian-enhanced skill).

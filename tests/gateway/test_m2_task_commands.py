@@ -74,9 +74,9 @@ class TestM2CategoryRegistryIsStable:
             assert resolve_command("/" + name) is not None, f"M1 /{name} disappeared"
 
     def test_registry_grew_by_one_command(self):
-        """M1 had 58 commands after landing; M2 should be exactly 59 (one new: /task)."""
-        # This is a soft guard — if we later add commands, update the expected count.
-        assert len(COMMAND_REGISTRY) == 59, (
+        """M1 had 58 commands after landing; M2 added /task → 59; M4 added /optimize → 60."""
+        # This is a soft guard — if we later add commands, update this test (or the M4 one).
+        assert len(COMMAND_REGISTRY) == 60, (
             f"Unexpected command registry size: {len(COMMAND_REGISTRY)}. "
             "If you added a new command, update this test."
         )
