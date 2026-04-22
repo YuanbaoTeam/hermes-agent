@@ -772,7 +772,10 @@ class SignManager:
 
                 if response.status_code != 200:
                     body = response.text
-                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
+                    raise RuntimeError(
+                        f"Sign token API returned {response.status_code}: "
+                        f"headers={dict(response.headers)} body={body[:200]}"
+                    )
 
                 try:
                     result_data: dict[str, Any] = response.json()
@@ -880,11 +883,16 @@ class SignManager:
         try:
             async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
                 resp = await client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
+                if resp.status_code != 200:
+                    logger.error(
+                        "fetch_bot_detail HTTP error: status=%d headers=%s body=%s",
+                        resp.status_code, dict(resp.headers), resp.text[:200],
+                    )
+                    return ""
                 result = resp.json()
             code = result.get("code", -1)
             if code != 0:
-                logger.warning(
+                logger.error(
                     "get-bot-detail returned non-zero code=%s msg=%s",
                     code, result.get("msg", ""),
                 )
@@ -895,7 +903,7 @@ class SignManager:
             ).get("owner_id") or ""
             return str(owner_id) if owner_id else ""
         except Exception as exc:
-            logger.warning("fetch_bot_detail failed: %s", exc)
+            logger.error("fetch_bot_detail failed: %s", exc, exc_info=True)
             return ""
 
     # -- Public API: force refresh -----------------------------------------
@@ -2228,7 +2236,11 @@ class MediaResolveMiddleware(InboundMiddleware):
                     headers["X-Source"] = source
                     continue
 
-                resp.raise_for_status()
+                if resp.status_code not in (200, 206):
+                    raise RuntimeError(
+                        f"resource/v1/download HTTP error: status={resp.status_code} "
+                        f"headers={dict(resp.headers)} body={resp.text[:200]}"
+                    )
                 payload = resp.json()
                 code = payload.get("code")
                 if code not in (None, 0):
