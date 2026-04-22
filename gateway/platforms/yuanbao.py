@@ -1610,51 +1610,6 @@ class AccessGuardMiddleware(InboundMiddleware):
         await next_fn()
 
 
-class AutoSetHomeMiddleware(InboundMiddleware):
-    """Auto-designate the first inbound conversation as Yuanbao home channel.
-
-    Triggers when no home channel is configured, or when an existing group-chat
-    home is superseded by the first DM (direct > group upgrade).
-    Silent: writes config.yaml and env, no user-facing message.
-    """
-
-    name = "auto-sethome"
-
-    async def handle(self, ctx: InboundContext, next_fn) -> None:
-        adapter = ctx.adapter
-        if not adapter._auto_sethome_done:
-            _cur_home = os.getenv("YUANBAO_HOME_CHANNEL", "")
-            _should_set = (
-                not _cur_home
-                or (_cur_home.startswith("group:") and ctx.chat_type == "dm")
-            )
-            if ctx.chat_type == "dm":
-                adapter._auto_sethome_done = True  # DM seen — no further upgrades needed
-            if _should_set:
-                try:
-                    from hermes_constants import get_hermes_home
-                    from utils import atomic_yaml_write
-                    import yaml
-
-                    _home = get_hermes_home()
-                    config_path = _home / "config.yaml"
-                    user_config: dict = {}
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            user_config = yaml.safe_load(f) or {}
-                    user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
-                    atomic_yaml_write(config_path, user_config)
-                    os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
-                    logger.info(
-                        "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",
-                        adapter.name, ctx.chat_id, ctx.chat_name,
-                    )
-                    # Silent auto-sethome: no user-facing message, only log
-                except Exception as e:
-                    logger.warning("[%s] Auto-sethome failed: %s", adapter.name, e)
-        await next_fn()
-
-
 class ExtractContentMiddleware(InboundMiddleware):
     """Extract raw text and media refs from msg_body."""
 
@@ -2642,7 +2597,6 @@ class InboundPipelineBuilder:
         SkipSelfMiddleware,
         ChatRoutingMiddleware,
         AccessGuardMiddleware,
-        AutoSetHomeMiddleware,
         ExtractContentMiddleware,
         PlaceholderFilterMiddleware,
         OwnerCommandMiddleware,
@@ -2662,6 +2616,39 @@ class InboundPipelineBuilder:
         for mw_cls in cls._DEFAULT_MIDDLEWARES:
             pipeline.use(mw_cls())
         return pipeline
+
+def _apply_sethome(chat_id: str, adapter_name: str, label: str = "") -> None:
+    """Write *chat_id* as YUANBAO_HOME_CHANNEL to config.yaml and os.environ.
+
+    Silent: logs at INFO on success, WARNING on failure — no user-facing message.
+
+    Args:
+        chat_id:      The channel / user ID to designate as home.
+        adapter_name: Used only for log prefixing.
+        label:        Optional human-readable description appended to the log line.
+    """
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        from utils import atomic_yaml_write
+
+        _home = get_hermes_home()
+        config_path = _home / "config.yaml"
+        user_config: dict = {}
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                user_config = yaml.safe_load(f) or {}
+        user_config["YUANBAO_HOME_CHANNEL"] = chat_id
+        atomic_yaml_write(config_path, user_config)
+        os.environ["YUANBAO_HOME_CHANNEL"] = str(chat_id)
+        _desc = f" ({label})" if label else ""
+        logger.info(
+            "[%s] Auto-sethome: designated %s%s as Yuanbao home channel",
+            adapter_name, chat_id, _desc,
+        )
+    except Exception as e:
+        logger.warning("[%s] Auto-sethome failed: %s", adapter_name, e)
+
 
 class ConnectionManager:
     """Manages the WebSocket connection lifecycle for YuanbaoAdapter.
@@ -2832,6 +2819,8 @@ class ConnectionManager:
             if owner_id:
                 adapter._owner_id = owner_id
                 logger.info("[%s] Bot owner_id=%s", adapter.name, owner_id)
+                if not os.getenv("YUANBAO_HOME_CHANNEL"):
+                    _apply_sethome(owner_id, adapter.name)
 
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
@@ -4627,18 +4616,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Inbound message processing pipeline (middleware pattern)
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
-
-        # ------------------------------------------------------------------
-        # Auto-sethome: first user to message the bot becomes the owner.
-        # If no home channel is configured, the first conversation will be
-        # automatically set as the home channel.  When the existing home
-        # channel is a group chat (group:xxx), it stays eligible for
-        # upgrade — the first DM will override it with direct:xxx.
-        # ------------------------------------------------------------------
-        _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (
-            config.home_channel.chat_id if config.home_channel else ""
-        )
-        self._auto_sethome_done: bool = bool(_existing_home) and not _existing_home.startswith("group:")
 
     # ------------------------------------------------------------------
     # Task tracking helper
