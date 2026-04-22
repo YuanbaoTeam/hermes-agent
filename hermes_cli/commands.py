@@ -156,6 +156,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("sync", "Sync the Obsidian knowledge base to Git (pull/commit/push)",
                "Knowledge"),
 
+    # Development — AI 数字员工 M2 研发闭环（通过 Hermes Skills H4/H5 提供服务）
+    CommandDef("task", "Create a development task — decompose into DAG and delegate to Claude Code",
+               "Development", args_hint="<description>",
+               subcommands=("list", "cancel", "retry")),
+
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]"),

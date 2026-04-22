@@ -3190,6 +3190,9 @@ class GatewayRunner:
 
         if canonical == "sync":
             return await self._handle_sync_command(event)
+
+        if canonical == "task":
+            return await self._handle_task_command(event)
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
@@ -4794,6 +4797,18 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
+
+        # M2: surface active /task DAG runs
+        active_task_runs = getattr(self, "_active_task_runs", {}) or {}
+        if active_task_runs:
+            lines.extend(["", f"**Active /task runs:** {len(active_task_runs)}"])
+            now = datetime.now()
+            for tid, meta in list(active_task_runs.items())[:5]:
+                elapsed = int((now - meta["started_at"]).total_seconds())
+                desc_short = meta["description"][:50] + ("…" if len(meta["description"]) > 50 else "")
+                lines.append(f"  • `{tid}` ({elapsed}s) — {desc_short}")
+            if len(active_task_runs) > 5:
+                lines.append(f"  ... and {len(active_task_runs) - 5} more (use /task list)")
 
         return "\n".join(lines)
 
@@ -6448,6 +6463,153 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+
+    async def _handle_task_command(self, event: MessageEvent) -> str:
+        """Handle /task <desc> — AI 数字员工 M2 研发任务委派.
+
+        Subcommands:
+          /task <description>    Plan + execute via H4 task-planner + H5 orchestrator
+          /task list             List currently running /task DAGs
+          /task cancel <id>      Cancel a running DAG
+          /task retry <id>       Retry a failed task
+        """
+        raw_args = event.get_command_args().strip()
+
+        if not raw_args:
+            return (
+                "Usage: /task <description>\n"
+                "Example: /task 修复 WeCom 适配器的重连超时 bug\n\n"
+                "Subcommands:\n"
+                "  /task list             List running task DAGs\n"
+                "  /task cancel <id>      Cancel a running DAG\n"
+                "  /task retry <id>       Retry a failed task\n\n"
+                "The Agent loads task-planner skill (H4) to decompose the request into a DAG, "
+                "then claude-code-orchestrator skill (H5) delegates to Claude Code per node."
+            )
+
+        # Subcommand routing
+        parts = raw_args.split(maxsplit=1)
+        subcommand = parts[0].lower()
+
+        if subcommand == "list":
+            return self._list_active_tasks()
+        if subcommand == "cancel":
+            target_id = parts[1].strip() if len(parts) > 1 else ""
+            return self._cancel_task(target_id)
+        if subcommand == "retry":
+            target_id = parts[1].strip() if len(parts) > 1 else ""
+            if not target_id:
+                return "Usage: /task retry <task_id>"
+            # Retry is just re-running the original description — for now treat it as a
+            # fresh /task invocation (full DAG tracking left to M2.1)
+            return f"⚠️ /task retry for {target_id} not yet implemented. Re-run /task with the original description."
+
+        # Default: treat full raw_args as task description
+        description = raw_args
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        import uuid as _uuid
+        task_id = f"task_{datetime.now().strftime('%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+
+        channel_label = getattr(source, "platform", None)
+        channel_str = channel_label.value if hasattr(channel_label, "value") else str(channel_label or "unknown")
+
+        task_prompt = (
+            "[Triggered by /task command — AI 数字员工 M2 研发闭环.] "
+            "Load two skills in order: (1) task-planner for requirement decomposition into "
+            "a DAG of subtasks, (2) claude-code-orchestrator for executing the DAG by "
+            "delegating to Claude Code (via delegate_task with acp_command='claude') or "
+            "subagents per the executor field. "
+            "Workflow: "
+            "(a) Analyze intent (bug-fix/feature/refactor/research/config) per task-planner §2. "
+            "(b) Retrieve context via obsidian-enhanced skill — search ~/knowledge for relevant "
+            "project knowledge (hermes-agent/chatbot-web/etc). "
+            "(c) Emit DAG per task-planner §3-6 spec. "
+            "(d) Post a concise plan summary back to the user (format per task-planner §7), then "
+            "PROCEED with execution — do NOT wait for user approval unless the DAG contains "
+            "human-review nodes or destructive operations. "
+            "(e) Execute per claude-code-orchestrator §2 — topologically, max concurrency 3. "
+            "(f) Report progress after each subtask (format per claude-code-orchestrator §6). "
+            "(g) At the end, deliver the aggregate summary per §8. "
+            f"Source channel: {channel_str}. Task id: {task_id}."
+            "\n\n"
+            f"User request: {description}"
+        )
+
+        # Register task for /task list visibility
+        if not hasattr(self, "_active_task_runs"):
+            self._active_task_runs: dict = {}
+        self._active_task_runs[task_id] = {
+            "description": description[:120],
+            "channel": channel_str,
+            "started_at": datetime.now(),
+        }
+
+        _task = asyncio.create_task(
+            self._run_knowledge_task(
+                prompt=task_prompt,
+                source=source,
+                session_key=session_key,
+                task_id=task_id,
+                header_emoji="🛠️",
+                command_label="/task",
+                preview_text=description,
+                toolsets=["file", "terminal", "skills", "delegation"],
+            )
+        )
+        self._background_tasks.add(_task)
+
+        def _cleanup_task_run(task):
+            self._background_tasks.discard(task)
+            if hasattr(self, "_active_task_runs"):
+                self._active_task_runs.pop(task_id, None)
+
+        _task.add_done_callback(_cleanup_task_run)
+
+        preview = description[:60] + ("..." if len(description) > 60 else "")
+        return (
+            f'🛠️ /task: "{preview}"\n'
+            f'Task ID: `{task_id}`\n'
+            f"Planning and execution starting. Progress updates will appear here.\n"
+            f"Cancel with: /task cancel {task_id}"
+        )
+
+    def _list_active_tasks(self) -> str:
+        """List currently-running /task DAGs."""
+        runs = getattr(self, "_active_task_runs", {}) or {}
+        if not runs:
+            return "📋 No active /task runs."
+        lines = ["📋 **Active /task runs:**", ""]
+        now = datetime.now()
+        for tid, meta in list(runs.items()):
+            elapsed = (now - meta["started_at"]).total_seconds()
+            lines.append(
+                f"• `{tid}` — {meta['description']}\n"
+                f"   channel={meta['channel']} · elapsed={int(elapsed)}s"
+            )
+        return "\n".join(lines)
+
+    def _cancel_task(self, task_id: str) -> str:
+        """Cancel a running /task DAG by id."""
+        if not task_id:
+            return "Usage: /task cancel <task_id>\nUse /task list to see active ids."
+        runs = getattr(self, "_active_task_runs", {}) or {}
+        if task_id not in runs:
+            return f"⚠️ Task `{task_id}` not found. Use /task list to see active ids."
+        # Find the asyncio.Task — we stash it in _background_tasks, match by task_id via name/coro introspection
+        cancelled = False
+        for bg_task in list(self._background_tasks):
+            coro = getattr(bg_task, "get_coro", lambda: None)()
+            if coro is not None and task_id in (getattr(coro, "cr_frame", None) and str(coro.cr_frame.f_locals.get("task_id", "")) or ""):
+                bg_task.cancel()
+                cancelled = True
+                break
+        runs.pop(task_id, None)
+        if cancelled:
+            return f"🛑 /task {task_id} cancelled."
+        # Fallback: at least clear the registry entry
+        return f"🛑 /task {task_id} marked cancelled (best-effort; may finish its current iteration)."
 
     async def _handle_search_command(self, event: MessageEvent) -> str:
         """Handle /search <query> — search Obsidian knowledge base (via H1 obsidian-enhanced skill).

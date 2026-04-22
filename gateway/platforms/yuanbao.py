@@ -1557,6 +1557,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
         "/btw", "/queue", "/q",
         # Knowledge commands (M1 AI 数字员工) — owner 群聊内可直接触发
         "/search", "/note", "/sync",
+        # Development commands (M2 AI 数字员工) — owner 群聊内可直接委派研发任务
+        "/task",
     })
 
     @staticmethod
