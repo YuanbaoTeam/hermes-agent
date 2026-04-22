@@ -696,8 +696,13 @@ class TestGroupAtGuardMiddleware:
         next_fn.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_owner_command_skips_at_check(self):
-        """GroupAtGuardMiddleware passes when owner_command is set."""
+    async def test_owner_command_still_requires_at_bot(self):
+        """GroupAtGuardMiddleware rejects group messages without @Bot even when owner_command is set.
+
+        Pins the product semantic introduced in commit d5291473: owner slash
+        commands in groups no longer exempt the @Bot check — owner must still
+        @Bot to trigger commands, otherwise the message is silently ignored.
+        """
         adapter = make_adapter()
         adapter._bot_id = "bot_123"
         ctx = make_ctx(
@@ -710,7 +715,7 @@ class TestGroupAtGuardMiddleware:
         next_fn = AsyncMock()
 
         await GroupAtGuardMiddleware()(ctx, next_fn)
-        next_fn.assert_awaited_once()
+        next_fn.assert_not_awaited()
 
 
 # ============================================================
