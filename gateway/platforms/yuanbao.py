@@ -162,6 +162,65 @@ OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
 # Max number of resource references to resolve per inbound turn
 OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
 
+
+def _extract_addressed_slash_command_line(msg_body: list, bot_id: Optional[str]) -> Optional[str]:
+    """Return a normalized slash command line addressed to this bot.
+
+    Supports both common client layouts:
+      - ``[AT(bot), text(" /help")]``
+      - ``[text("/help "), AT(bot)]``
+
+    Returns ``None`` when the message is not confidently a bot-directed
+    slash command.
+    """
+    if not bot_id:
+        return None
+
+    at_entries: List[dict] = []
+    for elem in (msg_body or []):
+        if elem.get("msg_type") != "TIMCustomElem":
+            continue
+        data_str = (elem.get("msg_content") or {}).get("data", "")
+        if not data_str:
+            continue
+        try:
+            custom = json.loads(data_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if custom.get("elem_type") == 1002:
+            at_entries.append(custom)
+
+    # If any AT targets someone other than this bot, do not treat the turn
+    # as a slash command for us.
+    for entry in at_entries:
+        if entry.get("user_id") != bot_id:
+            return None
+
+    if not at_entries:
+        return None
+
+    mention_text = str(at_entries[0].get("text") or "")
+
+    text_parts: List[str] = []
+    for elem in (msg_body or []):
+        if elem.get("msg_type") != "TIMTextElem":
+            continue
+        part = (elem.get("msg_content") or {}).get("text", "")
+        if part:
+            text_parts.append(part)
+    text = "".join(text_parts)
+
+    cleaned_text = text
+    if mention_text and cleaned_text.startswith(mention_text):
+        cleaned_text = cleaned_text[len(mention_text):]
+    else:
+        cleaned_text = _LEADING_MENTION_RE.sub("", cleaned_text, count=1)
+
+    cleaned_text = cleaned_text.strip()
+    if cleaned_text.startswith('\uff0f'):
+        cleaned_text = '/' + cleaned_text[1:]
+    return cleaned_text if cleaned_text.startswith("/") else None
+
 class MarkdownProcessor:
     """Encapsulates all Markdown-related utilities for the Yuanbao platform.
 
@@ -1892,68 +1951,6 @@ class OwnerCommandMiddleware(InboundMiddleware):
         return text
 
     @classmethod
-    def _extract_addressed_slash_command_line(
-        cls,
-        *,
-        msg_body: list,
-        bot_id: Optional[str],
-    ) -> Optional[str]:
-        """Return a normalized slash command line addressed to this bot.
-
-        Supports both common client layouts:
-          - ``[AT(bot), text(" /help")]``
-          - ``[text("/help "), AT(bot)]``
-
-        Returns ``None`` when the message is not confidently a bot-directed
-        slash command.
-        """
-        if not bot_id:
-            return None
-
-        at_entries: List[dict] = []
-        for elem in (msg_body or []):
-            if elem.get("msg_type") != "TIMCustomElem":
-                continue
-            data_str = (elem.get("msg_content") or {}).get("data", "")
-            if not data_str:
-                continue
-            try:
-                custom = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if custom.get("elem_type") == 1002:
-                at_entries.append(custom)
-
-        # If any AT targets someone other than this bot, do not treat the turn
-        # as a slash command for us.
-        for entry in at_entries:
-            if entry.get("user_id") != bot_id:
-                return None
-
-        if not at_entries:
-            return None
-
-        mention_text = str(at_entries[0].get("text") or "")
-
-        text_parts: List[str] = []
-        for elem in (msg_body or []):
-            if elem.get("msg_type") != "TIMTextElem":
-                continue
-            part = (elem.get("msg_content") or {}).get("text", "")
-            if part:
-                text_parts.append(part)
-        text = "".join(text_parts)
-
-        cleaned_text = text
-        if mention_text and cleaned_text.startswith(mention_text):
-            cleaned_text = cleaned_text[len(mention_text):]
-        else:
-            cleaned_text = _LEADING_MENTION_RE.sub("", cleaned_text, count=1)
-
-        cmd_line = cls._rewrite_slash_command(cleaned_text)
-        return cmd_line if cmd_line.startswith("/") else None
-
-    @classmethod
     def _detect_owner_command(
         cls,
         *,
@@ -1978,10 +1975,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
         if not bot_id:
             return None, None, False
 
-        cmd_line = cls._extract_addressed_slash_command_line(
-            msg_body=msg_body,
-            bot_id=bot_id,
-        )
+        cmd_line = _extract_addressed_slash_command_line(msg_body, bot_id)
         if not cmd_line:
             return None, None, False
         cmd = cmd_line.split(maxsplit=1)[0].lower()
@@ -2173,10 +2167,7 @@ class GroupAttributionMiddleware(InboundMiddleware):
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if ctx.chat_type == "group" and not ctx.owner_command:
             adapter = ctx.adapter
-            cmd_line = OwnerCommandMiddleware._extract_addressed_slash_command_line(
-                msg_body=ctx.msg_body,
-                bot_id=adapter._bot_id,
-            )
+            cmd_line = _extract_addressed_slash_command_line(ctx.msg_body, adapter._bot_id)
             if cmd_line:
                 logger.info(
                     "[%s] Group @bot slash command routed to gateway: chat=%s from=%s cmd=%s",
