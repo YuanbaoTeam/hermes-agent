@@ -1185,6 +1185,54 @@ class TestOwnerCommandAtBot:
         assert ctx.owner_command is None
 
     @pytest.mark.asyncio
+    async def test_owner_falls_back_to_cached_adapter_owner_id_when_push_missing(self):
+        """Empty push.bot_owner_id should fall back to adapter._owner_id."""
+        adapter = make_adapter()
+        adapter._owner_id = "alice"
+        msg_body = [make_at_elem("bot_123"), make_text_elem(" /new")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": ""},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot /new",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command == "/new"
+        assert ctx.raw_text == "/new"
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_owner_still_rejected_when_push_missing_and_cached_owner_differs(self):
+        """Fallback owner_id should still reject non-owner group slash commands."""
+        adapter = make_adapter()
+        adapter._owner_id = "alice"
+        adapter.send = AsyncMock()
+        msg_body = [make_at_elem("bot_123"), make_text_elem(" /new")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": ""},
+            msg_body=msg_body,
+            from_account="bob",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot /new",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+        await asyncio.sleep(0)
+
+        next_fn.assert_not_awaited()
+        adapter.send.assert_called_once()
+        assert ctx.owner_command is None
+
+    @pytest.mark.asyncio
     async def test_at_other_user_not_command(self):
         """AT targeting a different user -> not our command, next_fn awaited."""
         adapter = make_adapter()

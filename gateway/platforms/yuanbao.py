@@ -1959,6 +1959,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
         chat_type: str,
         from_account: str,
         bot_id: Optional[str],
+        fallback_owner_id: str = "",
     ) -> Tuple[Optional[str], Optional[str], bool]:
         """Identify allowlisted slash commands and determine sender identity.
 
@@ -1982,8 +1983,10 @@ class OwnerCommandMiddleware(InboundMiddleware):
         if cmd not in cls.ALLOWLIST:
             return None, None, False
 
-        # Sender identity check: bot owner <-> push.from_account == push.bot_owner_id
-        owner_id = (push or {}).get("bot_owner_id") or ""
+        # Sender identity check: prefer per-push bot_owner_id; fall back to the
+        # owner_id resolved at connect time because group callbacks sometimes omit
+        # bot_owner_id entirely.
+        owner_id = (push or {}).get("bot_owner_id") or fallback_owner_id or ""
         is_owner = bool(owner_id) and owner_id == from_account
         return cmd, cmd_line, is_owner
 
@@ -1995,6 +1998,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
             chat_type=ctx.chat_type,
             from_account=ctx.from_account,
             bot_id=adapter._bot_id,
+            fallback_owner_id=getattr(adapter, "_owner_id", "") or "",
         )
         if matched_cmd and not is_owner:
             # Non-owner tried an owner-only command — reject and stop
