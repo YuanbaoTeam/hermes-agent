@@ -39,6 +39,7 @@ from gateway.platforms.yuanbao import (
     OwnerCommandMiddleware,
     BuildSourceMiddleware,
     GroupAtGuardMiddleware,
+    GroupAttributionMiddleware,
     DispatchMiddleware,
     InboundPipelineBuilder,
     YuanbaoAdapter,
@@ -693,8 +694,8 @@ class TestGroupAtGuardMiddleware:
         next_fn.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_owner_command_skips_at_check(self):
-        """GroupAtGuardMiddleware passes when owner_command is set."""
+    async def test_owner_command_does_not_bypass_at_check(self):
+        """GroupAtGuardMiddleware still requires @bot even if owner_command is preset."""
         adapter = make_adapter()
         adapter._bot_id = "bot_123"
         ctx = make_ctx(
@@ -707,7 +708,7 @@ class TestGroupAtGuardMiddleware:
         next_fn = AsyncMock()
 
         await GroupAtGuardMiddleware()(ctx, next_fn)
-        next_fn.assert_awaited_once()
+        next_fn.assert_not_awaited()
 
 
 # ============================================================
@@ -1027,3 +1028,347 @@ class TestPipelineOOPRegistration:
         pipeline = InboundPipeline().use(MwA()).use(MwC())
         pipeline.use_after("a", MwB())
         assert pipeline.middleware_names == ["a", "b", "c"]
+
+
+# ============================================================
+# 7. OwnerCommandMiddleware @Bot + slash command tests
+# ============================================================
+
+def make_at_elem(bot_id, text="@yuanbao-bot"):
+    """Build a TIMCustomElem representing an AT (mention) of bot_id."""
+    return {
+        "msg_type": "TIMCustomElem",
+        "msg_content": {"data": json.dumps({"elem_type": 1002, "user_id": bot_id, "text": text})},
+    }
+
+
+def make_text_elem(text):
+    """Build a TIMTextElem."""
+    return {"msg_type": "TIMTextElem", "msg_content": {"text": text}}
+
+
+class TestOwnerCommandAtBot:
+    """Exercise OwnerCommandMiddleware for @Bot + slash-command matrix.
+
+    These cases bypass the full pipeline and invoke the middleware directly.
+    adapter._bot_id is pre-set to "bot_123" by make_adapter().
+    """
+
+    @pytest.mark.asyncio
+    async def test_owner_at_bot_slash_reset_detected(self):
+        """AT(bot) + ' /reset' from the bot owner -> /reset detected."""
+        adapter = make_adapter()
+        msg_body = [make_at_elem("bot_123"), make_text_elem(" /reset")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot /reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command == "/reset"
+        assert ctx.raw_text == "/reset"
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_owner_at_bot_multi_text_fragments_detected(self):
+        """Multiple TIMTextElem fragments concatenate to '/reset arg1'."""
+        adapter = make_adapter()
+        msg_body = [
+            make_at_elem("bot_123"),
+            make_text_elem(" /"),
+            make_text_elem("reset arg1"),
+        ]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot /reset arg1",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command == "/reset"
+        assert ctx.raw_text == "/reset arg1"
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_inline_mention_without_at_elem_not_command(self):
+        """Inline '@yuanbao-bot /reset' text with NO AT elem -> defensive bailout.
+
+        The middleware bails out when `at_entries` is empty in a group context,
+        because such a message would not have passed GroupAtGuard in production.
+        The `_LEADING_MENTION_RE` fallback only activates when an AT elem exists
+        but the concatenated text also inlines the mention string.
+        """
+        adapter = make_adapter()
+        msg_body = [make_text_elem("@yuanbao-bot /reset")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot /reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command is None
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_owner_at_bot_non_allowlisted_command_ignored(self):
+        """AT(bot) + ' /unknown' -> not in ALLOWLIST, owner_command stays None."""
+        adapter = make_adapter()
+        msg_body = [make_at_elem("bot_123"), make_text_elem(" /unknown")]
+        upstream_raw_text = "@yuanbao-bot /unknown"
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text=upstream_raw_text,
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command is None
+        # raw_text should be untouched by this middleware when no cmd matches
+        assert ctx.raw_text == upstream_raw_text
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_owner_at_bot_slash_rejected(self):
+        """Non-owner attempts /reset -> adapter.send called, next_fn NOT awaited."""
+        adapter = make_adapter()
+        adapter.send = AsyncMock()
+        msg_body = [make_at_elem("bot_123"), make_text_elem(" /reset")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="bob",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot /reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        # Let the fire-and-forget task created via asyncio.create_task resolve.
+        await asyncio.sleep(0)
+
+        next_fn.assert_not_awaited()
+        adapter.send.assert_called_once()
+        args, kwargs = adapter.send.call_args
+        # adapter.send(chat_id, message) — message is second positional arg
+        sent_message = args[1] if len(args) > 1 else kwargs.get("content", "")
+        assert "only available to the creator" in sent_message
+        # owner_command should NOT be set on non-owner rejection
+        assert ctx.owner_command is None
+
+    @pytest.mark.asyncio
+    async def test_at_other_user_not_command(self):
+        """AT targeting a different user -> not our command, next_fn awaited."""
+        adapter = make_adapter()
+        msg_body = [
+            make_at_elem("other_user", text="@someone"),
+            make_text_elem(" /reset"),
+        ]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@someone /reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command is None
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_multiple_ats_with_one_non_bot_not_command(self):
+        """AT(bot) + AT(other) + ' /reset' -> not a command, next_fn awaited."""
+        adapter = make_adapter()
+        msg_body = [
+            make_at_elem("bot_123"),
+            make_at_elem("other_user", text="@someone"),
+            make_text_elem(" /reset"),
+        ]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot @someone /reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command is None
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_leading_plain_text_before_slash_not_command(self):
+        """AT(bot) + ' hey /reset' -> after mention strip, starts with 'hey', not '/'."""
+        adapter = make_adapter()
+        msg_body = [make_at_elem("bot_123"), make_text_elem(" hey /reset")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot hey /reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command is None
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dm_path_unchanged(self):
+        """DM (chat_type='dm') -> middleware returns early, no owner_command set."""
+        adapter = make_adapter()
+        msg_body = [make_text_elem("/reset")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="dm",
+            chat_id="direct:alice",
+            raw_text="/reset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command is None
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_owner_at_bot_fullwidth_slash(self):
+        """AT(bot) + full-width slash '\uff0freset' -> normalized to '/reset'."""
+        adapter = make_adapter()
+        msg_body = [make_at_elem("bot_123"), make_text_elem("\uff0freset")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="@yuanbao-bot \uff0freset",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command == "/reset"
+        assert ctx.raw_text == "/reset"
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_owner_slash_before_at_bot_detected(self):
+        """Text('/reset ') + AT(bot) should still detect the owner command."""
+        adapter = make_adapter()
+        msg_body = [make_text_elem("/reset "), make_at_elem("bot_123")]
+        ctx = make_ctx(
+            adapter=adapter,
+            push={"bot_owner_id": "alice"},
+            msg_body=msg_body,
+            from_account="alice",
+            chat_type="group",
+            chat_id="group:grp-1",
+            raw_text="/reset @yuanbao-bot",
+        )
+        next_fn = AsyncMock()
+
+        await OwnerCommandMiddleware()(ctx, next_fn)
+
+        assert ctx.owner_command == "/reset"
+        assert ctx.raw_text == "/reset"
+        next_fn.assert_awaited_once()
+
+
+class TestGroupAttributionSlashCommands:
+    """Ensure non-owner group slash commands reach gateway dispatch un-attributed."""
+
+    @pytest.mark.asyncio
+    async def test_group_at_bot_help_preserves_slash_command(self):
+        """AT(bot) + ' /help' should stay '/help' for gateway command dispatch."""
+        adapter = make_adapter()
+        source = MagicMock()
+        source.user_name = "Alice"
+        ctx = make_ctx(
+            adapter=adapter,
+            chat_type="group",
+            chat_id="group:grp-1",
+            msg_body=[make_at_elem("bot_123"), make_text_elem(" /help")],
+            from_account="alice",
+            sender_nickname="Alice",
+            raw_text="@yuanbao-bot /help",
+            source=source,
+        )
+        next_fn = AsyncMock()
+
+        await GroupAttributionMiddleware()(ctx, next_fn)
+
+        assert ctx.raw_text == "/help"
+        assert ctx.channel_prompt is None
+        assert ctx.source is source
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_group_help_with_trailing_at_preserves_slash_command(self):
+        """Text('/help ') + AT(bot) should also stay '/help' for dispatch."""
+        adapter = make_adapter()
+        source = MagicMock()
+        source.user_name = "Alice"
+        ctx = make_ctx(
+            adapter=adapter,
+            chat_type="group",
+            chat_id="group:grp-1",
+            msg_body=[make_text_elem("/help "), make_at_elem("bot_123")],
+            from_account="alice",
+            sender_nickname="Alice",
+            raw_text="/help @yuanbao-bot",
+            source=source,
+        )
+        next_fn = AsyncMock()
+
+        await GroupAttributionMiddleware()(ctx, next_fn)
+
+        assert ctx.raw_text == "/help"
+        assert ctx.channel_prompt is None
+        assert ctx.source is source
+        next_fn.assert_awaited_once()

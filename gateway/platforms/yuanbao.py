@@ -151,6 +151,12 @@ _YB_RES_REF_RE = re.compile(
 # Strip page indicators like (1/3) appended by BasePlatformAdapter
 _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
 
+# Strip a leading @mention inlined into the text fragment by some clients,
+# e.g. "@yuanbao-bot /reset" -> "/reset". Used as a fallback when the client
+# did not send a separate TIMCustomElem AT element, or when the AT text
+# prefix match failed to match due to subtle formatting differences.
+_LEADING_MENTION_RE = re.compile(r'^@\S+\s+')
+
 # Observed-media backfill: how many recent transcript messages to scan
 OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
 # Max number of resource references to resolve per inbound turn
@@ -1859,15 +1865,18 @@ class PlaceholderFilterMiddleware(InboundMiddleware):
 
 
 class OwnerCommandMiddleware(InboundMiddleware):
-    """Detect bot-owner slash commands in group chat.
+    """Detect bot-owner slash commands in group chat with @Bot.
 
-    Identifies in-group allowlisted slash commands and determines sender identity.
-    Owner commands skip @Bot detection; non-owner attempts are rejected.
+    Identifies allowlisted slash commands sent while mentioning the bot
+    (GroupAtGuard has already filtered non-@Bot group messages) and
+    determines sender identity. Owner commands are forwarded; non-owner
+    attempts are rejected with a reply.
     """
 
     name = "owner-command"
 
-    # Slash command allowlist that bot owner can execute in group without @Bot
+    # Slash command allowlist that bot owner can execute in group chat with
+    # @Bot (GroupAtGuard has already filtered non-@Bot group messages).
     ALLOWLIST: frozenset = frozenset({
         "/new", "/reset", "/retry", "/undo", "/stop",
         "/approve", "/deny", "/background", "/bg",
@@ -1883,6 +1892,68 @@ class OwnerCommandMiddleware(InboundMiddleware):
         return text
 
     @classmethod
+    def _extract_addressed_slash_command_line(
+        cls,
+        *,
+        msg_body: list,
+        bot_id: Optional[str],
+    ) -> Optional[str]:
+        """Return a normalized slash command line addressed to this bot.
+
+        Supports both common client layouts:
+          - ``[AT(bot), text(" /help")]``
+          - ``[text("/help "), AT(bot)]``
+
+        Returns ``None`` when the message is not confidently a bot-directed
+        slash command.
+        """
+        if not bot_id:
+            return None
+
+        at_entries: List[dict] = []
+        for elem in (msg_body or []):
+            if elem.get("msg_type") != "TIMCustomElem":
+                continue
+            data_str = (elem.get("msg_content") or {}).get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if custom.get("elem_type") == 1002:
+                at_entries.append(custom)
+
+        # If any AT targets someone other than this bot, do not treat the turn
+        # as a slash command for us.
+        for entry in at_entries:
+            if entry.get("user_id") != bot_id:
+                return None
+
+        if not at_entries:
+            return None
+
+        mention_text = str(at_entries[0].get("text") or "")
+
+        text_parts: List[str] = []
+        for elem in (msg_body or []):
+            if elem.get("msg_type") != "TIMTextElem":
+                continue
+            part = (elem.get("msg_content") or {}).get("text", "")
+            if part:
+                text_parts.append(part)
+        text = "".join(text_parts)
+
+        cleaned_text = text
+        if mention_text and cleaned_text.startswith(mention_text):
+            cleaned_text = cleaned_text[len(mention_text):]
+        else:
+            cleaned_text = _LEADING_MENTION_RE.sub("", cleaned_text, count=1)
+
+        cmd_line = cls._rewrite_slash_command(cleaned_text)
+        return cmd_line if cmd_line.startswith("/") else None
+
+    @classmethod
     def _detect_owner_command(
         cls,
         *,
@@ -1890,6 +1961,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
         msg_body: list,
         chat_type: str,
         from_account: str,
+        bot_id: Optional[str],
     ) -> Tuple[Optional[str], Optional[str], bool]:
         """Identify allowlisted slash commands and determine sender identity.
 
@@ -1901,17 +1973,16 @@ class OwnerCommandMiddleware(InboundMiddleware):
         if chat_type != "group" or not cls.ALLOWLIST:
             return None, None, False
 
-        # Extract TIMTextElem: only do command recognition with exactly one text segment
-        text_elems = [
-            e for e in (msg_body or [])
-            if e.get("msg_type") == "TIMTextElem"
-        ]
-        if len(text_elems) != 1:
+        # A group message without knowing our own bot_id cannot be confidently
+        # attributed — bail out defensively.
+        if not bot_id:
             return None, None, False
 
-        text = (text_elems[0].get("msg_content") or {}).get("text", "")
-        cmd_line = cls._rewrite_slash_command(text)
-        if not cmd_line.startswith("/"):
+        cmd_line = cls._extract_addressed_slash_command_line(
+            msg_body=msg_body,
+            bot_id=bot_id,
+        )
+        if not cmd_line:
             return None, None, False
         cmd = cmd_line.split(maxsplit=1)[0].lower()
         if cmd not in cls.ALLOWLIST:
@@ -1929,6 +2000,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
             msg_body=ctx.msg_body,
             chat_type=ctx.chat_type,
             from_account=ctx.from_account,
+            bot_id=adapter._bot_id,
         )
         if matched_cmd and not is_owner:
             # Non-owner tried an owner-only command — reject and stop
@@ -1944,8 +2016,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
 
         if matched_cmd and is_owner and cmd_line:
             logger.info(
-                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
-                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
+                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s via=%s",
+                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd, "@bot",
             )
             ctx.owner_command = matched_cmd
             ctx.raw_text = cmd_line  # Override with clean command text
@@ -2101,6 +2173,22 @@ class GroupAttributionMiddleware(InboundMiddleware):
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if ctx.chat_type == "group" and not ctx.owner_command:
             adapter = ctx.adapter
+            cmd_line = OwnerCommandMiddleware._extract_addressed_slash_command_line(
+                msg_body=ctx.msg_body,
+                bot_id=adapter._bot_id,
+            )
+            if cmd_line:
+                logger.info(
+                    "[%s] Group @bot slash command routed to gateway: chat=%s from=%s cmd=%s",
+                    adapter.name,
+                    ctx.chat_id,
+                    ctx.from_account,
+                    cmd_line.split(maxsplit=1)[0].lower(),
+                )
+                ctx.raw_text = cmd_line
+                await next_fn()
+                return
+
             ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(
                 ctx.msg_body, adapter._bot_id,
             )
