@@ -113,6 +113,7 @@ _OPERATION_SYSTEM = sys.platform
 
 DEFAULT_WS_GATEWAY_URL = "wss://bot-wss.yuanbao.tencent.com/wss/connection"
 DEFAULT_API_DOMAIN = "https://bot.yuanbao.tencent.com"
+DEFAULT_SOURCE = "web"
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 15.0
@@ -150,10 +151,75 @@ _YB_RES_REF_RE = re.compile(
 # Strip page indicators like (1/3) appended by BasePlatformAdapter
 _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
 
+# Strip a leading @mention inlined into the text fragment by some clients,
+# e.g. "@yuanbao-bot /reset" -> "/reset". Used as a fallback when the client
+# did not send a separate TIMCustomElem AT element, or when the AT text
+# prefix match failed to match due to subtle formatting differences.
+_LEADING_MENTION_RE = re.compile(r'^@\S+\s+')
+
 # Observed-media backfill: how many recent transcript messages to scan
 OBSERVED_MEDIA_BACKFILL_LOOKBACK = 50
 # Max number of resource references to resolve per inbound turn
 OBSERVED_MEDIA_BACKFILL_MAX_RESOLVE_PER_TURN = 12
+
+
+def _extract_addressed_slash_command_line(msg_body: list, bot_id: Optional[str]) -> Optional[str]:
+    """Return a normalized slash command line addressed to this bot.
+
+    Supports both common client layouts:
+      - ``[AT(bot), text(" /help")]``
+      - ``[text("/help "), AT(bot)]``
+
+    Returns ``None`` when the message is not confidently a bot-directed
+    slash command.
+    """
+    if not bot_id:
+        return None
+
+    at_entries: List[dict] = []
+    for elem in (msg_body or []):
+        if elem.get("msg_type") != "TIMCustomElem":
+            continue
+        data_str = (elem.get("msg_content") or {}).get("data", "")
+        if not data_str:
+            continue
+        try:
+            custom = json.loads(data_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if custom.get("elem_type") == 1002:
+            at_entries.append(custom)
+
+    # If any AT targets someone other than this bot, do not treat the turn
+    # as a slash command for us.
+    for entry in at_entries:
+        if entry.get("user_id") != bot_id:
+            return None
+
+    if not at_entries:
+        return None
+
+    mention_text = str(at_entries[0].get("text") or "")
+
+    text_parts: List[str] = []
+    for elem in (msg_body or []):
+        if elem.get("msg_type") != "TIMTextElem":
+            continue
+        part = (elem.get("msg_content") or {}).get("text", "")
+        if part:
+            text_parts.append(part)
+    text = "".join(text_parts)
+
+    cleaned_text = text
+    if mention_text and cleaned_text.startswith(mention_text):
+        cleaned_text = cleaned_text[len(mention_text):]
+    else:
+        cleaned_text = _LEADING_MENTION_RE.sub("", cleaned_text, count=1)
+
+    cleaned_text = cleaned_text.strip()
+    if cleaned_text.startswith('\uff0f'):
+        cleaned_text = '/' + cleaned_text[1:]
+    return cleaned_text if cleaned_text.startswith("/") else None
 
 class MarkdownProcessor:
     """Encapsulates all Markdown-related utilities for the Yuanbao platform.
@@ -771,7 +837,10 @@ class SignManager:
 
                 if response.status_code != 200:
                     body = response.text
-                    raise RuntimeError(f"Sign token API returned {response.status_code}: {body[:200]}")
+                    raise RuntimeError(
+                        f"Sign token API returned {response.status_code}: "
+                        f"headers={dict(response.headers)} body={body[:200]}"
+                    )
 
                 try:
                     result_data: dict[str, Any] = response.json()
@@ -846,6 +915,68 @@ class SignManager:
             }
 
         return dict(cls._cache[app_key])
+
+    # -- Public API: fetch bot detail --------------------------------------
+
+    BOT_DETAIL_PATH = "/api/v5/robotLogic/get-bot-detail"
+
+    @classmethod
+    async def fetch_bot_detail(
+        cls,
+        bot_id: str,
+        token: str,
+        source: str,
+        api_domain: str,
+        route_env: str = "",
+    ) -> str:
+        """Fetch bot detail and return owner_id (empty string on any error).
+
+        Calls POST /api/v5/robotLogic/get-bot-detail with bot_id and scene=2.
+        Returns the owner_id from data.bot.owner_id, or "" if unavailable.
+        This call is non-fatal — connection proceeds regardless of outcome.
+        """
+        url = f"{api_domain.rstrip('/')}{cls.BOT_DETAIL_PATH}"
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "X-Token": token,
+            "X-ID": bot_id,
+            "X-Source": source,
+        }
+        if route_env:
+            headers["X-Route-Env"] = route_env
+        payload = {"bot_id": bot_id, "scene": 2}
+        try:
+            async with httpx.AsyncClient(timeout=cls.HTTP_TIMEOUT_S) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code != 200:
+                    logger.error(
+                        "fetch_bot_detail HTTP error: status=%d headers=%s body=%s",
+                        resp.status_code, dict(resp.headers), resp.text[:200],
+                    )
+                    return ""
+                result = resp.json()
+            code = result.get("code", -1)
+            if code != 0:
+                logger.error(
+                    "get-bot-detail returned non-zero code=%s msg=%s",
+                    code, result.get("msg", ""),
+                )
+                return ""
+            owner_id = (result.get("bot") or {}).get("owner_id") or ""
+            if owner_id:
+                logger.info(
+                    "fetch_bot_detail success: bot_id=%s owner_id=%s",
+                    bot_id, owner_id,
+                )
+            else:
+                logger.warning(
+                    "fetch_bot_detail: owner_id missing in response bot: %s",
+                    result.get("bot"),
+                )
+            return str(owner_id) if owner_id else ""
+        except Exception as exc:
+            logger.error("fetch_bot_detail failed: %s", exc, exc_info=True)
+            return ""
 
     # -- Public API: force refresh -----------------------------------------
 
@@ -1560,51 +1691,6 @@ class AccessGuardMiddleware(InboundMiddleware):
         await next_fn()
 
 
-class AutoSetHomeMiddleware(InboundMiddleware):
-    """Auto-designate the first inbound conversation as Yuanbao home channel.
-
-    Triggers when no home channel is configured, or when an existing group-chat
-    home is superseded by the first DM (direct > group upgrade).
-    Silent: writes config.yaml and env, no user-facing message.
-    """
-
-    name = "auto-sethome"
-
-    async def handle(self, ctx: InboundContext, next_fn) -> None:
-        adapter = ctx.adapter
-        if not adapter._auto_sethome_done:
-            _cur_home = os.getenv("YUANBAO_HOME_CHANNEL", "")
-            _should_set = (
-                not _cur_home
-                or (_cur_home.startswith("group:") and ctx.chat_type == "dm")
-            )
-            if ctx.chat_type == "dm":
-                adapter._auto_sethome_done = True  # DM seen — no further upgrades needed
-            if _should_set:
-                try:
-                    from hermes_constants import get_hermes_home
-                    from utils import atomic_yaml_write
-                    import yaml
-
-                    _home = get_hermes_home()
-                    config_path = _home / "config.yaml"
-                    user_config: dict = {}
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            user_config = yaml.safe_load(f) or {}
-                    user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
-                    atomic_yaml_write(config_path, user_config)
-                    os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
-                    logger.info(
-                        "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",
-                        adapter.name, ctx.chat_id, ctx.chat_name,
-                    )
-                    # Silent auto-sethome: no user-facing message, only log
-                except Exception as e:
-                    logger.warning("[%s] Auto-sethome failed: %s", adapter.name, e)
-        await next_fn()
-
-
 class ExtractContentMiddleware(InboundMiddleware):
     """Extract raw text and media refs from msg_body."""
 
@@ -1838,15 +1924,18 @@ class PlaceholderFilterMiddleware(InboundMiddleware):
 
 
 class OwnerCommandMiddleware(InboundMiddleware):
-    """Detect bot-owner slash commands in group chat.
+    """Detect bot-owner slash commands in group chat with @Bot.
 
-    Identifies in-group allowlisted slash commands and determines sender identity.
-    Owner commands skip @Bot detection; non-owner attempts are rejected.
+    Identifies allowlisted slash commands sent while mentioning the bot
+    (GroupAtGuard has already filtered non-@Bot group messages) and
+    determines sender identity. Owner commands are forwarded; non-owner
+    attempts are rejected with a reply.
     """
 
     name = "owner-command"
 
-    # Slash command allowlist that bot owner can execute in group without @Bot
+    # Slash command allowlist that bot owner can execute in group chat with
+    # @Bot (GroupAtGuard has already filtered non-@Bot group messages).
     ALLOWLIST: frozenset = frozenset({
         "/new", "/reset", "/retry", "/undo", "/stop",
         "/approve", "/deny", "/background", "/bg",
@@ -1869,6 +1958,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
         msg_body: list,
         chat_type: str,
         from_account: str,
+        bot_id: Optional[str],
+        fallback_owner_id: str = "",
     ) -> Tuple[Optional[str], Optional[str], bool]:
         """Identify allowlisted slash commands and determine sender identity.
 
@@ -1880,24 +1971,22 @@ class OwnerCommandMiddleware(InboundMiddleware):
         if chat_type != "group" or not cls.ALLOWLIST:
             return None, None, False
 
-        # Extract TIMTextElem: only do command recognition with exactly one text segment
-        text_elems = [
-            e for e in (msg_body or [])
-            if e.get("msg_type") == "TIMTextElem"
-        ]
-        if len(text_elems) != 1:
+        # A group message without knowing our own bot_id cannot be confidently
+        # attributed — bail out defensively.
+        if not bot_id:
             return None, None, False
 
-        text = (text_elems[0].get("msg_content") or {}).get("text", "")
-        cmd_line = cls._rewrite_slash_command(text)
-        if not cmd_line.startswith("/"):
+        cmd_line = _extract_addressed_slash_command_line(msg_body, bot_id)
+        if not cmd_line:
             return None, None, False
         cmd = cmd_line.split(maxsplit=1)[0].lower()
         if cmd not in cls.ALLOWLIST:
             return None, None, False
 
-        # Sender identity check: bot owner <-> push.from_account == push.bot_owner_id
-        owner_id = (push or {}).get("bot_owner_id") or ""
+        # Sender identity check: prefer per-push bot_owner_id; fall back to the
+        # owner_id resolved at connect time because group callbacks sometimes omit
+        # bot_owner_id entirely.
+        owner_id = (push or {}).get("bot_owner_id") or fallback_owner_id or ""
         is_owner = bool(owner_id) and owner_id == from_account
         return cmd, cmd_line, is_owner
 
@@ -1908,6 +1997,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
             msg_body=ctx.msg_body,
             chat_type=ctx.chat_type,
             from_account=ctx.from_account,
+            bot_id=adapter._bot_id,
+            fallback_owner_id=getattr(adapter, "_owner_id", "") or "",
         )
         if matched_cmd and not is_owner:
             # Non-owner tried an owner-only command — reject and stop
@@ -1923,8 +2014,8 @@ class OwnerCommandMiddleware(InboundMiddleware):
 
         if matched_cmd and is_owner and cmd_line:
             logger.info(
-                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s",
-                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
+                "[%s] Bot owner slash command: chat=%s from=%s cmd=%s via=%s",
+                adapter.name, ctx.chat_id, ctx.from_account, matched_cmd, "@bot",
             )
             ctx.owner_command = matched_cmd
             ctx.raw_text = cmd_line  # Override with clean command text
@@ -1950,10 +2041,7 @@ class BuildSourceMiddleware(InboundMiddleware):
 
 
 class GroupAtGuardMiddleware(InboundMiddleware):
-    """In group chat, observe non-@bot messages; only reply on @Bot.
-
-    Owner commands skip @Bot detection (owner doesn't need to @Bot).
-    """
+    """In group chat, observe non-@bot messages; only reply on @Bot."""
 
     name = "group-at-guard"
 
@@ -2052,7 +2140,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
-        if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
+        if ctx.chat_type == "group" and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
             self._observe_group_message(
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
                 msg_id=ctx.msg_id or None,
@@ -2083,6 +2171,19 @@ class GroupAttributionMiddleware(InboundMiddleware):
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         if ctx.chat_type == "group" and not ctx.owner_command:
             adapter = ctx.adapter
+            cmd_line = _extract_addressed_slash_command_line(ctx.msg_body, adapter._bot_id)
+            if cmd_line:
+                logger.info(
+                    "[%s] Group @bot slash command routed to gateway: chat=%s from=%s cmd=%s",
+                    adapter.name,
+                    ctx.chat_id,
+                    ctx.from_account,
+                    cmd_line.split(maxsplit=1)[0].lower(),
+                )
+                ctx.raw_text = cmd_line
+                await next_fn()
+                return
+
             ctx.channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt(
                 ctx.msg_body, adapter._bot_id,
             )
@@ -2191,7 +2292,7 @@ class MediaResolveMiddleware(InboundMiddleware):
 
         token_data = await adapter._get_cached_token()
         token = str(token_data.get("token") or "").strip()
-        source = str(token_data.get("source") or "web").strip() or "web"
+        source = str(token_data.get("source") or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
         bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
         if not token or not bot_id:
             raise RuntimeError("missing token or bot_id for resource download")
@@ -2213,7 +2314,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                         adapter._app_key, adapter._app_secret, adapter._api_domain,
                     )
                     token = str(token_data.get("token") or "").strip()
-                    source = str(token_data.get("source") or source or "web").strip() or "web"
+                    source = str(token_data.get("source") or source or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
                     bot_id = str(token_data.get("bot_id") or adapter._bot_id or adapter._app_key).strip()
                     if not token or not bot_id:
                         break
@@ -2222,7 +2323,11 @@ class MediaResolveMiddleware(InboundMiddleware):
                     headers["X-Source"] = source
                     continue
 
-                resp.raise_for_status()
+                if resp.status_code not in (200, 206):
+                    raise RuntimeError(
+                        f"resource/v1/download HTTP error: status={resp.status_code} "
+                        f"headers={dict(resp.headers)} body={resp.text[:200]}"
+                    )
                 payload = resp.json()
                 code = payload.get("code")
                 if code not in (None, 0):
@@ -2592,12 +2697,11 @@ class InboundPipelineBuilder:
         SkipSelfMiddleware,
         ChatRoutingMiddleware,
         AccessGuardMiddleware,
-        AutoSetHomeMiddleware,
         ExtractContentMiddleware,
         PlaceholderFilterMiddleware,
-        OwnerCommandMiddleware,
         BuildSourceMiddleware,
         GroupAtGuardMiddleware,
+        OwnerCommandMiddleware,
         GroupAttributionMiddleware,
         ClassifyMessageTypeMiddleware,
         QuoteContextMiddleware,
@@ -2612,6 +2716,40 @@ class InboundPipelineBuilder:
         for mw_cls in cls._DEFAULT_MIDDLEWARES:
             pipeline.use(mw_cls())
         return pipeline
+
+def _apply_sethome(owner_id: str, adapter_name: str, label: str = "") -> None:
+    """Write *chat_id* as YUANBAO_HOME_CHANNEL to config.yaml and os.environ.
+
+    Silent: logs at INFO on success, WARNING on failure — no user-facing message.
+
+    Args:
+        chat_id:      The channel / user ID to designate as home.
+        adapter_name: Used only for log prefixing.
+        label:        Optional human-readable description appended to the log line.
+    """
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        from utils import atomic_yaml_write
+
+        chat_id = f"direct:{owner_id}"
+        _home = get_hermes_home()
+        config_path = _home / "config.yaml"
+        user_config: dict = {}
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                user_config = yaml.safe_load(f) or {}
+        user_config["YUANBAO_HOME_CHANNEL"] = chat_id
+        atomic_yaml_write(config_path, user_config)
+        os.environ["YUANBAO_HOME_CHANNEL"] = str(chat_id)
+        _desc = f" ({label})" if label else ""
+        logger.info(
+            "[%s] Auto-sethome: designated %s%s as Yuanbao home channel",
+            adapter_name, chat_id, _desc,
+        )
+    except Exception as e:
+        logger.warning("[%s] Auto-sethome failed: %s", adapter_name, e)
+
 
 class ConnectionManager:
     """Manages the WebSocket connection lifecycle for YuanbaoAdapter.
@@ -2771,6 +2909,31 @@ class ConnectionManager:
                 await self._cleanup_ws()
                 return False
 
+            # Step 3b: Fetch bot detail to obtain owner_id
+            owner_id = await SignManager.fetch_bot_detail(
+                bot_id=adapter._bot_id or "",
+                token=token_data.get("token", ""),
+                source=token_data.get("source", "") or DEFAULT_SOURCE,
+                api_domain=adapter._api_domain,
+                route_env=adapter._route_env,
+            )
+            if owner_id:
+                adapter._owner_id = owner_id
+                logger.info("[%s] Bot owner_id=%s", adapter.name, owner_id)
+                existing_home = os.getenv("YUANBAO_HOME_CHANNEL")
+                if existing_home:
+                    logger.info(
+                        "[%s] Skipping auto-sethome: YUANBAO_HOME_CHANNEL already set to %r",
+                        adapter.name, existing_home,
+                    )
+                else:
+                    _apply_sethome(owner_id, adapter.name)
+            else:
+                logger.warning(
+                    "[%s] fetch_bot_detail returned empty owner_id — auto-sethome skipped",
+                    adapter.name,
+                )
+
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
             adapter._mark_connected()
@@ -2844,7 +3007,7 @@ class ConnectionManager:
 
         token = token_data.get("token", "")
         uid = adapter._bot_id or token_data.get("bot_id", "")
-        source = token_data.get("source") or "bot"
+        source = token_data.get("source") or DEFAULT_SOURCE
         route_env = adapter._route_env or token_data.get("route_env", "") or ""
 
         msg_id = str(uuid.uuid4())
@@ -4491,6 +4654,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._app_key: str = (_extra.get("app_id") or "").strip()
         self._app_secret: str = (_extra.get("app_secret") or "").strip()
         self._bot_id: Optional[str] = _extra.get("bot_id") or None
+        self._owner_id: str = ""
         self._ws_url: str = (_extra.get("ws_url") or DEFAULT_WS_GATEWAY_URL).strip()
         self._api_domain: str = (_extra.get("api_domain") or DEFAULT_API_DOMAIN).rstrip("/")
         self._route_env: str = (_extra.get("route_env") or "").strip()
@@ -4564,18 +4728,6 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
         # Inbound message processing pipeline (middleware pattern)
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
-
-        # ------------------------------------------------------------------
-        # Auto-sethome: first user to message the bot becomes the owner.
-        # If no home channel is configured, the first conversation will be
-        # automatically set as the home channel.  When the existing home
-        # channel is a group chat (group:xxx), it stays eligible for
-        # upgrade — the first DM will override it with direct:xxx.
-        # ------------------------------------------------------------------
-        _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (
-            config.home_channel.chat_id if config.home_channel else ""
-        )
-        self._auto_sethome_done: bool = bool(_existing_home) and not _existing_home.startswith("group:")
 
     # ------------------------------------------------------------------
     # Task tracking helper
