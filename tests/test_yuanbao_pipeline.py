@@ -39,6 +39,7 @@ from gateway.platforms.yuanbao import (
     OwnerCommandMiddleware,
     BuildSourceMiddleware,
     GroupAtGuardMiddleware,
+    QuoteContextMiddleware,
     DispatchMiddleware,
     InboundPipelineBuilder,
     YuanbaoAdapter,
@@ -601,6 +602,119 @@ class TestExtractContentMiddleware:
         assert ctx.media_refs[0]["kind"] == "image"
         next_fn.assert_awaited_once()
 
+    def test_parse_resource_id_from_url(self):
+        """_parse_resource_id extracts resourceId from URL query parameters."""
+        # Test with resourceId (capital I)
+        url1 = "https://example.com/resource?resourceId=abc123&other=value"
+        rid1 = ExtractContentMiddleware._parse_resource_id(url1)
+        assert rid1 == "abc123"
+
+        # Test with resourceid (lowercase)
+        url2 = "https://example.com/resource?resourceid=xyz789"
+        rid2 = ExtractContentMiddleware._parse_resource_id(url2)
+        assert rid2 == "xyz789"
+
+        # Test with no resourceId
+        url3 = "https://example.com/resource?other=value"
+        rid3 = ExtractContentMiddleware._parse_resource_id(url3)
+        assert rid3 == ""
+
+        # Test with empty URL
+        rid4 = ExtractContentMiddleware._parse_resource_id("")
+        assert rid4 == ""
+
+        # Test with None
+        rid5 = ExtractContentMiddleware._parse_resource_id(None)
+        assert rid5 == ""
+
+    @pytest.mark.asyncio
+    async def test_extract_text_with_image_resourceid(self):
+        """_extract_text generates [image|ybres:rid] for images with resourceId."""
+        msg_body = [
+            {"msg_type": "TIMImageElem", "msg_content": {
+                "image_info_array": [
+                    {"url": "https://img.example.com/thumb.jpg?resourceId=img123"},
+                    {"url": "https://img.example.com/medium.jpg?resourceId=img123"},
+                ]
+            }},
+        ]
+        ctx = make_ctx(msg_body=msg_body)
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        assert "[image|ybres:img123]" in ctx.raw_text
+
+    @pytest.mark.asyncio
+    async def test_extract_text_with_file_resourceid(self):
+        """_extract_text generates [file:name|ybres:rid] for files with resourceId."""
+        msg_body = [
+            {"msg_type": "TIMFileElem", "msg_content": {
+                "file_name": "report.pdf",
+                "url": "https://files.example.com/file?resourceId=file456",
+            }},
+        ]
+        ctx = make_ctx(msg_body=msg_body)
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        assert "[file:report.pdf|ybres:file456]" in ctx.raw_text
+
+    @pytest.mark.asyncio
+    async def test_extract_text_with_voice_resourceid(self):
+        """_extract_text generates [voice|ybres:rid] for voice with resourceId."""
+        msg_body = [
+            {"msg_type": "TIMSoundElem", "msg_content": {
+                "url": "https://audio.example.com/voice?resourceId=voice789",
+            }},
+        ]
+        ctx = make_ctx(msg_body=msg_body)
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        assert "[voice|ybres:voice789]" in ctx.raw_text
+
+    @pytest.mark.asyncio
+    async def test_extract_text_with_video_resourceid(self):
+        """_extract_text generates [video|ybres:rid] for video with resourceId."""
+        msg_body = [
+            {"msg_type": "TIMVideoFileElem", "msg_content": {
+                "url": "https://video.example.com/clip?resourceId=vid999",
+            }},
+        ]
+        ctx = make_ctx(msg_body=msg_body)
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        assert "[video|ybres:vid999]" in ctx.raw_text
+
+    @pytest.mark.asyncio
+    async def test_extract_text_without_resourceid_fallback(self):
+        """_extract_text falls back to plain placeholder when no resourceId."""
+        msg_body = [
+            {"msg_type": "TIMImageElem", "msg_content": {
+                "image_info_array": [{"url": "https://img.example.com/no-rid.jpg"}]
+            }},
+            {"msg_type": "TIMFileElem", "msg_content": {
+                "file_name": "doc.pdf",
+                "url": "",  # Empty URL
+            }},
+        ]
+        ctx = make_ctx(msg_body=msg_body)
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        # Image without resourceId -> [image]
+        assert "[image]" in ctx.raw_text
+        # File without resourceId -> [file: doc.pdf]
+        assert "[file: doc.pdf]" in ctx.raw_text
+        # Should NOT have ybres anchors
+        assert "ybres:" not in ctx.raw_text
+
 
 class TestPlaceholderFilterMiddleware:
     @pytest.mark.asyncio
@@ -707,6 +821,145 @@ class TestGroupAtGuardMiddleware:
         next_fn = AsyncMock()
 
         await GroupAtGuardMiddleware()(ctx, next_fn)
+        next_fn.assert_awaited_once()
+
+
+class TestQuoteContextMiddleware:
+    """Test QuoteContextMiddleware quote extraction and media ref parsing."""
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_with_media_refs(self):
+        """_extract_quote_context extracts media refs from quote desc."""
+        cloud_custom_data = json.dumps({
+            "quote": {
+                "id": "msg123",
+                "sender_nickname": "Alice",
+                "desc": "Check this [image|ybres:img456]",
+                "type": 1,
+            }
+        })
+        ctx = make_ctx(cloud_custom_data=cloud_custom_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id == "msg123"
+        assert "Alice: Check this [image|ybres:img456]" in ctx.reply_to_text
+        assert len(ctx.quote_media_refs) == 1
+        assert ctx.quote_media_refs[0] == ("img456", "image", "")
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_with_file_media_ref(self):
+        """_extract_quote_context extracts file media refs with filename."""
+        cloud_custom_data = json.dumps({
+            "quote": {
+                "id": "msg789",
+                "sender_nickname": "Bob",
+                "desc": "See [file:report.pdf|ybres:file123]",
+                "type": 1,
+            }
+        })
+        ctx = make_ctx(cloud_custom_data=cloud_custom_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id == "msg789"
+        assert len(ctx.quote_media_refs) == 1
+        rid, kind, filename = ctx.quote_media_refs[0]
+        assert rid == "file123"
+        assert kind == "file"
+        assert filename == "report.pdf"
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_with_multiple_media_refs(self):
+        """_extract_quote_context extracts multiple media refs from quote."""
+        cloud_custom_data = json.dumps({
+            "quote": {
+                "id": "msg999",
+                "sender_nickname": "Charlie",
+                "desc": "[image|ybres:img1] and [video|ybres:vid2]",
+                "type": 1,
+            }
+        })
+        ctx = make_ctx(cloud_custom_data=cloud_custom_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert len(ctx.quote_media_refs) == 2
+        assert ctx.quote_media_refs[0] == ("img1", "image", "")
+        assert ctx.quote_media_refs[1] == ("vid2", "video", "")
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_without_media_refs(self):
+        """_extract_quote_context returns empty list when no media refs."""
+        cloud_custom_data = json.dumps({
+            "quote": {
+                "id": "msg000",
+                "sender_nickname": "Dave",
+                "desc": "Just plain text",
+                "type": 1,
+            }
+        })
+        ctx = make_ctx(cloud_custom_data=cloud_custom_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id == "msg000"
+        assert ctx.reply_to_text == "Dave: Just plain text"
+        assert ctx.quote_media_refs == []
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_type_2_with_image(self):
+        """_extract_quote_context handles type=2 (image) with ybres anchor."""
+        cloud_custom_data = json.dumps({
+            "quote": {
+                "id": "img-msg",
+                "sender_id": "alice",
+                "desc": "[image|ybres:img789]",
+                "type": 2,
+            }
+        })
+        ctx = make_ctx(cloud_custom_data=cloud_custom_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id == "img-msg"
+        assert len(ctx.quote_media_refs) == 1
+        assert ctx.quote_media_refs[0] == ("img789", "image", "")
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_empty_cloud_data(self):
+        """_extract_quote_context returns None values for empty cloud_custom_data."""
+        ctx = make_ctx(cloud_custom_data="")
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id is None
+        assert ctx.reply_to_text is None
+        assert ctx.quote_media_refs == []
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_quote_invalid_json(self):
+        """_extract_quote_context handles invalid JSON gracefully."""
+        ctx = make_ctx(cloud_custom_data="not json {")
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id is None
+        assert ctx.reply_to_text is None
+        assert ctx.quote_media_refs == []
         next_fn.assert_awaited_once()
 
 
