@@ -2247,12 +2247,6 @@ class QuoteContextMiddleware(InboundMiddleware):
         # Resolve media refs from msg_id→resids cache (populated by
         # ExtractContentMiddleware). Cache miss → empty list.
         media_refs = ExtractContentMiddleware.get_resids_for_msg(quote_id) if quote_id else []
-        logger.debug(
-            "QuoteContext: quote_id=%r, cache_keys=%r, media_refs=%r",
-            quote_id,
-            list(ExtractContentMiddleware._msgid_to_resids.keys())[-10:],
-            media_refs,
-        )
 
         return quote_id, quote_text, media_refs
 
