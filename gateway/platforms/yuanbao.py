@@ -2627,7 +2627,7 @@ class DispatchMiddleware(InboundMiddleware):
                                 if mid and mid == ctx.reply_to_message_id:
                                     _content = msg.get("content", "")
                                     if isinstance(_content, str) and "|ybres:" in _content:
-                                       for m in _YB_RES_REF_RE.finditer(_content):
+                                        for m in _YB_RES_REF_RE.finditer(_content):
                                             head = m.group(1)
                                             rid = m.group(2)
                                             kind, _, filename = head.partition(":")
