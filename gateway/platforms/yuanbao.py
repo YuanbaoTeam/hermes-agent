@@ -2097,101 +2097,11 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         except Exception as exc:
             logger.warning("[%s] Failed to observe group message: %s", adapter.name, exc)
 
-    @staticmethod
-    async def _predownload_observed_media(adapter, msg_body: list) -> str:
-        """Pre-download media from an observed message and return patched text.
-
-        Extracts image/file references from msg_body, downloads them via
-        MediaResolveMiddleware, then returns a patched version of the extracted
-        text where [image|ybres:xxx] anchors are replaced with [image: /local/path].
-        If download fails or no media, returns empty string (caller uses original text).
-        """
-        # Extract media refs from msg_body
-        refs = ExtractContentMiddleware._extract_inbound_media_refs(msg_body)
-        if not refs:
-            return ""
-
-        # Filter to resolvable kinds only
-        resolvable = []
-        for ref in refs:
-            kind = str(ref.get("kind") or "").strip().lower()
-            url = str(ref.get("url") or "").strip()
-            if kind in _RESOLVABLE_MEDIA_KINDS and url:
-                rid = ExtractContentMiddleware._parse_resource_id(url)
-                resolvable.append((kind, url, rid, str(ref.get("name") or "").strip()))
-        if not resolvable:
-            return ""
-
-        # Download each media item
-        downloaded: List[Tuple[str, str, str]] = []  # (rid, local_path, mime)
-        for kind, url, rid, file_name in resolvable:
-            try:
-                fetch_url = await MediaResolveMiddleware._resolve_download_url(adapter, url)
-            except Exception as exc:
-                logger.debug(
-                    "[%s] observed pre-download resolve failed: url=%s err=%s",
-                    adapter.name, url[:80], exc,
-                )
-                continue
-            cached = await MediaResolveMiddleware._download_and_cache(
-                adapter,
-                fetch_url=fetch_url,
-                kind=kind,
-                file_name=file_name or None,
-                log_tag=f"observed-predownload rid={rid}",
-                resource_id=rid,
-            )
-            if cached is not None and rid:
-                downloaded.append((rid, cached[0], cached[1]))
-
-        if not downloaded:
-            return ""
-
-        # Build patched text from the raw_text that _extract_text would produce
-        raw_text = ExtractContentMiddleware._extract_text(msg_body)
-        patched = raw_text
-        for rid, local_path, mime in downloaded:
-            # Replace [image|ybres:<rid>] with [image: <local_path>]
-            anchor = f"[image|ybres:{rid}]"
-            if anchor in patched:
-                patched = patched.replace(anchor, f"[image: {local_path}]")
-                continue
-            # Also handle file anchors: [file:<name>|ybres:<rid>]
-            file_anchor_re = re.compile(r"\[file(?::[^|\]]*)?\|ybres:" + re.escape(rid) + r"\]")
-            file_match = file_anchor_re.search(patched)
-            if file_match:
-                label = os.path.basename(local_path)
-                patched = patched[:file_match.start()] + f"[file: {label} \u2192 {local_path}]" + patched[file_match.end():]
-
-        if patched != raw_text:
-            logger.debug(
-                "[%s] Observed media pre-downloaded: %d items",
-                adapter.name, len(downloaded),
-            )
-            return patched
-        return ""
-
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
         if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
-            # If message contains media, pre-download and use patched text
-            # so transcript stores local paths instead of ybres references.
-            observe_text = ctx.raw_text
-            if any(
-                elem.get("msg_type") in ("TIMImageElem", "TIMFileElem")
-                for elem in ctx.msg_body
-            ):
-                try:
-                    patched = await self._predownload_observed_media(adapter, ctx.msg_body)
-                    if patched:
-                        observe_text = patched
-                except Exception as exc:
-                    logger.warning(
-                        "[%s] Observed media pre-download failed, using raw text: %s",
-                        adapter.name, exc,
-                    )
             self._observe_group_message(
-                adapter, ctx.source, ctx.sender_nickname or ctx.from_account, observe_text,
+                adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
                 msg_id=ctx.msg_id or None,
             )
             logger.info(
@@ -2674,19 +2584,40 @@ class DispatchMiddleware(InboundMiddleware):
                         if store:
                             session_entry = store.get_or_create_session(ctx.source)
                             history = store.load_transcript(session_entry.session_id)
+                            # First pass: exact match by message_id
+                            matched_content: Optional[str] = None
                             for msg in reversed(history or []):
                                 mid = msg.get("message_id", "")
                                 if mid and mid == ctx.reply_to_message_id:
                                     _content = msg.get("content", "")
                                     if isinstance(_content, str) and "|ybres:" in _content:
-                                        for m in _YB_RES_REF_RE.finditer(_content):
-                                            head = m.group(1)
-                                            rid = m.group(2)
-                                            kind, _, filename = head.partition(":")
-                                            kind = kind.strip()
-                                            if kind in _RESOLVABLE_MEDIA_KINDS:
-                                                ctx.quote_media_refs.append((rid, kind, filename.strip()))
+                                        matched_content = _content
                                     break
+                            # Second pass: if exact match failed (quote.id vs msg_id format
+                            # mismatch), fall back to the most recent observed message
+                            # that contains ybres media references.
+                            if matched_content is None:
+                                for msg in reversed(history or []):
+                                    if not msg.get("observed"):
+                                        continue
+                                    _content = msg.get("content", "")
+                                    if isinstance(_content, str) and "|ybres:" in _content:
+                                        matched_content = _content
+                                        logger.debug(
+                                            "[%s] quote transcript exact match failed "
+                                            "(reply_to=%s), fell back to most recent "
+                                            "observed media message",
+                                            adapter.name, ctx.reply_to_message_id,
+                                        )
+                                        break
+                            if matched_content:
+                                for m in _YB_RES_REF_RE.finditer(matched_content):
+                                    head = m.group(1)
+                                    rid = m.group(2)
+                                    kind, _, filename = head.partition(":")
+                                    kind = kind.strip()
+                                    if kind in _RESOLVABLE_MEDIA_KINDS:
+                                        ctx.quote_media_refs.append((rid, kind, filename.strip()))
                     except Exception as exc:
                         logger.warning(
                             "[%s] quote transcript lookup failed: %s",
