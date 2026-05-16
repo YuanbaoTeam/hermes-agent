@@ -2622,40 +2622,19 @@ class DispatchMiddleware(InboundMiddleware):
                         if store:
                             session_entry = store.get_or_create_session(ctx.source)
                             history = store.load_transcript(session_entry.session_id)
-                            # First pass: exact match by message_id
-                            matched_content: Optional[str] = None
                             for msg in reversed(history or []):
                                 mid = msg.get("message_id", "")
                                 if mid and mid == ctx.reply_to_message_id:
                                     _content = msg.get("content", "")
                                     if isinstance(_content, str) and "|ybres:" in _content:
-                                        matched_content = _content
+                                       for m in _YB_RES_REF_RE.finditer(_content):
+                                            head = m.group(1)
+                                            rid = m.group(2)
+                                            kind, _, filename = head.partition(":")
+                                            kind = kind.strip()
+                                            if kind in _RESOLVABLE_MEDIA_KINDS:
+                                                ctx.quote_media_refs.append((rid, kind, filename.strip()))
                                     break
-                            # Second pass: if exact match failed (quote.id vs msg_id format
-                            # mismatch), fall back to the most recent observed message
-                            # that contains ybres media references.
-                            if matched_content is None:
-                                for msg in reversed(history or []):
-                                    # if not msg.get("observed"):
-                                    #     continue
-                                    _content = msg.get("content", "")
-                                    if isinstance(_content, str) and "|ybres:" in _content:
-                                        matched_content = _content
-                                        logger.debug(
-                                            "[%s] quote transcript exact match failed "
-                                            "(reply_to=%s), fell back to most recent "
-                                            "observed media message",
-                                            adapter.name, ctx.reply_to_message_id,
-                                        )
-                                        break
-                            if matched_content:
-                                for m in _YB_RES_REF_RE.finditer(matched_content):
-                                    head = m.group(1)
-                                    rid = m.group(2)
-                                    kind, _, filename = head.partition(":")
-                                    kind = kind.strip()
-                                    if kind in _RESOLVABLE_MEDIA_KINDS:
-                                        ctx.quote_media_refs.append((rid, kind, filename.strip()))
                     except Exception as exc:
                         logger.warning(
                             "[%s] quote transcript lookup failed: %s",
