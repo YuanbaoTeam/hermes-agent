@@ -1850,10 +1850,56 @@ class ExtractContentMiddleware(InboundMiddleware):
                         pass
         return urls
 
+    # --- msg_id → resids cache ---
+    # Maps message IDs to their media resource IDs so that QuoteContextMiddleware
+    # can resolve quoted images even when cloud_custom_data.quote.desc is empty.
+    _msgid_to_resids: ClassVar[Dict[str, List[Tuple[str, str, str]]]] = {}  # msg_id -> [(rid, kind, filename)]
+    _MSGID_CACHE_MAX_SIZE: ClassVar[int] = 512
+
+    @classmethod
+    def _store_msgid_resids(cls, msg_id: str, resids: List[Tuple[str, str, str]]) -> None:
+        """Store msg_id → [(rid, kind, filename)] mapping for quote resolution."""
+        if not msg_id or not resids:
+            return
+        if len(cls._msgid_to_resids) >= cls._MSGID_CACHE_MAX_SIZE:
+            keys_to_remove = list(cls._msgid_to_resids.keys())[: cls._MSGID_CACHE_MAX_SIZE // 4]
+            for k in keys_to_remove:
+                cls._msgid_to_resids.pop(k, None)
+        cls._msgid_to_resids[msg_id] = resids
+
+    @classmethod
+    def get_resids_for_msg(cls, msg_id: str) -> List[Tuple[str, str, str]]:
+        """Look up cached resource IDs for a given message ID.
+
+        Returns list of (rid, kind, filename) tuples, or empty list.
+        """
+        if not msg_id:
+            return []
+        return cls._msgid_to_resids.get(msg_id, [])
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.link_urls = self._extract_link_urls(ctx.msg_body)
+
+        # Store msg_id → resids mapping for quote resolution.
+        # _extract_text embeds resource IDs as [image|ybres:RID] etc. in raw_text,
+        # so we extract them here — this covers ALL messages including observed ones
+        # that never reach MediaResolveMiddleware.
+        if ctx.msg_id and ctx.raw_text:
+            resids: List[Tuple[str, str, str]] = []
+            for m in _YB_RES_REF_RE.finditer(ctx.raw_text):
+                head = m.group(1)  # "image" | "file:<name>" | "voice" | "video"
+                rid = m.group(2)
+                kind, _, filename = head.partition(":")
+                resids.append((rid, kind.strip(), filename.strip()))
+            if resids:
+                self._store_msgid_resids(ctx.msg_id, resids)
+                logger.debug(
+                    "[%s] Stored msg_id→resids: msg_id=%s resids=%s",
+                    ctx.adapter.name, ctx.msg_id, resids,
+                )
+
         await next_fn()
 
 class PlaceholderFilterMiddleware(InboundMiddleware):
@@ -2194,32 +2240,24 @@ class QuoteContextMiddleware(InboundMiddleware):
         if not isinstance(quote, dict):
             return None, None, []
 
-        # type=2 corresponds to image reference; desc may be empty, provide a placeholder.
-        quote_type = int(quote.get("type") or 0)
-        desc = str(quote.get("desc") or "").strip()
-        if quote_type == 2 and not desc:
-            desc = "[image]"
-        if not desc:
-            return None, None, []
-
         quote_id = str(quote.get("id") or "").strip() or None
+        desc = str(quote.get("desc") or "").strip()
         sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
-        quote_text = f"{sender}: {desc}" if sender else desc
-
-        # Extract media references from desc using _YB_RES_REF_RE regex
-        media_refs: list = []
-        for m in _YB_RES_REF_RE.finditer(desc):
-            head = m.group(1)  # "image" | "file:<name>" | "voice" | "video"
-            rid = m.group(2)
-            kind, _, filename = head.partition(":")
-            kind = kind.strip()
-            media_refs.append((rid, kind, filename.strip()))
+        quote_text = (f"{sender}: {desc}" if sender else desc) if desc else None
+        # Resolve media refs from msg_id→resids cache (populated by
+        # ExtractContentMiddleware). Cache miss → empty list.
+        media_refs = ExtractContentMiddleware.get_resids_for_msg(quote_id) if quote_id else []
+        logger.debug(
+            "QuoteContext: quote_id=%r, cache_keys=%r, media_refs=%r",
+            quote_id,
+            list(ExtractContentMiddleware._msgid_to_resids.keys())[-10:],
+            media_refs,
+        )
 
         return quote_id, quote_text, media_refs
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.reply_to_message_id, ctx.reply_to_text, ctx.quote_media_refs = self._extract_quote_context(ctx.cloud_custom_data)
-
         await next_fn()
 
 
@@ -2598,8 +2636,8 @@ class DispatchMiddleware(InboundMiddleware):
                             # that contains ybres media references.
                             if matched_content is None:
                                 for msg in reversed(history or []):
-                                    if not msg.get("observed"):
-                                        continue
+                                    # if not msg.get("observed"):
+                                    #     continue
                                     _content = msg.get("content", "")
                                     if isinstance(_content, str) and "|ybres:" in _content:
                                         matched_content = _content
