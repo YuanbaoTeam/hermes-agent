@@ -2097,11 +2097,101 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         except Exception as exc:
             logger.warning("[%s] Failed to observe group message: %s", adapter.name, exc)
 
+    @staticmethod
+    async def _predownload_observed_media(adapter, msg_body: list) -> str:
+        """Pre-download media from an observed message and return patched text.
+
+        Extracts image/file references from msg_body, downloads them via
+        MediaResolveMiddleware, then returns a patched version of the extracted
+        text where [image|ybres:xxx] anchors are replaced with [image: /local/path].
+        If download fails or no media, returns empty string (caller uses original text).
+        """
+        # Extract media refs from msg_body
+        refs = ExtractContentMiddleware._extract_inbound_media_refs(msg_body)
+        if not refs:
+            return ""
+
+        # Filter to resolvable kinds only
+        resolvable = []
+        for ref in refs:
+            kind = str(ref.get("kind") or "").strip().lower()
+            url = str(ref.get("url") or "").strip()
+            if kind in _RESOLVABLE_MEDIA_KINDS and url:
+                rid = ExtractContentMiddleware._parse_resource_id(url)
+                resolvable.append((kind, url, rid, str(ref.get("name") or "").strip()))
+        if not resolvable:
+            return ""
+
+        # Download each media item
+        downloaded: List[Tuple[str, str, str]] = []  # (rid, local_path, mime)
+        for kind, url, rid, file_name in resolvable:
+            try:
+                fetch_url = await MediaResolveMiddleware._resolve_download_url(adapter, url)
+            except Exception as exc:
+                logger.debug(
+                    "[%s] observed pre-download resolve failed: url=%s err=%s",
+                    adapter.name, url[:80], exc,
+                )
+                continue
+            cached = await MediaResolveMiddleware._download_and_cache(
+                adapter,
+                fetch_url=fetch_url,
+                kind=kind,
+                file_name=file_name or None,
+                log_tag=f"observed-predownload rid={rid}",
+                resource_id=rid,
+            )
+            if cached is not None and rid:
+                downloaded.append((rid, cached[0], cached[1]))
+
+        if not downloaded:
+            return ""
+
+        # Build patched text from the raw_text that _extract_text would produce
+        raw_text = ExtractContentMiddleware._extract_text(msg_body)
+        patched = raw_text
+        for rid, local_path, mime in downloaded:
+            # Replace [image|ybres:<rid>] with [image: <local_path>]
+            anchor = f"[image|ybres:{rid}]"
+            if anchor in patched:
+                patched = patched.replace(anchor, f"[image: {local_path}]")
+                continue
+            # Also handle file anchors: [file:<name>|ybres:<rid>]
+            file_anchor_re = re.compile(r"\[file(?::[^|\]]*)?\|ybres:" + re.escape(rid) + r"\]")
+            file_match = file_anchor_re.search(patched)
+            if file_match:
+                label = os.path.basename(local_path)
+                patched = patched[:file_match.start()] + f"[file: {label} \u2192 {local_path}]" + patched[file_match.end():]
+
+        if patched != raw_text:
+            logger.debug(
+                "[%s] Observed media pre-downloaded: %d items",
+                adapter.name, len(downloaded),
+            )
+            return patched
+        return ""
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
         if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
+            # If message contains media, pre-download and use patched text
+            # so transcript stores local paths instead of ybres references.
+            observe_text = ctx.raw_text
+            if any(
+                elem.get("msg_type") in ("TIMImageElem", "TIMFileElem")
+                for elem in ctx.msg_body
+            ):
+                try:
+                    patched = await self._predownload_observed_media(adapter, ctx.msg_body)
+                    if patched:
+                        observe_text = patched
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Observed media pre-download failed, using raw text: %s",
+                        adapter.name, exc,
+                    )
             self._observe_group_message(
-                adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
+                adapter, ctx.source, ctx.sender_nickname or ctx.from_account, observe_text,
                 msg_id=ctx.msg_id or None,
             )
             logger.info(
@@ -2228,6 +2318,43 @@ class MediaResolveMiddleware(InboundMiddleware):
 
     name = "media-resolve"
 
+    # --- Resource download cache (keyed by resourceId) ---
+    # Avoids redundant downloads of the same resource within the TTL window.
+    _resource_cache: ClassVar[Dict[str, Tuple[str, str, float]]] = {}  # rid -> (local_path, mime, ts)
+    _RESOURCE_CACHE_TTL_S: ClassVar[int] = 24 * 60 * 60  # 24 hours
+    _RESOURCE_CACHE_MAX_SIZE: ClassVar[int] = 256
+
+    @classmethod
+    def _get_cached_resource(cls, resource_id: str) -> Optional[Tuple[str, str]]:
+        """Return cached (local_path, mime) if still valid and file exists, else None."""
+        if not resource_id:
+            return None
+        entry = cls._resource_cache.get(resource_id)
+        if entry is None:
+            return None
+        local_path, mime, ts = entry
+        if time.time() - ts > cls._RESOURCE_CACHE_TTL_S:
+            cls._resource_cache.pop(resource_id, None)
+            return None
+        # Verify the cached file still exists on disk
+        if not os.path.isfile(local_path):
+            cls._resource_cache.pop(resource_id, None)
+            return None
+        return local_path, mime
+
+    @classmethod
+    def _put_cached_resource(cls, resource_id: str, local_path: str, mime: str) -> None:
+        """Store download result in cache. Evicts oldest entries when over capacity."""
+        if not resource_id:
+            return
+        # Simple eviction: remove oldest entries when exceeding max size
+        if len(cls._resource_cache) >= cls._RESOURCE_CACHE_MAX_SIZE:
+            # Remove the oldest 25% entries by timestamp
+            sorted_keys = sorted(cls._resource_cache, key=lambda k: cls._resource_cache[k][2])
+            for k in sorted_keys[: cls._RESOURCE_CACHE_MAX_SIZE // 4]:
+                cls._resource_cache.pop(k, None)
+        cls._resource_cache[resource_id] = (local_path, mime, time.time())
+
     @staticmethod
     def _guess_image_ext_from_url(url: str) -> str:
         """Guess image extension from URL path."""
@@ -2325,8 +2452,23 @@ class MediaResolveMiddleware(InboundMiddleware):
     async def _download_and_cache(
         cls, adapter, *, fetch_url: str, kind: str,
         file_name: Optional[str] = None, log_tag: str = "",
+        resource_id: str = "",
     ) -> Optional[Tuple[str, str]]:
-        """Download a Yuanbao resource and cache locally. Returns ``(local_path, mime)`` or ``None``."""
+        """Download a Yuanbao resource and cache locally. Returns ``(local_path, mime)`` or ``None``.
+
+        If *resource_id* is provided, a memory-level cache keyed by resourceId
+        is consulted first to avoid redundant downloads of the same resource.
+        """
+        # Check in-memory cache first
+        if resource_id:
+            hit = cls._get_cached_resource(resource_id)
+            if hit is not None:
+                logger.debug(
+                    "[%s] resource cache hit: rid=%s path=%s",
+                    adapter.name, resource_id, hit[0],
+                )
+                return hit
+
         try:
             file_bytes, content_type = await media_download_url(
                 fetch_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
@@ -2351,6 +2493,7 @@ class MediaResolveMiddleware(InboundMiddleware):
             mime = guess_mime_type(f"image{ext}")
             if not mime.startswith("image/"):
                 mime = content_type if content_type.startswith("image/") else "image/jpeg"
+            cls._put_cached_resource(resource_id, local_path, mime)
             return local_path, mime
 
         # kind == "file"
@@ -2366,6 +2509,7 @@ class MediaResolveMiddleware(InboundMiddleware):
             )
             return None
         mime = guess_mime_type(file_name) or content_type or "application/octet-stream"
+        cls._put_cached_resource(resource_id, local_path, mime)
         return local_path, mime
 
     @classmethod
@@ -2391,6 +2535,9 @@ class MediaResolveMiddleware(InboundMiddleware):
             if kind not in _RESOLVABLE_MEDIA_KINDS or not url:
                 continue
 
+            # Extract resourceId from URL for cache dedup
+            rid = ExtractContentMiddleware._parse_resource_id(url)
+
             try:
                 fetch_url = await cls._resolve_download_url(adapter, url)
             except Exception as exc:
@@ -2406,6 +2553,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                 kind=kind,
                 file_name=str(ref.get("name") or "").strip() or None,
                 log_tag=f"placeholder_url={url[:80]}",
+                resource_id=rid,
             )
             if cached is None:
                 continue
@@ -2478,6 +2626,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                 kind=kind,
                 file_name=filename or None,
                 log_tag=f"rid={rid}",
+                resource_id=rid,
             )
             if cached is None:
                 continue
@@ -2561,6 +2710,7 @@ class DispatchMiddleware(InboundMiddleware):
                         kind=kind,
                         file_name=filename or None,
                         log_tag=f"quote rid={rid}",
+                        resource_id=rid,
                     )
                     if cached is None:
                         continue
