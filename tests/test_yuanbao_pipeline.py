@@ -39,6 +39,7 @@ from gateway.platforms.yuanbao import (
     OwnerCommandMiddleware,
     BuildSourceMiddleware,
     GroupAtGuardMiddleware,
+    QuoteContextMiddleware,
     DispatchMiddleware,
     InboundPipelineBuilder,
     YuanbaoAdapter,
@@ -1027,3 +1028,282 @@ class TestPipelineOOPRegistration:
         pipeline = InboundPipeline().use(MwA()).use(MwC())
         pipeline.use_after("a", MwB())
         assert pipeline.middleware_names == ["a", "b", "c"]
+
+
+# ============================================================
+# ExtractContentMiddleware msg_id→resids Cache Tests
+# ============================================================
+
+class TestExtractContentMiddlewareResidsCache:
+    """Tests for ExtractContentMiddleware._msgid_to_resids cache."""
+
+    def setup_method(self):
+        """Clear the class-level cache before each test."""
+        ExtractContentMiddleware._msgid_to_resids.clear()
+
+    def teardown_method(self):
+        """Clean up cache after each test."""
+        ExtractContentMiddleware._msgid_to_resids.clear()
+
+    def test_store_and_get_resids(self):
+        """Basic store and retrieve works."""
+        resids = [("rid1", "image", ""), ("rid2", "file", "doc.pdf")]
+        ExtractContentMiddleware._store_msgid_resids("msg-100", resids)
+
+        result = ExtractContentMiddleware.get_resids_for_msg("msg-100")
+        assert result == resids
+
+    def test_get_nonexistent_returns_empty(self):
+        """Cache miss returns empty list."""
+        result = ExtractContentMiddleware.get_resids_for_msg("nonexistent-id")
+        assert result == []
+
+    def test_get_none_returns_empty(self):
+        """Passing None or empty string returns empty list."""
+        assert ExtractContentMiddleware.get_resids_for_msg(None) == []
+        assert ExtractContentMiddleware.get_resids_for_msg("") == []
+
+    def test_store_ignores_empty_msg_id(self):
+        """Store with empty msg_id does nothing."""
+        ExtractContentMiddleware._store_msgid_resids("", [("rid1", "image", "")])
+        assert len(ExtractContentMiddleware._msgid_to_resids) == 0
+
+    def test_store_ignores_empty_resids(self):
+        """Store with empty resids list does nothing."""
+        ExtractContentMiddleware._store_msgid_resids("msg-100", [])
+        assert len(ExtractContentMiddleware._msgid_to_resids) == 0
+
+    def test_eviction_when_full(self):
+        """When cache exceeds max size, oldest 25% entries are evicted."""
+        original_max = ExtractContentMiddleware._MSGID_CACHE_MAX_SIZE
+        try:
+            # Use a small max size for testing
+            ExtractContentMiddleware._MSGID_CACHE_MAX_SIZE = 8
+
+            # Fill up to capacity
+            for i in range(8):
+                ExtractContentMiddleware._store_msgid_resids(
+                    f"msg-{i}", [(f"rid-{i}", "image", "")]
+                )
+            assert len(ExtractContentMiddleware._msgid_to_resids) == 8
+
+            # Add one more — should evict oldest 25% (2 entries: msg-0, msg-1)
+            ExtractContentMiddleware._store_msgid_resids("msg-new", [("rid-new", "image", "")])
+            assert "msg-0" not in ExtractContentMiddleware._msgid_to_resids
+            assert "msg-1" not in ExtractContentMiddleware._msgid_to_resids
+            # Recent entries still present
+            assert "msg-7" in ExtractContentMiddleware._msgid_to_resids
+            assert "msg-new" in ExtractContentMiddleware._msgid_to_resids
+        finally:
+            ExtractContentMiddleware._MSGID_CACHE_MAX_SIZE = original_max
+
+    @pytest.mark.asyncio
+    async def test_handle_populates_cache_from_raw_text(self):
+        """ExtractContentMiddleware.handle() stores resids from raw_text into cache."""
+        adapter = make_adapter()
+        msg_body = [
+            {"msg_type": "TIMImageElem", "msg_content": {
+                "image_info_array": [
+                    {"url": "https://cdn.example.com/img?resourceId=abc123&type=img"},
+                ]
+            }},
+        ]
+        ctx = make_ctx(adapter=adapter, msg_body=msg_body, msg_id="msg-with-image")
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        # raw_text should contain ybres reference
+        assert "ybres:abc123" in ctx.raw_text
+        # Cache should have the entry
+        cached = ExtractContentMiddleware.get_resids_for_msg("msg-with-image")
+        assert len(cached) == 1
+        assert cached[0][0] == "abc123"  # rid
+        assert cached[0][1] == "image"   # kind
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_no_cache_for_text_only_message(self):
+        """ExtractContentMiddleware.handle() does not cache messages without ybres refs."""
+        adapter = make_adapter()
+        msg_body = [
+            {"msg_type": "TIMTextElem", "msg_content": {"text": "Just text"}},
+        ]
+        ctx = make_ctx(adapter=adapter, msg_body=msg_body, msg_id="msg-text-only")
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        assert ExtractContentMiddleware.get_resids_for_msg("msg-text-only") == []
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_no_cache_without_msg_id(self):
+        """ExtractContentMiddleware.handle() does not cache if msg_id is empty."""
+        adapter = make_adapter()
+        msg_body = [
+            {"msg_type": "TIMImageElem", "msg_content": {
+                "image_info_array": [
+                    {"url": "https://cdn.example.com/img?resourceId=xyz789"},
+                ]
+            }},
+        ]
+        ctx = make_ctx(adapter=adapter, msg_body=msg_body, msg_id="")
+        next_fn = AsyncMock()
+
+        await ExtractContentMiddleware()(ctx, next_fn)
+
+        # No entry should be cached
+        assert len(ExtractContentMiddleware._msgid_to_resids) == 0
+        next_fn.assert_awaited_once()
+
+
+# ============================================================
+# QuoteContextMiddleware Tests
+# ============================================================
+
+class TestQuoteContextMiddleware:
+    """Tests for QuoteContextMiddleware and its cache-based media resolution."""
+
+    def setup_method(self):
+        """Clear cache before each test."""
+        ExtractContentMiddleware._msgid_to_resids.clear()
+
+    def teardown_method(self):
+        """Clean up cache after each test."""
+        ExtractContentMiddleware._msgid_to_resids.clear()
+
+    def test_extract_quote_context_no_cloud_data(self):
+        """Returns (None, None, []) when cloud_custom_data is empty."""
+        result = QuoteContextMiddleware._extract_quote_context("")
+        assert result == (None, None, [])
+
+    def test_extract_quote_context_no_quote_key(self):
+        """Returns (None, None, []) when JSON has no 'quote' key."""
+        cloud_data = json.dumps({"foo": "bar"})
+        result = QuoteContextMiddleware._extract_quote_context(cloud_data)
+        assert result == (None, None, [])
+
+    def test_extract_quote_context_with_desc(self):
+        """Extracts quote_id and quote_text from desc."""
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "quoted-msg-001",
+                "desc": "Hello world",
+                "sender_nickname": "Alice",
+            }
+        })
+        quote_id, quote_text, media_refs = QuoteContextMiddleware._extract_quote_context(cloud_data)
+        assert quote_id == "quoted-msg-001"
+        assert quote_text == "Alice: Hello world"
+        assert media_refs == []  # No cache entry
+
+    def test_extract_quote_context_resolves_from_cache(self):
+        """Resolves media_refs from ExtractContentMiddleware cache."""
+        # Pre-populate cache (simulating an earlier message that went through
+        # ExtractContentMiddleware)
+        ExtractContentMiddleware._store_msgid_resids(
+            "quoted-msg-002",
+            [("rid-img-1", "image", ""), ("rid-file-1", "file", "report.pdf")],
+        )
+
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "quoted-msg-002",
+                "desc": "",  # Empty desc — common on Yuanbao
+                "sender_nickname": "Bob",
+            }
+        })
+        quote_id, quote_text, media_refs = QuoteContextMiddleware._extract_quote_context(cloud_data)
+        assert quote_id == "quoted-msg-002"
+        assert quote_text is None  # desc is empty
+        assert len(media_refs) == 2
+        assert media_refs[0] == ("rid-img-1", "image", "")
+        assert media_refs[1] == ("rid-file-1", "file", "report.pdf")
+
+    def test_extract_quote_context_cache_miss_returns_empty(self):
+        """When quote_id is not in cache, media_refs is empty list."""
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "never-cached-msg",
+                "desc": "[image]",
+                "sender_nickname": "Charlie",
+            }
+        })
+        quote_id, quote_text, media_refs = QuoteContextMiddleware._extract_quote_context(cloud_data)
+        assert quote_id == "never-cached-msg"
+        assert quote_text == "Charlie: [image]"
+        assert media_refs == []
+
+    def test_extract_quote_context_no_quote_id(self):
+        """When quote.id is empty, no cache lookup is attempted."""
+        ExtractContentMiddleware._store_msgid_resids("some-id", [("rid1", "image", "")])
+
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "",
+                "desc": "some text",
+            }
+        })
+        quote_id, quote_text, media_refs = QuoteContextMiddleware._extract_quote_context(cloud_data)
+        assert quote_id is None
+        assert media_refs == []
+
+    @pytest.mark.asyncio
+    async def test_handle_sets_ctx_fields(self):
+        """QuoteContextMiddleware.handle() sets ctx.reply_to_message_id, reply_to_text, quote_media_refs."""
+        ExtractContentMiddleware._store_msgid_resids(
+            "quoted-msg-003",
+            [("rid-video-1", "video", "")],
+        )
+
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "quoted-msg-003",
+                "desc": "Check this video",
+                "sender_nickname": "Dave",
+            }
+        })
+        adapter = make_adapter()
+        ctx = make_ctx(adapter=adapter, cloud_custom_data=cloud_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id == "quoted-msg-003"
+        assert ctx.reply_to_text == "Dave: Check this video"
+        assert ctx.quote_media_refs == [("rid-video-1", "video", "")]
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_extract_then_quote(self):
+        """End-to-end: ExtractContentMiddleware caches, QuoteContextMiddleware reads."""
+        adapter = make_adapter()
+
+        # Step 1: Simulate an inbound image message going through ExtractContentMiddleware
+        img_msg_body = [
+            {"msg_type": "TIMImageElem", "msg_content": {
+                "image_info_array": [
+                    {"url": "https://cdn.example.com/img?resourceId=e2e_rid_001&type=pic"},
+                ]
+            }},
+        ]
+        ctx1 = make_ctx(adapter=adapter, msg_body=img_msg_body, msg_id="original-msg-100")
+        await ExtractContentMiddleware()(ctx1, AsyncMock())
+
+        # Verify cache is populated
+        assert ExtractContentMiddleware.get_resids_for_msg("original-msg-100") != []
+
+        # Step 2: Simulate a quote reply referencing the original message
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "original-msg-100",
+                "desc": "",
+                "sender_nickname": "Eve",
+            }
+        })
+        ctx2 = make_ctx(adapter=adapter, cloud_custom_data=cloud_data)
+        await QuoteContextMiddleware()(ctx2, AsyncMock())
+
+        assert ctx2.reply_to_message_id == "original-msg-100"
+        assert ctx2.quote_media_refs == [("e2e_rid_001", "image", "")]

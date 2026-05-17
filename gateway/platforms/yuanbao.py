@@ -1850,10 +1850,56 @@ class ExtractContentMiddleware(InboundMiddleware):
                         pass
         return urls
 
+    # --- msg_id → resids cache ---
+    # Maps message IDs to their media resource IDs so that QuoteContextMiddleware
+    # can resolve quoted images even when cloud_custom_data.quote.desc is empty.
+    _msgid_to_resids: ClassVar[Dict[str, List[Tuple[str, str, str]]]] = {}  # msg_id -> [(rid, kind, filename)]
+    _MSGID_CACHE_MAX_SIZE: ClassVar[int] = 512
+
+    @classmethod
+    def _store_msgid_resids(cls, msg_id: str, resids: List[Tuple[str, str, str]]) -> None:
+        """Store msg_id → [(rid, kind, filename)] mapping for quote resolution."""
+        if not msg_id or not resids:
+            return
+        if len(cls._msgid_to_resids) >= cls._MSGID_CACHE_MAX_SIZE:
+            keys_to_remove = list(cls._msgid_to_resids.keys())[: cls._MSGID_CACHE_MAX_SIZE // 4]
+            for k in keys_to_remove:
+                cls._msgid_to_resids.pop(k, None)
+        cls._msgid_to_resids[msg_id] = resids
+
+    @classmethod
+    def get_resids_for_msg(cls, msg_id: str) -> List[Tuple[str, str, str]]:
+        """Look up cached resource IDs for a given message ID.
+
+        Returns list of (rid, kind, filename) tuples, or empty list.
+        """
+        if not msg_id:
+            return []
+        return cls._msgid_to_resids.get(msg_id, [])
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.link_urls = self._extract_link_urls(ctx.msg_body)
+
+        # Store msg_id → resids mapping for quote resolution.
+        # _extract_text embeds resource IDs as [image|ybres:RID] etc. in raw_text,
+        # so we extract them here — this covers ALL messages including observed ones
+        # that never reach MediaResolveMiddleware.
+        if ctx.msg_id and ctx.raw_text:
+            resids: List[Tuple[str, str, str]] = []
+            for m in _YB_RES_REF_RE.finditer(ctx.raw_text):
+                head = m.group(1)  # "image" | "file:<name>" | "voice" | "video"
+                rid = m.group(2)
+                kind, _, filename = head.partition(":")
+                resids.append((rid, kind.strip(), filename.strip()))
+            if resids:
+                self._store_msgid_resids(ctx.msg_id, resids)
+                logger.debug(
+                    "[%s] Stored msg_id→resids: msg_id=%s resids=%s",
+                    ctx.adapter.name, ctx.msg_id, resids,
+                )
+
         await next_fn()
 
 class PlaceholderFilterMiddleware(InboundMiddleware):
@@ -2194,32 +2240,18 @@ class QuoteContextMiddleware(InboundMiddleware):
         if not isinstance(quote, dict):
             return None, None, []
 
-        # type=2 corresponds to image reference; desc may be empty, provide a placeholder.
-        quote_type = int(quote.get("type") or 0)
-        desc = str(quote.get("desc") or "").strip()
-        if quote_type == 2 and not desc:
-            desc = "[image]"
-        if not desc:
-            return None, None, []
-
         quote_id = str(quote.get("id") or "").strip() or None
+        desc = str(quote.get("desc") or "").strip()
         sender = str(quote.get("sender_nickname") or quote.get("sender_id") or "").strip()
-        quote_text = f"{sender}: {desc}" if sender else desc
-
-        # Extract media references from desc using _YB_RES_REF_RE regex
-        media_refs: list = []
-        for m in _YB_RES_REF_RE.finditer(desc):
-            head = m.group(1)  # "image" | "file:<name>" | "voice" | "video"
-            rid = m.group(2)
-            kind, _, filename = head.partition(":")
-            kind = kind.strip()
-            media_refs.append((rid, kind, filename.strip()))
+        quote_text = (f"{sender}: {desc}" if sender else desc) if desc else None
+        # Resolve media refs from msg_id→resids cache (populated by
+        # ExtractContentMiddleware). Cache miss → empty list.
+        media_refs = ExtractContentMiddleware.get_resids_for_msg(quote_id) if quote_id else []
 
         return quote_id, quote_text, media_refs
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.reply_to_message_id, ctx.reply_to_text, ctx.quote_media_refs = self._extract_quote_context(ctx.cloud_custom_data)
-
         await next_fn()
 
 
@@ -2227,6 +2259,43 @@ class MediaResolveMiddleware(InboundMiddleware):
     """Resolve inbound media references to downloadable URLs."""
 
     name = "media-resolve"
+
+    # --- Resource download cache (keyed by resourceId) ---
+    # Avoids redundant downloads of the same resource within the TTL window.
+    _resource_cache: ClassVar[Dict[str, Tuple[str, str, float]]] = {}  # rid -> (local_path, mime, ts)
+    _RESOURCE_CACHE_TTL_S: ClassVar[int] = 24 * 60 * 60  # 24 hours
+    _RESOURCE_CACHE_MAX_SIZE: ClassVar[int] = 256
+
+    @classmethod
+    def _get_cached_resource(cls, resource_id: str) -> Optional[Tuple[str, str]]:
+        """Return cached (local_path, mime) if still valid and file exists, else None."""
+        if not resource_id:
+            return None
+        entry = cls._resource_cache.get(resource_id)
+        if entry is None:
+            return None
+        local_path, mime, ts = entry
+        if time.time() - ts > cls._RESOURCE_CACHE_TTL_S:
+            cls._resource_cache.pop(resource_id, None)
+            return None
+        # Verify the cached file still exists on disk
+        if not os.path.isfile(local_path):
+            cls._resource_cache.pop(resource_id, None)
+            return None
+        return local_path, mime
+
+    @classmethod
+    def _put_cached_resource(cls, resource_id: str, local_path: str, mime: str) -> None:
+        """Store download result in cache. Evicts oldest entries when over capacity."""
+        if not resource_id:
+            return
+        # Simple eviction: remove oldest entries when exceeding max size
+        if len(cls._resource_cache) >= cls._RESOURCE_CACHE_MAX_SIZE:
+            # Remove the oldest 25% entries by timestamp
+            sorted_keys = sorted(cls._resource_cache, key=lambda k: cls._resource_cache[k][2])
+            for k in sorted_keys[: cls._RESOURCE_CACHE_MAX_SIZE // 4]:
+                cls._resource_cache.pop(k, None)
+        cls._resource_cache[resource_id] = (local_path, mime, time.time())
 
     @staticmethod
     def _guess_image_ext_from_url(url: str) -> str:
@@ -2325,8 +2394,23 @@ class MediaResolveMiddleware(InboundMiddleware):
     async def _download_and_cache(
         cls, adapter, *, fetch_url: str, kind: str,
         file_name: Optional[str] = None, log_tag: str = "",
+        resource_id: str = "",
     ) -> Optional[Tuple[str, str]]:
-        """Download a Yuanbao resource and cache locally. Returns ``(local_path, mime)`` or ``None``."""
+        """Download a Yuanbao resource and cache locally. Returns ``(local_path, mime)`` or ``None``.
+
+        If *resource_id* is provided, a memory-level cache keyed by resourceId
+        is consulted first to avoid redundant downloads of the same resource.
+        """
+        # Check in-memory cache first
+        if resource_id:
+            hit = cls._get_cached_resource(resource_id)
+            if hit is not None:
+                logger.debug(
+                    "[%s] resource cache hit: rid=%s path=%s",
+                    adapter.name, resource_id, hit[0],
+                )
+                return hit
+
         try:
             file_bytes, content_type = await media_download_url(
                 fetch_url, max_size_mb=adapter.MEDIA_MAX_SIZE_MB,
@@ -2351,6 +2435,7 @@ class MediaResolveMiddleware(InboundMiddleware):
             mime = guess_mime_type(f"image{ext}")
             if not mime.startswith("image/"):
                 mime = content_type if content_type.startswith("image/") else "image/jpeg"
+            cls._put_cached_resource(resource_id, local_path, mime)
             return local_path, mime
 
         # kind == "file"
@@ -2366,6 +2451,7 @@ class MediaResolveMiddleware(InboundMiddleware):
             )
             return None
         mime = guess_mime_type(file_name) or content_type or "application/octet-stream"
+        cls._put_cached_resource(resource_id, local_path, mime)
         return local_path, mime
 
     @classmethod
@@ -2391,6 +2477,9 @@ class MediaResolveMiddleware(InboundMiddleware):
             if kind not in _RESOLVABLE_MEDIA_KINDS or not url:
                 continue
 
+            # Extract resourceId from URL for cache dedup
+            rid = ExtractContentMiddleware._parse_resource_id(url)
+
             try:
                 fetch_url = await cls._resolve_download_url(adapter, url)
             except Exception as exc:
@@ -2406,6 +2495,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                 kind=kind,
                 file_name=str(ref.get("name") or "").strip() or None,
                 log_tag=f"placeholder_url={url[:80]}",
+                resource_id=rid,
             )
             if cached is None:
                 continue
@@ -2478,6 +2568,7 @@ class MediaResolveMiddleware(InboundMiddleware):
                 kind=kind,
                 file_name=filename or None,
                 log_tag=f"rid={rid}",
+                resource_id=rid,
             )
             if cached is None:
                 continue
@@ -2561,6 +2652,7 @@ class DispatchMiddleware(InboundMiddleware):
                         kind=kind,
                         file_name=filename or None,
                         log_tag=f"quote rid={rid}",
+                        resource_id=rid,
                     )
                     if cached is None:
                         continue
