@@ -147,6 +147,12 @@ _YB_RES_REF_RE = re.compile(
     r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]"
 )
 
+# Patched local-media anchors once an inbound resource has been downloaded to the local cache. 
+#   [image: /opt/data/image_cache/img_xxx.bmp]
+#   [file: report.pdf → /opt/data/.../report.pdf]
+#   (and any future kind, e.g. [video: /opt/.../clip.mp4])
+_YB_LOCAL_MEDIA_RE = re.compile(r"\[(\w+):[^\]]*?(/[^\]]+?)\s*\]")
+
 # Media kinds that can be resolved and injected into the model context
 _RESOLVABLE_MEDIA_KINDS = frozenset({"image", "file"})
 
@@ -2597,6 +2603,51 @@ class MediaResolveMiddleware(InboundMiddleware):
             adapter, quote_media_refs, log_prefix="quote",
         )
 
+    @staticmethod
+    def _collect_quote_local_media(ctx: InboundContext) -> Tuple[List[str], List[str]]:
+        """Private-chat fallback for recovering already-local quoted media.
+
+        Only already-local media is handled here: by the time a turn is cached,
+        ``PatchAnchorsMiddleware`` has rewritten resolved ``|ybres:`` anchors to
+        ``[image: /path]`` / ``[file: name → /path]``. Unresolved anchors are an
+        original-turn resolution failure and belong to that turn's handling, not
+        this quote fallback — so no re-download happens here.
+
+        Returns ``(local_paths, mimes)`` for media already downloaded to the
+        local cache on its original turn, ready to inject as-is.
+        """
+        paths: List[str] = []
+        mimes: List[str] = []
+        rid_key = ctx.reply_to_message_id
+        if not rid_key:
+            return paths, mimes
+        cache = getattr(ctx.adapter, "_msg_content_cache", None)
+        if not cache:
+            return paths, mimes
+        text = cache.get(rid_key)
+        if not isinstance(text, str) or not text:
+            return paths, mimes
+
+        # Already-local media paths written by PatchAnchorsMiddleware. The
+        # generic anchor regex covers every kind _patch emits (image/file today,
+        # video/audio if they later become resolvable) without per-kind upkeep.
+        seen: set = set()
+        for m in _YB_LOCAL_MEDIA_RE.finditer(text):
+            kind = (m.group(1) or "").strip().lower()
+            path = (m.group(2) or "").strip()
+            if not path or path in seen:
+                continue
+            if not os.path.exists(path):
+                continue
+            seen.add(path)
+            mime = guess_mime_type(os.path.basename(path)) or (
+                "image/jpeg" if kind == "image" else "application/octet-stream"
+            )
+            paths.append(path)
+            mimes.append(mime)
+
+        return paths, mimes
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         # NOTE: Reaching this middleware in a group chat implies the message has
         # @-mentioned the bot (or is an owner command). GroupAtGuardMiddleware
@@ -2628,6 +2679,12 @@ class MediaResolveMiddleware(InboundMiddleware):
         if ctx.reply_to_message_id is not None:
             if ctx.quote_media_refs:
                 _add_unique_pairs(await self._resolve_quote_media(adapter, ctx.quote_media_refs))
+            else:
+                # DM quote fallback: no transcript message_id match (DM user rows
+                # carry no platform message_id), so recover already-local media
+                # from the adapter msg cache. Patched on its original turn — no
+                # re-download needed, inject as-is.
+                _add_unique_pairs(self._collect_quote_local_media(ctx))
         elif ctx.chat_type == "group":
             # Group chats: only @-bot turns reach this middleware
             # (see GroupAtGuardMiddleware note at top of handle()),
