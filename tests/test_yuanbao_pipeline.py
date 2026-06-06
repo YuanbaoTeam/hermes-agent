@@ -705,6 +705,7 @@ class TestCreateInboundPipeline:
             "group-attribution",
             "classify-msg-type",
             "quote-context",
+            "forwarded-records-parse",
             "media-resolve",
             "patch-anchors",
             "dispatch",

@@ -492,6 +492,29 @@ def decode_biz_msg(data: bytes) -> dict:
 #   field 10: url (string)
 #   field 11: file_size (uint32)
 #   field 12: file_name (string)
+#   field 999: ext_map (map<string, string>)  ← 微信聊天记录转发扩展信息
+#       protobuf map 在线上编码为 repeated message entry，每个 entry：
+#         field 1: key (string)
+#         field 2: value (string)
+#       key 拼接规则: wexin_forward_msg_[forward_msg_id]_[userid]
+#       value: base64(ForwardMsgData protobuf)  ← 注意不是 JSON，是 base64 编码的
+#              protobuf 二进制，需用 decode_forward_msg_data() 解析。
+
+
+def _encode_map_entry(key: str, value: str) -> bytes:
+    """编码 protobuf map<string, string> 的单个 entry（field 1 key, field 2 value）。"""
+    buf = b""
+    if key:
+        buf += _encode_field(1, WT_LEN, _encode_string(str(key)))
+    if value:
+        buf += _encode_field(2, WT_LEN, _encode_string(str(value)))
+    return buf
+
+
+def _decode_map_entry(data: bytes) -> tuple[str, str]:
+    """解码 protobuf map<string, string> 的单个 entry，返回 (key, value)。"""
+    fdict = _fields_to_dict(_parse_fields(data))
+    return _get_string(fdict, 1), _get_string(fdict, 2)
 
 
 def _encode_msg_content(content: dict) -> bytes:
@@ -518,6 +541,12 @@ def _encode_msg_content(content: dict) -> bytes:
         if url:
             img_buf += _encode_field(5, WT_LEN, _encode_string(url))
         buf += _encode_field(8, WT_LEN, _encode_message(img_buf))
+    # ext_map (map<string, string>, field 999) — repeated message entries
+    ext_map = content.get("ext_map")
+    if isinstance(ext_map, dict):
+        for k, v in ext_map.items():
+            entry_bytes = _encode_map_entry(str(k), str(v))
+            buf += _encode_field(999, WT_LEN, _encode_message(entry_bytes))
     return buf
 
 
@@ -550,6 +579,14 @@ def _decode_msg_content(data: bytes) -> dict:
             imgs.append(img)
     if imgs:
         content["image_info_array"] = imgs
+    # ext_map (field 999) — decode repeated map entries into a plain dict
+    ext_map: dict[str, str] = {}
+    for entry_bytes in _get_repeated_bytes(fdict, 999):
+        k, v = _decode_map_entry(entry_bytes)
+        if k:
+            ext_map[k] = v
+    if ext_map:
+        content["ext_map"] = ext_map
     return content
 
 
@@ -710,9 +747,178 @@ def decode_inbound_push(data: bytes) -> Optional[dict]:
 
 
 # ============================================================
+# 微信转发聊天记录解析（ForwardMsgData）
+# ============================================================
+#
+# ext_map["wexin_forward_msg_<id>_<userid>"] 的 value 是 base64 编码的
+# ForwardMsgData protobuf（不是 JSON）。protobuf 结构（按真实抓包确认）：
+#
+#   message ForwardMsgData {
+#     uint32 sub_type   = 1;   // 1 = 微信聊天记录转发
+#     uint32 begin_time = 2;
+#     uint32 end_time   = 3;
+#     string nick_name  = 4;   // 转发者微信昵称
+#     repeated ForwardMsg msg = 5;
+#   }
+#   message ForwardMsg {
+#     string sender    = 1;
+#     uint32 time      = 2;
+#     string plainText = 3;
+#     repeated MsgContent msgContent = 4;
+#   }
+#   message MsgContent {
+#     uint32 type = 1;                  // 1=TEXT, 2=MULTIMEDIA, 3=nested forward
+#     string text = 2;                  // type==1
+#     repeated Multimedia multimedia = 3;  // type==2
+#   }
+#   message Multimedia {
+#     string type      = 1;   // image / file / document / url / video
+#     string url       = 2;
+#     string file_name = 4;
+#     uint32 file_size = 5;
+#     uint32 width     = 6;
+#     uint32 height    = 7;
+#     string media_id  = 15;  // 直接可用作 ybres RID
+#     string res_type  = 24;
+#   }
+
+
+def _decode_forward_multimedia(data: bytes) -> dict:
+    """解码单个 Multimedia 子消息，返回 _format_multimedia 期望的 dict。"""
+    fdict = _fields_to_dict(_parse_fields(data))
+    media: dict = {}
+    mtype = _get_string(fdict, 1)
+    if mtype:
+        media["type"] = mtype
+    url = _get_string(fdict, 2)
+    if url:
+        media["url"] = url
+    file_name = _get_string(fdict, 4)
+    if file_name:
+        media["file_name"] = file_name
+    file_size = _get_varint(fdict, 5)
+    if file_size:
+        media["file_size"] = file_size
+    media_id = _get_string(fdict, 15)
+    if media_id:
+        media["media_id"] = media_id
+    return media
+
+
+def _decode_forward_msg_content(data: bytes) -> dict:
+    """解码单个 MsgContent 子消息，返回 {type, text?, multimedia?}。"""
+    fdict = _fields_to_dict(_parse_fields(data))
+    content: dict = {"type": _get_varint(fdict, 1)}
+    text = _get_string(fdict, 2)
+    if text:
+        content["text"] = text
+    multimedia = [
+        _decode_forward_multimedia(b) for b in _get_repeated_bytes(fdict, 3)
+    ]
+    if multimedia:
+        content["multimedia"] = multimedia
+    return content
+
+
+def _decode_forward_msg(data: bytes) -> dict:
+    """解码单个 ForwardMsg 子消息，返回 {sender, plainText, msgContent}。"""
+    fdict = _fields_to_dict(_parse_fields(data))
+    return {
+        "sender": _get_string(fdict, 1),
+        "time": _get_varint(fdict, 2),
+        "plainText": _get_string(fdict, 3),
+        "msgContent": [
+            _decode_forward_msg_content(b) for b in _get_repeated_bytes(fdict, 4)
+        ],
+    }
+
+
+def decode_forward_msg_data(data: bytes) -> Optional[dict]:
+    """解析 ForwardMsgData protobuf bytes（ext_map value base64 解码后的内容）。
+
+    Args:
+        data: base64 解码后的 ForwardMsgData protobuf bytes。
+
+    Returns:
+        与 ``ForwardedRecordsParseMiddleware.build_forward_text`` 消费的
+        结构一致的 dict（``sub_type`` / ``nick_name`` / ``msg`` 列表），解析失败
+        返回 ``None``。
+    """
+    try:
+        fdict = _fields_to_dict(_parse_fields(data))
+        return {
+            "sub_type": _get_varint(fdict, 1),
+            "begin_time": _get_varint(fdict, 2),
+            "end_time": _get_varint(fdict, 3),
+            "nick_name": _get_string(fdict, 4),
+            "msg": [_decode_forward_msg(b) for b in _get_repeated_bytes(fdict, 5)],
+        }
+    except Exception as e:
+        if DEBUG_MODE:
+            logger.debug("[yuanbao_proto] decode_forward_msg_data failed: %s", e)
+        return None
+
+
+def _encode_forward_multimedia(media: dict) -> bytes:
+    buf = b""
+    for fn, key in [(1, "type"), (2, "url"), (4, "file_name"), (15, "media_id")]:
+        v = media.get(key, "")
+        if v:
+            buf += _encode_field(fn, WT_LEN, _encode_string(str(v)))
+    for fn, key in [(5, "file_size"), (6, "width"), (7, "height")]:
+        v = media.get(key, 0)
+        if v:
+            buf += _encode_field(fn, WT_VARINT, _encode_varint(int(v)))
+    return buf
+
+
+def _encode_forward_msg_content(content: dict) -> bytes:
+    buf = _encode_field(1, WT_VARINT, _encode_varint(int(content.get("type", 0))))
+    text = content.get("text", "")
+    if text:
+        buf += _encode_field(2, WT_LEN, _encode_string(str(text)))
+    for media in content.get("multimedia") or []:
+        buf += _encode_field(3, WT_LEN, _encode_message(_encode_forward_multimedia(media)))
+    return buf
+
+
+def _encode_forward_msg(msg: dict) -> bytes:
+    buf = b""
+    sender = msg.get("sender", "")
+    if sender:
+        buf += _encode_field(1, WT_LEN, _encode_string(str(sender)))
+    time_val = msg.get("time", 0)
+    if time_val:
+        buf += _encode_field(2, WT_VARINT, _encode_varint(int(time_val)))
+    plain = msg.get("plainText", "")
+    if plain:
+        buf += _encode_field(3, WT_LEN, _encode_string(str(plain)))
+    for mc in msg.get("msgContent") or []:
+        buf += _encode_field(4, WT_LEN, _encode_message(_encode_forward_msg_content(mc)))
+    return buf
+
+
+def encode_forward_msg_data(data: dict) -> bytes:
+    """编码 ForwardMsgData protobuf bytes（``decode_forward_msg_data`` 的逆操作）。
+
+    主要用于构造 mock / 测试数据；线上不需要编码这个结构。
+    """
+    buf = _encode_field(1, WT_VARINT, _encode_varint(int(data.get("sub_type", 0))))
+    for fn, key in [(2, "begin_time"), (3, "end_time")]:
+        v = data.get(key, 0)
+        if v:
+            buf += _encode_field(fn, WT_VARINT, _encode_varint(int(v)))
+    nick = data.get("nick_name", "")
+    if nick:
+        buf += _encode_field(4, WT_LEN, _encode_string(str(nick)))
+    for msg in data.get("msg") or []:
+        buf += _encode_field(5, WT_LEN, _encode_message(_encode_forward_msg(msg)))
+    return buf
+
+
+# ============================================================
 # 出站消息编码
 # ============================================================
-
 def _encode_send_c2c_req(
     to_account: str,
     from_account: str,

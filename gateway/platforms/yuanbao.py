@@ -18,6 +18,8 @@ Configuration in config.yaml (or via env vars):
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import collections
 import dataclasses
 import hashlib
@@ -31,9 +33,10 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone, timedelta
+from enum import Enum
 from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, Iterator, List, Optional, Tuple
 
 import sys
 
@@ -55,6 +58,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.yuanbao_media import (
@@ -77,6 +81,7 @@ from gateway.platforms.yuanbao_proto import (
     HERMES_INSTANCE_ID,
     decode_conn_msg,
     decode_inbound_push,
+    decode_forward_msg_data,
     decode_query_group_info_rsp,
     decode_get_group_member_list_rsp,
     encode_auth_bind,
@@ -154,7 +159,7 @@ _YB_RES_REF_RE = re.compile(
 _YB_LOCAL_MEDIA_RE = re.compile(r"\[(\w+):[^\]]*?(/[^\]]+?)\s*\]")
 
 # Media kinds that can be resolved and injected into the model context
-_RESOLVABLE_MEDIA_KINDS = frozenset({"image", "file"})
+_RESOLVABLE_MEDIA_KINDS = frozenset({"image", "file", "video"})
 
 # Strip page indicators like (1/3) appended by BasePlatformAdapter
 _INDICATOR_RE = re.compile(r'\s*\(\d+/\d+\)$')
@@ -922,6 +927,10 @@ class InboundContext:
     raw_text: str = ""
     media_refs: list = dc_field(default_factory=list)
 
+    # Populated by ExtractContentMiddleware for elem_type 1009 (WeChat forward).
+    # Contains the parsed ForwardMsgData dict (sub_type / nick_name / msg list).
+    forwarded_records: Optional[dict] = None
+
     # Owner command detection
     owner_command: Optional[str] = None
 
@@ -929,7 +938,7 @@ class InboundContext:
     source: Optional[Any] = None  # SessionSource
 
     # Populated by ClassifyMessageTypeMiddleware
-    msg_type: Optional[Any] = None  # MessageType
+    msg_type: Optional[Any] = None  # MessageType | YuanbaoMessageType
 
     # Populated by QuoteContextMiddleware
     reply_to_message_id: Optional[str] = None
@@ -1751,6 +1760,11 @@ class ExtractContentMiddleware(InboundMiddleware):
                                 parts.append(text)
                             else:
                                 parts.append("[unsupported message type]")
+                        elif ctype == 1009:
+                            # WeChat forwarded chat record: use the truncated
+                            # summary text. Detailed records live in ext_map and
+                            # are parsed by ForwardedRecordsParseMiddleware.
+                            parts.append(custom.get("text", "[chat record]"))
                         else:
                             parts.append("[unsupported message type]")
                     except (json.JSONDecodeError, TypeError):
@@ -1862,10 +1876,87 @@ class ExtractContentMiddleware(InboundMiddleware):
                         pass
         return urls
 
+    @staticmethod
+    def _extract_forwarded_records(msg_body: list, user_id: str = "") -> Optional[dict]:
+        """Extract ForwardMsgData from ext_map for elem_type 1009 (WeChat forward).
+
+        The detailed chat-record payload lives in ``msg_content.ext_map``
+        (protobuf field 999, ``map<string, string>``):
+          - key format: ``wexin_forward_msg_[forward_msg_id]_[userid]``
+          - value: a **base64-encoded protobuf** ``ForwardMsgData`` (NOT JSON).
+            Decode with base64 then ``decode_forward_msg_data`` to recover the
+            ``sub_type`` / ``nick_name`` / ``msg`` structure.
+
+        Matching strategy: take the first ``wexin_forward_msg_`` entry whose
+        decoded payload is a valid ``ForwardMsgData`` (``sub_type == 1``).
+
+        Returns the parsed ``ForwardMsgData`` dict or ``None``.
+        """
+        for elem in msg_body or []:
+            if not isinstance(elem, dict) or elem.get("msg_type") != "TIMCustomElem":
+                continue
+            content = elem.get("msg_content", {}) or {}
+            if not isinstance(content, dict):
+                continue
+            data_str = content.get("data", "")
+            if not data_str:
+                continue
+            try:
+                custom = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not (isinstance(custom, dict) and custom.get("elem_type") == 1009):
+                continue
+
+            ext_map = content.get("ext_map") or {}
+            if not isinstance(ext_map, dict) or not ext_map:
+                return None
+
+            def _parse_value(value):
+                # ext_map values are base64-encoded ForwardMsgData protobuf.
+                if not isinstance(value, str) or not value:
+                    return None
+                try:
+                    pb = base64.b64decode(value)
+                except (binascii.Error, ValueError):
+                    return None
+                data = decode_forward_msg_data(pb)
+                if isinstance(data, dict) and data.get("sub_type") == 1:
+                    return data
+                return None
+
+            # Take the first valid wexin_forward_msg_ entry.
+            for key, value in ext_map.items():
+                if not key.startswith("wexin_forward_msg_"):
+                    continue
+                parsed = _parse_value(value)
+                if parsed is not None:
+                    return parsed
+
+        return None
+
+    @staticmethod
+    def _cache_forwarded_records(adapter, msg_id: str, records: dict) -> None:
+        """Cache by ``msg_id`` for later quote-reply recovery; FIFO-evict
+        beyond ``FORWARDED_RECORDS_CACHE_MAX``."""
+        cache = getattr(adapter, "_forwarded_records_cache", None)
+        if cache is None:
+            return
+        cache[msg_id] = records
+        cap = getattr(adapter, "FORWARDED_RECORDS_CACHE_MAX", 100)
+        if len(cache) > cap:
+            for k in list(cache)[:len(cache) - cap]:
+                del cache[k]
+
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.link_urls = self._extract_link_urls(ctx.msg_body)
+        # Extract + cache forwarded records early, before GroupAtGuardMiddleware
+        # can short-circuit observed-only group messages.
+        ctx.forwarded_records = self._extract_forwarded_records(ctx.msg_body, ctx.from_account)
+        if ctx.forwarded_records and ctx.msg_id:
+            self._cache_forwarded_records(ctx.adapter, ctx.msg_id, ctx.forwarded_records)
         await next_fn()
 
 class PlaceholderFilterMiddleware(InboundMiddleware):
@@ -2075,10 +2166,11 @@ class GroupAtGuardMiddleware(InboundMiddleware):
             "and answer it directly."
         )
 
-    @staticmethod
+    @classmethod
     def _observe_group_message(
+        cls,
         adapter, source, sender_display: str, text: str,
-        *, msg_id: Optional[str] = None,
+        *, msg_id: Optional[str] = None, forwarded_records: Optional[dict] = None,
     ) -> None:
         """Write a group message into the session transcript without triggering the agent.
 
@@ -2086,6 +2178,14 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         eventually invoked via @bot.  Messages are stored with ``role: "user"``
         in the format ``[nickname|user_id]\\n<content>`` so the model
         can distinguish participants and their user ids.
+
+        When ``forwarded_records`` is provided (a WeChat ``ForwardMsgData``
+        dict), it is eagerly rendered into a plain-text summary appended to
+        ``content`` so a later @bot turn sees the actual forwarded
+        conversation in transcript history. Media markers carry no RIDs (RIDs
+        would have expired by then); deep parsing with valid RIDs only
+        happens on the dispatch path via the adapter's
+        ``_forwarded_records_cache`` (e.g. quote-reply).
         """
         store = getattr(adapter, "_session_store", None)
         if not store:
@@ -2093,7 +2193,14 @@ class GroupAtGuardMiddleware(InboundMiddleware):
         try:
             session_entry = store.get_or_create_session(source)
             user_id = source.user_id or "unknown"
-            attributed = f"[{sender_display}|{user_id}]\n{text}"
+            body_text = text
+            if forwarded_records:
+                summary = ForwardedRecordsParseMiddleware.build_forward_text(
+                    forwarded_records, user_nickname=sender_display,
+                )
+                if summary:
+                    body_text = f"{text}\n{summary}" if text else summary
+            attributed = f"[{sender_display}|{user_id}]\n{body_text}"
             entry: dict = {
                 "role": "user",
                 "content": attributed,
@@ -2115,6 +2222,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
             self._observe_group_message(
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
                 msg_id=ctx.msg_id or None,
+                forwarded_records=ctx.forwarded_records,
             )
             logger.info(
                 "[%s] Group message observed (no @bot): chat=%s from=%s",
@@ -2155,14 +2263,32 @@ class GroupAttributionMiddleware(InboundMiddleware):
         await next_fn()
 
 
+class YuanbaoMessageType(Enum):
+    """Yuanbao-internal message subtypes not part of the shared MessageType.
+
+    Kept local to this adapter (closed-loop): the gateway-wide
+    :class:`MessageType` enum in ``base.py`` only knows generic kinds, so
+    platform-specific subtypes like WeChat forwarded chat records live here
+    and are coerced back to a base ``MessageType`` before a ``MessageEvent``
+    leaves the adapter (see :class:`DispatchMiddleware`).
+    """
+
+    # WeChat forwarded chat records (TIMCustomElem, elem_type 1009).
+    CHAT_RECORD = "chat_record"
+
+
 class ClassifyMessageTypeMiddleware(InboundMiddleware):
     """Determine MessageType from text content and msg_body elements."""
 
     name = "classify-msg-type"
 
     @staticmethod
-    def _classify(text: str, msg_body: list) -> MessageType:
-        """Classify message type based on text and msg_body."""
+    def _classify(text: str, msg_body: list):
+        """Classify message type based on text and msg_body.
+
+        Returns a base :class:`MessageType`, or a yuanbao-local
+        :class:`YuanbaoMessageType` for platform-specific subtypes.
+        """
         if text.startswith("/"):
             return MessageType.COMMAND
         for elem in msg_body:
@@ -2175,6 +2301,14 @@ class ClassifyMessageTypeMiddleware(InboundMiddleware):
                 return MessageType.VIDEO
             if etype == "TIMFileElem":
                 return MessageType.DOCUMENT
+            if etype == "TIMCustomElem":
+                data_str = (elem.get("msg_content") or {}).get("data", "")
+                try:
+                    custom = json.loads(data_str)
+                except (json.JSONDecodeError, TypeError):
+                    custom = None
+                if isinstance(custom, dict) and custom.get("elem_type") == 1009:
+                    return YuanbaoMessageType.CHAT_RECORD
         return MessageType.TEXT
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -2254,6 +2388,229 @@ class QuoteContextMiddleware(InboundMiddleware):
         ctx.reply_to_message_id, ctx.reply_to_text = self._extract_quote_context(ctx.cloud_custom_data)
         ctx.quote_media_refs = await self._extract_media_refs_from_transcript(ctx)
         await next_fn()
+
+
+class ForwardedRecordsParseMiddleware(InboundMiddleware):
+    """Deep-parse WeChat forwarded chat records (elem_type 1009) for dispatch.
+
+    Activates when a full ``ForwardMsgData`` dict is available on the current
+    turn — either carried by the current message (``ctx.forwarded_records``)
+    or recovered from the adapter's ``_forwarded_records_cache`` via
+    quote-reply (see design §2.4.4). Resolves media to ``[kind|ybres:RID]``
+    placeholders, appends downloadable refs to ``ctx.media_refs`` (for
+    :class:`MediaResolveMiddleware`), and rewrites ``ctx.raw_text``.
+
+    Group @bot turns *without* a forward on the current message rely on the
+    eagerly-rendered summaries that :class:`GroupAtGuardMiddleware` writes to
+    the transcript at observe time — there is no run-time summary fallback
+    here.
+
+    On any failure the middleware leaves ``ctx.raw_text`` untouched
+    (graceful degradation, design §2.8).
+    """
+
+    name = "forwarded-records-parse"
+
+    async def handle(self, ctx: InboundContext, next_fn) -> None:
+        try:
+            forward_data = self._resolve_records(ctx)
+
+            if forward_data:
+                # Full ForwardMsgData available (private / group @bot
+                # / quote-reply). Send a loading heartbeat then deep-parse.
+                self._send_loading_heartbeat(ctx)
+                ctx.raw_text = self.build_forward_text(forward_data, ctx=ctx)
+        except Exception as exc:
+            # Degrade gracefully: leave ctx.raw_text as-is.
+            logger.warning(
+                "[%s] forwarded-records deep parse failed: %s",
+                getattr(ctx.adapter, "name", "yuanbao"), exc,
+            )
+
+        await next_fn()
+
+    # -- Heartbeat ---------------------------------------------------------
+
+    @staticmethod
+    async def _send_loading_heartbeat(ctx: InboundContext) -> None:
+        """Best-effort RUNNING heartbeat so the user sees a loading bubble."""
+        try:
+            await ctx.adapter._outbound.heartbeat.send_heartbeat_once(
+                ctx.chat_id, WS_HEARTBEAT_RUNNING,
+            )
+        except Exception:
+            pass
+
+    # -- Record resolution -------------------------------------------------
+
+    @staticmethod
+    def _resolve_records(ctx: InboundContext) -> Optional[dict]:
+        """Resolve a full ``ForwardMsgData`` dict for the current turn.
+
+        Order of precedence:
+          1. The current message itself carries a forwarded record.
+          2. A quote-reply — recovered from the adapter's
+             ``_forwarded_records_cache`` (keyed by msg_id). The SQLite
+             transcript cannot persist ``ForwardMsgData``, so this in-memory
+             cache is the sole recovery source within the gateway process.
+
+        Returns the ``ForwardMsgData`` dict or ``None``.
+        """
+        # Case 1: current message IS a chat record (private or group @bot).
+        if ctx.forwarded_records:
+            return ctx.forwarded_records
+
+        # Case 2: quote-reply — recover the quoted forward's ForwardMsgData
+        # from the adapter's in-memory cache.
+        if ctx.reply_to_message_id:
+            cache = getattr(ctx.adapter, "_forwarded_records_cache", None)
+            if cache:
+                records = cache.get(ctx.reply_to_message_id)
+                if isinstance(records, dict):
+                    return records
+        return None
+
+    # -- Record rendering helpers -----------------------------------------
+
+    @classmethod
+    def _media_marker(
+        cls, media: dict, plain_text: str = "", *, with_rid: bool,
+    ) -> Tuple[str, Optional[Dict[str, str]]]:
+        """Render one ``msgContent.multimedia`` entry as a textual marker.
+
+        Returns ``(marker, ref)``. With ``with_rid=True`` (dispatch path),
+        downloadable media emits a ``[kind|ybres:RID]`` marker and a
+        ``ctx.media_refs`` ref dict; with ``with_rid=False`` (observed path)
+        only a plain ``[kind] name`` marker and ``ref=None`` — those RIDs
+        would expire before any later @bot turn could consume them.
+        """
+        media_type = (media.get("type", "") or media.get("doc_type", "")).strip().lower()
+        url = str(media.get("url") or "").strip()
+        media_id = str(media.get("media_id") or "").strip()
+        file_name = str(media.get("file_name") or "").strip()
+        # media_id is directly usable as a ybres RID (design §2.10.9);
+        # fall back to parsing the resourceId out of the URL.
+        rid = (media_id or ExtractContentMiddleware._parse_resource_id(url)) if with_rid else ""
+
+        if media_type == "image":
+            if with_rid and url and rid:
+                return f"[image|ybres:{rid}] {file_name}".rstrip(), {"kind": "image", "url": url}
+            return f"[image] {file_name or plain_text}".rstrip(), None
+
+        if media_type in ("file", "document", "code"):
+            if with_rid and url and rid:
+                ref: Dict[str, str] = {"kind": "file", "url": url}
+                if file_name:
+                    ref["name"] = file_name
+                return f"[file|ybres:{rid}] {file_name}".rstrip(), ref
+            return f"[file] {file_name}".rstrip(), None
+
+        if media_type == "url":
+            # Link share (e.g. WeChat article) — keep URL for the agent
+            # in both dispatch and observed paths.
+            link_title = file_name or str(media.get("title") or "")
+            return f"[link] {link_title} {url}".rstrip(), None
+
+        if media_type == "video":
+            if with_rid and url and rid:
+                return f"[video|ybres:{rid}] {file_name}".rstrip(), {"kind": "video", "url": url}
+            return f"[video] {file_name or url}".rstrip(), None
+
+        return f"[{media_type or 'media'}] {url or file_name}".rstrip(), None
+
+    # Per-record combined-text cap; record count is NOT capped (design §2.10.3).
+    FORWARD_MSG_TEXT_MAX_CHARS = 1000
+
+    @classmethod
+    def _walk_forward_msgs(
+        cls,
+        forward_data: dict,
+        *,
+        with_rid: bool,
+    ) -> Iterator[Tuple[str, str, List[Dict[str, str]]]]:
+        """Walk ``ForwardMsgData['msg']`` and yield ``(sender, body, refs)``.
+
+        Per-record dispatch over ``msgContent`` (text / multimedia / nested
+        forward / fallback); ``body`` is capped at
+        :attr:`FORWARD_MSG_TEXT_MAX_CHARS`. Media goes through
+        :meth:`_media_marker` with ``with_rid``; ``refs`` holds that record's
+        downloadable ``ctx.media_refs`` entries in textual order (empty when
+        ``with_rid=False``) — the order PatchAnchorsMiddleware relies on
+        (design §2.10.6). Headers / footers are the caller's job.
+        """
+        for msg in (forward_data.get("msg") if isinstance(forward_data, dict) else None) or []:
+            if not isinstance(msg, dict):
+                continue
+            sender = msg.get("sender", "")
+            plain_text = msg.get("plainText", "")
+            msg_contents = msg.get("msgContent", []) or []
+
+            refs: List[Dict[str, str]] = []
+            if not msg_contents:
+                rendered = plain_text
+            else:
+                parts: List[str] = []
+                for mc in msg_contents:
+                    if not isinstance(mc, dict):
+                        continue
+                    mc_type = mc.get("type", 0)  # EnumMsgContentType
+                    if mc_type == 1:  # TEXT
+                        parts.append(mc.get("text", ""))
+                    elif mc_type == 2:  # MULTIMEDIA
+                        for media in mc.get("multimedia", []) or []:
+                            if isinstance(media, dict):
+                                marker, ref = cls._media_marker(
+                                    media, plain_text, with_rid=with_rid,
+                                )
+                                parts.append(marker)
+                                if ref is not None:
+                                    refs.append(ref)
+                    elif mc_type == 3:  # nested FORWARD_MSG (design §2.10.10)
+                        parts.append("[嵌套聊天记录]")
+                    else:
+                        if plain_text:
+                            parts.append(plain_text)
+                rendered = "  ".join(p for p in parts if p) or plain_text
+
+            if len(rendered) > cls.FORWARD_MSG_TEXT_MAX_CHARS:
+                rendered = rendered[: cls.FORWARD_MSG_TEXT_MAX_CHARS] + "…(已截断)"
+            yield sender, rendered, refs
+
+    # -- Prompt builders ---------------------------------------------------
+
+    @classmethod
+    def build_forward_text(
+        cls,
+        forward_data: dict,
+        *,
+        ctx: Optional[InboundContext] = None,
+        user_nickname: str = "",
+    ) -> str:
+        """Render ``ForwardMsgData`` into forward text. Mode is chosen by whether
+        ``ctx`` is supplied:
+
+        - **Dispatch** (``ctx`` set) — this turn consumes the @bot forward:
+          ``[kind|ybres:RID]`` placeholders, refs appended to ``ctx.media_refs``
+          in textual order, plus a ``用户附言：{ctx.raw_text}`` footer.
+        - **Observed** (``ctx is None``) — forward seen without @bot (via
+          :meth:`GroupAtGuardMiddleware._observe_group_message`): plain
+          ``[kind] name`` markers, no refs, no footer.
+
+        Nickname for the header comes from ``ctx.sender_nickname`` (dispatch) or
+        the ``user_nickname`` arg (observed), falling back to ``用户``.
+        """
+        is_dispatch = ctx is not None
+        nickname = (getattr(ctx, "sender_nickname", "") if is_dispatch else user_nickname) or "用户"
+
+        lines = [f"当前用户的昵称为{nickname}", "以下为用户的聊天记录"]
+        for sender, body, refs in cls._walk_forward_msgs(forward_data, with_rid=is_dispatch):
+            lines.append(f"{sender}：{body}")
+            if is_dispatch:
+                ctx.media_refs.extend(refs)
+        text = "\n".join(lines)
+        if is_dispatch and ctx.raw_text.strip():
+            text += f"\n\n用户附言：{ctx.raw_text.strip()}"
+        return text
 
 
 class MediaResolveMiddleware(InboundMiddleware):
@@ -2436,6 +2793,15 @@ class MediaResolveMiddleware(InboundMiddleware):
             mime = guess_mime_type(f"image{ext}")
             if not mime.startswith("image/"):
                 mime = content_type if content_type.startswith("image/") else "image/jpeg"
+            cls._put_cached_resource(resource_id, local_path, mime)
+            return local_path, mime
+
+        if kind == "video":
+            # Yuanbao video resources carry no reliable extension; default to mp4.
+            local_path = cache_video_from_bytes(file_bytes)
+            mime = guess_mime_type(local_path) or (
+                content_type if content_type.startswith("video/") else "video/mp4"
+            )
             cls._put_cached_resource(resource_id, local_path, mime)
             return local_path, mime
 
@@ -2628,9 +2994,7 @@ class MediaResolveMiddleware(InboundMiddleware):
         if not isinstance(text, str) or not text:
             return paths, mimes
 
-        # Already-local media paths written by PatchAnchorsMiddleware. The
-        # generic anchor regex covers every kind _patch emits (image/file today,
-        # video/audio if they later become resolvable) without per-kind upkeep.
+        # Already-local media paths written by PatchAnchorsMiddleware.
         seen: set = set()
         for m in _YB_LOCAL_MEDIA_RE.finditer(text):
             kind = (m.group(1) or "").strip().lower()
@@ -2744,6 +3108,8 @@ class PatchAnchorsMiddleware(InboundMiddleware):
             elif kind == "file":
                 label = filename.strip() or os.path.basename(u)
                 replacement = f"[file: {label} → {u}]"
+            elif kind == "video":
+                replacement = f"[video: {u}]"
             else:
                 continue
             patched = (
@@ -2778,7 +3144,11 @@ class DispatchMiddleware(InboundMiddleware):
                 message_type=(
                     MessageType.DOCUMENT
                     if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types)
-                    else ctx.msg_type
+                    # Coerce yuanbao-local subtypes (e.g. CHAT_RECORD) back to a
+                    # base MessageType: chat records are deep-parsed into a text
+                    # prompt, so TEXT is the right kind for downstream routing.
+                    else ctx.msg_type if isinstance(ctx.msg_type, MessageType)
+                    else MessageType.TEXT
                 ),
                 source=ctx.source,
                 message_id=ctx.msg_id or None,
@@ -2795,8 +3165,9 @@ class DispatchMiddleware(InboundMiddleware):
             if ctx.msg_id and ctx.raw_text:
                 cache = adapter._msg_content_cache
                 cache[ctx.msg_id] = ctx.raw_text
-                if len(cache) > 200:
-                    for k in list(cache)[:len(cache) - 200]:
+                cap = getattr(adapter, "MSG_CONTENT_CACHE_MAX", 200)
+                if len(cache) > cap:
+                    for k in list(cache)[:len(cache) - cap]:
                         del cache[k]
             await adapter.handle_message(event)
 
@@ -2877,6 +3248,7 @@ class InboundPipelineBuilder:
         GroupAttributionMiddleware,
         ClassifyMessageTypeMiddleware,
         QuoteContextMiddleware,
+        ForwardedRecordsParseMiddleware,
         MediaResolveMiddleware,
         PatchAnchorsMiddleware,
         DispatchMiddleware,
@@ -4719,6 +5091,18 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Used by _patch_transcript as content-match fallback when transcript
         # entries lack a message_id field (agent-processed @bot messages).
         self._msg_content_cache: Dict[str, str] = {}
+        self.MSG_CONTENT_CACHE_MAX: int = 200
+
+        # Bounded cache of msg_id → ForwardMsgData dict for recent WeChat
+        # forwards. The transcript (SQLite) cannot persist forwarded_records
+        # (no column), so a later quote-reply recovers the full chat-record
+        # detail from here by reply_to_message_id. Populated in
+        # ExtractContentMiddleware; read in ForwardedRecordsParseMiddleware.
+        self._forwarded_records_cache: Dict[str, dict] = {}
+        # Dedicated window for forwarded records: they are low-frequency but
+        # need to survive long enough for a much later quote-reply to recover
+        # them.
+        self.FORWARDED_RECORDS_CACHE_MAX: int = 100
 
         # Reply-to dedup: inbound_msg_id -> expire_ts
         # ------------------------------------------------------------------
