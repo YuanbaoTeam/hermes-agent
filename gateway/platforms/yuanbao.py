@@ -939,6 +939,10 @@ class InboundContext:
 
     # Populated by GroupAttributionMiddleware
     channel_prompt: Optional[str] = None
+    # Set by ChannelPromptTimeMiddleware so group-queued dispatches can
+    # refresh the wall-clock line at actual dispatch time rather than at
+    # pipeline-ingress time (which may be minutes earlier in busy groups).
+    channel_prompt_refresh: Optional[Callable[[], str]] = None
 
 
 class InboundMiddleware(ABC):
@@ -2616,6 +2620,8 @@ class DispatchMiddleware(InboundMiddleware):
                     + _patched_event_text[anchor_match.end():]
                 )
 
+            if ctx.channel_prompt_refresh is not None:
+                ctx.channel_prompt = ctx.channel_prompt_refresh()
             event = MessageEvent(
                 text=_patched_event_text,
                 message_type=(
@@ -2695,6 +2701,11 @@ class DispatchMiddleware(InboundMiddleware):
             adapter._group_queues.pop(session_key, None)
 
 
+from gateway.platforms.yuanbao_eval_time import make_channel_prompt_time_middleware
+
+ChannelPromptTimeMiddleware = make_channel_prompt_time_middleware(InboundMiddleware)
+
+
 class InboundPipelineBuilder:
     """Factory for building InboundPipeline instances.
 
@@ -2721,6 +2732,7 @@ class InboundPipelineBuilder:
         ClassifyMessageTypeMiddleware,
         QuoteContextMiddleware,
         MediaResolveMiddleware,
+        ChannelPromptTimeMiddleware,
         DispatchMiddleware,
     ]
 

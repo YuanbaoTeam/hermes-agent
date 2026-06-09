@@ -721,20 +721,27 @@ class TestCreateInboundPipeline:
         expected = [
             "decode",
             "extract-fields",
+            "recall_guard",
             "dedup",
             "skip-self",
             "chat-routing",
             "access-guard",
+            "auto-sethome",
             "extract-content",
             "placeholder-filter",
             "owner-command",
             "build-source",
             "group-at-guard",
+            "group-attribution",
             "classify-msg-type",
             "quote-context",
             "media-resolve",
+            "channel-prompt-time",
             "dispatch",
         ]
+        assert pipeline.middleware_names == expected
+
+    def test_pipeline_can_be_customized_after_creation(self):
         """Pipeline can be customized after creation."""
         pipeline = InboundPipelineBuilder.build()
 
