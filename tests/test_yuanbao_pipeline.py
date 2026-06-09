@@ -707,6 +707,7 @@ class TestCreateInboundPipeline:
             "quote-context",
             "media-resolve",
             "patch-anchors",
+            "channel-prompt-time",
             "dispatch",
         ]
         assert pipeline.middleware_names == expected
