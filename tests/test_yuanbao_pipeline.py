@@ -13,6 +13,8 @@ Tests cover:
 import sys
 import os
 import json
+import asyncio
+import collections
 
 # Ensure project root is on the path
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +23,11 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import time
+
+from gateway.session import SessionSource, build_session_key
+from gateway.config import Platform
 
 from gateway.platforms.yuanbao import (
     InboundContext,
@@ -45,6 +52,7 @@ from gateway.platforms.yuanbao import (
     InboundPipelineBuilder,
     YuanbaoAdapter,
 )
+
 from gateway.config import PlatformConfig
 
 
@@ -1381,3 +1389,210 @@ class TestPatchAnchorsMiddleware:
         await PatchAnchorsMiddleware()(ctx, next_fn)
         assert ctx.raw_text == "hi [image: /cache/y.png]"
         next_fn.assert_awaited_once()
+
+
+# ============================================================
+# Helpers for group interrupt / backward-pull tests
+# ============================================================
+
+def _at_bot_msg_body(bot_id="bot_123"):
+    """Build a bare @bot msg_body (mention only, no extra content)."""
+    return [{
+        "msg_type": "TIMCustomElem",
+        "msg_content": {
+            "data": json.dumps({"elem_type": 1002, "text": "@Bot", "user_id": bot_id})
+        },
+    }]
+
+
+def _make_group_source(user_id, group_code="grp-1"):
+    """Create a real SessionSource for a group context."""
+    return SessionSource(
+        platform=Platform.YUANBAO,
+        chat_id=f"group:{group_code}",
+        chat_type="group",
+        user_id=user_id,
+        thread_id="main",
+    )
+
+
+def _make_group_ctx(adapter, user_id, group_code="grp-1", text="", msg_body=None, **kw):
+    """Create a group InboundContext with the minimum required fields set."""
+    source = _make_group_source(user_id, group_code)
+    return make_ctx(
+        adapter=adapter,
+        chat_type="group",
+        chat_id=f"group:{group_code}",
+        group_code=group_code,
+        from_account=user_id,
+        sender_nickname=user_id,
+        raw_text=text,
+        msg_body=msg_body or _at_bot_msg_body(adapter._bot_id),
+        source=source,
+        **kw,
+    )
+
+
+# ============================================================
+# TestGroupAtGuardExtensions — speaker recording behaviour
+# ============================================================
+
+class TestGroupAtGuardExtensions:
+    """Tests for the speaker-recording addition to GroupAtGuardMiddleware."""
+
+    @pytest.mark.asyncio
+    async def test_speaker_recorded_for_non_at_bot(self):
+        """Non-@bot group messages are recorded in _group_recent_speakers."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        adapter._session_store = None
+        ctx = _make_group_ctx(
+            adapter, "alice", group_code="g1",
+            text="hello everyone",
+            msg_body=[{"msg_type": "TIMTextElem", "msg_content": {"text": "hello everyone"}}],
+        )
+        next_fn = AsyncMock()
+        await GroupAtGuardMiddleware()(ctx, next_fn)
+        speakers = [uid for uid, _ts in adapter._group_recent_speakers.get("g1", [])]
+        assert "alice" in speakers
+
+    @pytest.mark.asyncio
+    async def test_speaker_recorded_for_at_bot(self):
+        """@bot group messages are also recorded in _group_recent_speakers."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        ctx = _make_group_ctx(adapter, "alice", group_code="g2")
+        next_fn = AsyncMock()
+        await GroupAtGuardMiddleware()(ctx, next_fn)
+        speakers = [uid for uid, _ts in adapter._group_recent_speakers.get("g2", [])]
+        assert "alice" in speakers
+
+
+# ============================================================
+# TestGroupInterruptInDispatch
+# ============================================================
+
+class TestGroupInterruptInDispatch:
+    """Integration tests for the interrupt gate in DispatchMiddleware's group branch.
+
+    Condition logic is covered by TestShouldInterrupt (unit). Here we only verify
+    that DispatchMiddleware correctly wires the decision to interrupt_session_activity,
+    and that DM messages bypass the gate entirely.
+    """
+
+    def _make_sk(self, user_id, group_code="grp-1"):
+        source = _make_group_source(user_id, group_code)
+        return build_session_key(source, group_sessions_per_user=True), source
+
+    @pytest.mark.asyncio
+    async def test_same_user_within_window_calls_interrupt(self):
+        """Same user re-@bots within window → interrupt_session_activity called before enqueue."""
+        adapter = make_adapter()
+        adapter._interrupt_window_seconds = 20.0
+        sk, source = self._make_sk("alice")
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 5.0
+        adapter.interrupt_session_activity = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        ctx = _make_group_ctx(adapter, "alice", group_code="grp-1")
+        ctx.source = source
+        ctx.msg_type = MagicMock()
+        ctx.media_types = []
+        ctx.media_urls = []
+        await DispatchMiddleware()(ctx, AsyncMock())
+
+        adapter.interrupt_session_activity.assert_awaited_once_with(sk, "group:grp-1")
+
+    @pytest.mark.asyncio
+    async def test_dm_never_triggers_interrupt(self):
+        """DM messages go through the else branch — interrupt logic is unreachable."""
+        adapter = make_adapter()
+        adapter.interrupt_session_activity = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        source = _make_group_source("alice", "grp-1")
+        ctx = make_ctx(
+            adapter=adapter,
+            chat_type="dm",
+            from_account="alice",
+            source=source,
+            msg_type=MagicMock(),
+            media_types=[],
+            media_urls=[],
+        )
+        await DispatchMiddleware()(ctx, AsyncMock())
+        adapter.interrupt_session_activity.assert_not_awaited()
+
+
+# ============================================================
+# TestShouldInterrupt — unit tests for the helper method
+# ============================================================
+
+class TestShouldInterrupt:
+    """Unit tests for DispatchMiddleware._should_interrupt."""
+
+    def _setup(self, window=20.0):
+        adapter = make_adapter()
+        adapter._interrupt_window_seconds = window
+        return adapter
+
+    def _call(self, adapter, ctx, sk):
+        return DispatchMiddleware._should_interrupt(adapter, ctx, sk, time.monotonic())
+
+    def _record_speaker(self, adapter, group_code, user_id, ts):
+        dq = adapter._group_recent_speakers.get(group_code)
+        if dq is None:
+            dq = collections.deque(maxlen=20)
+            adapter._group_recent_speakers[group_code] = dq
+        dq.append((user_id, ts))
+
+    def test_all_conditions_met_returns_true(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 5.0
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is True
+
+    def test_different_user_returns_false(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 5.0
+        ctx = make_ctx(adapter=adapter, from_account="bob", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
+
+    def test_window_expired_returns_false(self):
+        adapter = self._setup(window=10.0)
+        sk = "session:alice"
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 15.0
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
+
+    def test_interleave_after_start_returns_false(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        started = time.monotonic() - 5.0
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = started
+        self._record_speaker(adapter, "g1", "bob", started + 2.0)
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
+
+    def test_interleave_before_start_ignored(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        started = time.monotonic() - 5.0
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = started
+        self._record_speaker(adapter, "g1", "bob", started - 1.0)
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is True
+
+    def test_no_active_turn_returns_false(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
