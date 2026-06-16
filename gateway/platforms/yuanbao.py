@@ -13,6 +13,9 @@ Configuration in config.yaml (or via env vars):
           bot_id: "..."              # or YUANBAO_BOT_ID  (optional, returned by sign-token)
           ws_url: "wss://..."        # or YUANBAO_WS_URL
           api_domain: "https://..."  # or YUANBAO_API_DOMAIN
+          interrupt_window_seconds: 20  # How long (s) after a turn starts to allow
+                                        # the same user to interrupt it with a new @bot.
+                                        # Set to 0 to disable interruption entirely.
 """
 
 from __future__ import annotations
@@ -2204,6 +2207,15 @@ class GroupAtGuardMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
+
+        # Record every group speaker (including non-@bot) for interleave detection.
+        if ctx.chat_type == "group" and ctx.group_code and ctx.from_account:
+            dq = adapter._group_recent_speakers.get(ctx.group_code)
+            if dq is None:
+                dq = collections.deque(maxlen=20)
+                adapter._group_recent_speakers[ctx.group_code] = dq
+            dq.append((ctx.from_account, time.monotonic()))
+
         if ctx.chat_type == "group" and not ctx.owner_command and not self._is_at_bot(ctx.msg_body, adapter._bot_id):
             self._observe_group_message(
                 adapter, ctx.source, ctx.sender_nickname or ctx.from_account, ctx.raw_text,
@@ -2216,6 +2228,7 @@ class GroupAtGuardMiddleware(InboundMiddleware):
                 adapter.name, ctx.chat_id, ctx.from_account,
             )
             return  # Stop pipeline — message observed but not dispatched
+
         await next_fn()
 
 
@@ -3080,6 +3093,8 @@ class DispatchMiddleware(InboundMiddleware):
             thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
         )
 
+        _from_account = ctx.from_account
+
         async def _dispatch_inbound_event() -> None:
             event = MessageEvent(
                 text=ctx.raw_text,
@@ -3110,9 +3125,23 @@ class DispatchMiddleware(InboundMiddleware):
                 if len(cache) > 200:
                     for k in list(cache)[:len(cache) - 200]:
                         del cache[k]
+            # Record turn owner at dispatch time (not pipeline time) to avoid queue races.
+            if _sk and _from_account:
+                adapter._active_turn_user[_sk] = _from_account
+                adapter._active_turn_started_at[_sk] = time.monotonic()
             await adapter.handle_message(event)
 
         if ctx.chat_type == "group":
+            # Interrupt running turn if same user re-@bots within the window.
+            if _sk in adapter._active_sessions:
+                now = time.monotonic()
+                if DispatchMiddleware._should_interrupt(adapter, ctx, _sk, now):
+                    logger.info(
+                        "[%s] Interrupting running turn for %s — same user re-@bot within %.0fs window",
+                        adapter.name, (_sk or "")[:60], adapter._interrupt_window_seconds,
+                    )
+                    await adapter.interrupt_session_activity(_sk, ctx.chat_id)
+
             is_new = _sk not in adapter._group_queues
             queue = adapter._group_queues.setdefault(_sk, asyncio.Queue())
             queue.put_nowait(_dispatch_inbound_event)
@@ -3136,6 +3165,22 @@ class DispatchMiddleware(InboundMiddleware):
             task.add_done_callback(adapter._inbound_tasks.discard)
 
         await next_fn()
+
+    @staticmethod
+    def _should_interrupt(adapter: "YuanbaoAdapter", ctx: "InboundContext", sk: str, now: float) -> bool:
+        """True when same user re-@bots, no one else spoke, and within the window."""
+        responder = adapter._active_turn_user.get(sk)
+        if not responder or ctx.from_account != responder:
+            return False
+        started_at = adapter._active_turn_started_at.get(sk, 0.0)
+        if now - started_at > adapter._interrupt_window_seconds:
+            return False
+        speakers = adapter._group_recent_speakers.get(ctx.group_code)
+        if speakers:
+            for uid, ts in speakers:
+                if uid != responder and ts > started_at:
+                    return False
+        return True
 
     @staticmethod
     async def _consume_group_queue(adapter: "YuanbaoAdapter", session_key: str) -> None:
@@ -5034,6 +5079,15 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # Group chat sequential dispatch queue (session_key → asyncio.Queue).
         self._group_queues: Dict[str, asyncio.Queue] = {}
 
+        # Group interrupt: tracks who triggered the running turn and when,
+        # plus recent speakers per group for interleave detection.
+        self._active_turn_user: Dict[str, str] = {}          # sk -> user_id
+        self._active_turn_started_at: Dict[str, float] = {}  # sk -> monotonic ts
+        self._group_recent_speakers: Dict[str, collections.deque] = {}  # group_code -> deque[(uid, ts)]
+        self._interrupt_window_seconds: float = float(
+            _extra.get("interrupt_window_seconds", 20.0)
+        )
+
         # Recall support: track which msg_id is being processed per session_key
         # so RecallGuardMiddleware can detect "currently processing" messages.
         self._processing_msg_ids: Dict[str, str] = {}
@@ -5140,6 +5194,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._inbound_tasks.clear()
 
         self._group_queues.clear()
+
+        self._active_turn_user.clear()
+        self._active_turn_started_at.clear()
+        self._group_recent_speakers.clear()
 
         logger.info("[%s] Disconnected", self.name)
 

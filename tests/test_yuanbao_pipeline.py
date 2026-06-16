@@ -14,6 +14,7 @@ import sys
 import os
 import json
 import asyncio
+import collections
 
 # Ensure project root is on the path
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +23,11 @@ if _REPO_ROOT not in sys.path:
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+
+import time
+
+from gateway.session import SessionSource, build_session_key
+from gateway.config import Platform
 
 from gateway.platforms.yuanbao import (
     InboundContext,
@@ -40,10 +46,14 @@ from gateway.platforms.yuanbao import (
     BuildSourceMiddleware,
     GroupAtGuardMiddleware,
     DispatchMiddleware,
+    QuoteContextMiddleware,
+    MediaResolveMiddleware,
+    PatchAnchorsMiddleware,
     InboundPipelineBuilder,
     YuanbaoAdapter,
 )
-from gateway.config import Platform, PlatformConfig
+
+from gateway.config import PlatformConfig
 
 
 # ============================================================
@@ -1027,3 +1037,618 @@ class TestPipelineOOPRegistration:
         pipeline = InboundPipeline().use(MwA()).use(MwC())
         pipeline.use_after("a", MwB())
         assert pipeline.middleware_names == ["a", "b", "c"]
+
+
+# ============================================================
+# QuoteContextMiddleware Tests
+# ============================================================
+
+class TestQuoteContextMiddleware:
+    """Tests for QuoteContextMiddleware."""
+
+    def test_extract_quote_context_no_quote_id(self):
+        """When quote.id is empty, quote_id is None."""
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "",
+                "desc": "some text",
+            }
+        })
+        quote_id, _quote_text = QuoteContextMiddleware()._extract_quote_context(cloud_data)
+        assert quote_id is None
+
+    @pytest.mark.asyncio
+    async def test_handle_sets_ctx_fields(self):
+        """QuoteContextMiddleware.handle() sets ctx.reply_to_message_id, reply_to_text, quote_media_refs.
+
+        With no transcript store wired up, quote_media_refs falls back to []
+        — media resolution from transcript is covered by separate tests.
+        """
+        cloud_data = json.dumps({
+            "quote": {
+                "id": "quoted-msg-004",
+                "desc": "Check this image",
+                "sender_nickname": "Dave",
+            }
+        })
+        adapter = make_adapter()
+        adapter._session_store = None  # no transcript lookup path
+        ctx = make_ctx(adapter=adapter, cloud_custom_data=cloud_data)
+        next_fn = AsyncMock()
+
+        await QuoteContextMiddleware()(ctx, next_fn)
+
+        assert ctx.reply_to_message_id == "quoted-msg-004"
+        assert ctx.reply_to_text == "Dave: Check this image"
+        assert ctx.quote_media_refs == []
+        next_fn.assert_awaited_once()
+
+
+# ============================================================
+# MediaResolveMiddleware Tests
+# ============================================================
+#
+# After the dispatch refactor, MediaResolveMiddleware is the single entry
+# point for all inbound media downloads. It merges up to three sources
+# into ``ctx.media_urls`` / ``ctx.media_types`` (deduped, in this order):
+#
+#   1) media carried by the current message itself (always),
+#   2) quote_media_refs (when reply_to_message_id is set),
+#   3) recent group-observed media (only when chat_type == "group" and
+#      no quote is present).
+#
+# Direct messages skip the observed backfill entirely.
+
+class TestResolveYbresRefs:
+    """Direct tests for ``MediaResolveMiddleware._resolve_ybres_refs``.
+
+    This classmethod is the shared engine for both ``_resolve_quote_media``
+    and ``_collect_observed_media``. Patching the two upstream callers from
+    routing tests doesn't exercise its filtering / error-swallowing
+    behavior, so we pin those contracts directly here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolves_each_ref_in_order(self):
+        """Successful resolution returns ``(paths, mimes)`` aligned with input order."""
+        adapter = make_adapter()
+        refs = [
+            ("rid-1", "image", "a.jpg"),
+            ("rid-2", "file", "doc.pdf"),
+        ]
+
+        with patch.object(
+            MediaResolveMiddleware, "_fetch_resource_url",
+            new=AsyncMock(side_effect=["https://fresh/1", "https://fresh/2"]),
+        ) as p_fetch, patch.object(
+            MediaResolveMiddleware, "_download_and_cache",
+            new=AsyncMock(side_effect=[
+                ("/cache/a.jpg", "image/jpeg"),
+                ("/cache/doc.pdf", "application/pdf"),
+            ]),
+        ) as p_cache:
+            paths, mimes = await MediaResolveMiddleware._resolve_ybres_refs(
+                adapter, refs, log_prefix="test",
+            )
+
+        assert paths == ["/cache/a.jpg", "/cache/doc.pdf"]
+        assert mimes == ["image/jpeg", "application/pdf"]
+        assert p_fetch.await_count == 2
+        # filename from the ref tuple is forwarded to download_and_cache
+        cache_kwargs = [c.kwargs for c in p_cache.await_args_list]
+        assert cache_kwargs[0]["file_name"] == "a.jpg"
+        assert cache_kwargs[0]["kind"] == "image"
+        assert cache_kwargs[0]["resource_id"] == "rid-1"
+        assert cache_kwargs[1]["file_name"] == "doc.pdf"
+
+    @pytest.mark.asyncio
+    async def test_skips_unresolvable_kinds(self):
+        """Refs whose kind is outside ``_RESOLVABLE_MEDIA_KINDS`` are dropped silently."""
+        adapter = make_adapter()
+        refs = [
+            ("rid-v", "video", ""),       # not resolvable
+            ("rid-i", "image", "ok.jpg"),  # resolvable
+            ("rid-?", "unknown", ""),     # not resolvable
+        ]
+
+        with patch.object(
+            MediaResolveMiddleware, "_fetch_resource_url",
+            new=AsyncMock(return_value="https://fresh/i"),
+        ) as p_fetch, patch.object(
+            MediaResolveMiddleware, "_download_and_cache",
+            new=AsyncMock(return_value=("/cache/ok.jpg", "image/jpeg")),
+        ) as p_cache:
+            paths, mimes = await MediaResolveMiddleware._resolve_ybres_refs(
+                adapter, refs, log_prefix="test",
+            )
+
+        assert paths == ["/cache/ok.jpg"]
+        assert mimes == ["image/jpeg"]
+        # Only the resolvable ref hit the network.
+        p_fetch.assert_awaited_once()
+        p_cache.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_is_swallowed_per_ref(self):
+        """If ``_fetch_resource_url`` raises, that ref is skipped — not the whole batch."""
+        adapter = make_adapter()
+        refs = [
+            ("rid-bad", "image", ""),
+            ("rid-ok", "image", ""),
+        ]
+
+        with patch.object(
+            MediaResolveMiddleware, "_fetch_resource_url",
+            new=AsyncMock(side_effect=[RuntimeError("boom"), "https://fresh/ok"]),
+        ), patch.object(
+            MediaResolveMiddleware, "_download_and_cache",
+            new=AsyncMock(return_value=("/cache/ok.jpg", "image/jpeg")),
+        ) as p_cache:
+            paths, mimes = await MediaResolveMiddleware._resolve_ybres_refs(
+                adapter, refs, log_prefix="test",
+            )
+
+        # bad ref dropped; good ref preserved
+        assert paths == ["/cache/ok.jpg"]
+        assert mimes == ["image/jpeg"]
+        # download_and_cache was only invoked for the surviving ref
+        p_cache.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_drops_ref(self):
+        """If ``_download_and_cache`` returns None, the ref is dropped."""
+        adapter = make_adapter()
+        refs = [("rid-1", "image", "")]
+
+        with patch.object(
+            MediaResolveMiddleware, "_fetch_resource_url",
+            new=AsyncMock(return_value="https://fresh/1"),
+        ), patch.object(
+            MediaResolveMiddleware, "_download_and_cache",
+            new=AsyncMock(return_value=None),
+        ):
+            paths, mimes = await MediaResolveMiddleware._resolve_ybres_refs(
+                adapter, refs, log_prefix="test",
+            )
+
+        assert paths == []
+        assert mimes == []
+
+
+class TestMediaResolveMiddlewareRouting:
+    """Branch-routing tests for MediaResolveMiddleware.handle()."""
+
+    def _make_resolved_ctx(self, *, chat_type: str, reply_to: str = None,
+                            quote_media_refs=None, raw_text: str = "hello"):
+        adapter = make_adapter()
+        ctx = make_ctx(
+            adapter=adapter,
+            chat_type=chat_type,
+            reply_to_message_id=reply_to,
+            quote_media_refs=list(quote_media_refs or []),
+            raw_text=raw_text,
+            media_refs=[],  # no own attachments by default
+        )
+        return adapter, ctx
+
+    @pytest.mark.asyncio
+    async def test_dm_no_quote_skips_observed_backfill(self):
+        """In dm chats, observed-media backfill is never invoked."""
+        _adapter, ctx = self._make_resolved_ctx(chat_type="dm")
+
+        with patch.object(
+            MediaResolveMiddleware, "_resolve_media_urls",
+            new=AsyncMock(return_value=([], [])),
+        ) as p_own, patch.object(
+            MediaResolveMiddleware, "_resolve_quote_media",
+            new=AsyncMock(return_value=([], [])),
+        ) as p_quote, patch.object(
+            MediaResolveMiddleware, "_collect_observed_media",
+            new=AsyncMock(return_value=([], [])),
+        ) as p_observed:
+            next_fn = AsyncMock()
+            await MediaResolveMiddleware()(ctx, next_fn)
+
+        p_own.assert_awaited_once()
+        p_quote.assert_not_awaited()
+        p_observed.assert_not_awaited()
+        next_fn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dm_with_quote_resolves_quote_media_only(self):
+        """In dm chats with a quote, only quote media (plus own) is resolved."""
+        _adapter, ctx = self._make_resolved_ctx(
+            chat_type="dm",
+            reply_to="quoted-001",
+            quote_media_refs=[("rid-q1", "image", "")],
+        )
+
+        with patch.object(
+            MediaResolveMiddleware, "_resolve_media_urls",
+            new=AsyncMock(return_value=([], [])),
+        ) as p_own, patch.object(
+            MediaResolveMiddleware, "_resolve_quote_media",
+            new=AsyncMock(return_value=(["/cache/q1.jpg"], ["image/jpeg"])),
+        ) as p_quote, patch.object(
+            MediaResolveMiddleware, "_collect_observed_media",
+            new=AsyncMock(return_value=([], [])),
+        ) as p_observed:
+            next_fn = AsyncMock()
+            await MediaResolveMiddleware()(ctx, next_fn)
+
+        p_own.assert_awaited_once()
+        p_quote.assert_awaited_once()
+        p_observed.assert_not_awaited()
+        assert ctx.media_urls == ["/cache/q1.jpg"]
+        assert ctx.media_types == ["image/jpeg"]
+
+    @pytest.mark.asyncio
+    async def test_group_no_quote_runs_observed_backfill(self):
+        """In group chats without quote, observed-media backfill is invoked."""
+        _adapter, ctx = self._make_resolved_ctx(chat_type="group")
+
+        with patch.object(
+            MediaResolveMiddleware, "_resolve_media_urls",
+            new=AsyncMock(return_value=([], [])),
+        ), patch.object(
+            MediaResolveMiddleware, "_resolve_quote_media",
+            new=AsyncMock(return_value=([], [])),
+        ) as p_quote, patch.object(
+            MediaResolveMiddleware, "_collect_observed_media",
+            new=AsyncMock(return_value=(["/cache/o1.jpg"], ["image/jpeg"])),
+        ) as p_observed:
+            next_fn = AsyncMock()
+            await MediaResolveMiddleware()(ctx, next_fn)
+
+        p_quote.assert_not_awaited()
+        p_observed.assert_awaited_once()
+        assert ctx.media_urls == ["/cache/o1.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_group_with_quote_skips_observed_backfill(self):
+        """In group chats with a quote, only quote media is resolved (no backfill)."""
+        _adapter, ctx = self._make_resolved_ctx(
+            chat_type="group",
+            reply_to="quoted-002",
+            quote_media_refs=[("rid-q2", "image", "")],
+        )
+
+        with patch.object(
+            MediaResolveMiddleware, "_resolve_media_urls",
+            new=AsyncMock(return_value=([], [])),
+        ), patch.object(
+            MediaResolveMiddleware, "_resolve_quote_media",
+            new=AsyncMock(return_value=(["/cache/q2.jpg"], ["image/jpeg"])),
+        ) as p_quote, patch.object(
+            MediaResolveMiddleware, "_collect_observed_media",
+            new=AsyncMock(return_value=(["/cache/o2.jpg"], ["image/jpeg"])),
+        ) as p_observed:
+            next_fn = AsyncMock()
+            await MediaResolveMiddleware()(ctx, next_fn)
+
+        p_quote.assert_awaited_once()
+        p_observed.assert_not_awaited()
+        assert ctx.media_urls == ["/cache/q2.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_merges_and_dedupes_three_sources(self):
+        """Own + quote sources are merged with dedup applied."""
+        _adapter, ctx = self._make_resolved_ctx(
+            chat_type="dm",
+            reply_to="quoted-003",
+            quote_media_refs=[("rid", "image", "")],
+        )
+
+        with patch.object(
+            MediaResolveMiddleware, "_resolve_media_urls",
+            new=AsyncMock(return_value=(["/cache/a.jpg"], ["image/jpeg"])),
+        ), patch.object(
+            MediaResolveMiddleware, "_resolve_quote_media",
+            # Same path as own → must be deduped.
+            new=AsyncMock(return_value=(["/cache/a.jpg", "/cache/b.jpg"],
+                                          ["image/jpeg", "image/png"])),
+        ):
+            next_fn = AsyncMock()
+            await MediaResolveMiddleware()(ctx, next_fn)
+
+        assert ctx.media_urls == ["/cache/a.jpg", "/cache/b.jpg"]
+        assert ctx.media_types == ["image/jpeg", "image/png"]
+
+    @pytest.mark.asyncio
+    async def test_placeholder_recheck_uses_own_count_only(self):
+        """Placeholder retry-skip uses ``own_count``, not the merged total.
+
+        A bare placeholder text (e.g. ``[image]``) accompanied only by a
+        quote-resolved image is still skippable — quote media must not
+        flip a placeholder into a non-placeholder.
+        """
+        _adapter, ctx = self._make_resolved_ctx(
+            chat_type="dm",
+            reply_to="quoted-004",
+            quote_media_refs=[("rid", "image", "")],
+            raw_text="[image]",
+        )
+
+        with patch.object(
+            MediaResolveMiddleware, "_resolve_media_urls",
+            new=AsyncMock(return_value=([], [])),  # no own media
+        ), patch.object(
+            MediaResolveMiddleware, "_resolve_quote_media",
+            new=AsyncMock(return_value=(["/cache/q.jpg"], ["image/jpeg"])),
+        ), patch.object(
+            PlaceholderFilterMiddleware, "is_skippable_placeholder",
+            return_value=True,
+        ) as p_check:
+            next_fn = AsyncMock()
+            await MediaResolveMiddleware()(ctx, next_fn)
+
+        # Pipeline short-circuited despite quote media being present.
+        next_fn.assert_not_awaited()
+        # And the second-pass check was called with own_count == 0.
+        p_check.assert_called_once()
+        _text_arg, count_arg = p_check.call_args.args
+        assert count_arg == 0
+
+
+# ============================================================
+# PatchAnchorsMiddleware Tests
+# ============================================================
+
+class TestPatchAnchorsMiddleware:
+    """Tests for PatchAnchorsMiddleware._patch()."""
+
+    def test_no_op_when_text_or_urls_empty(self):
+        assert PatchAnchorsMiddleware._patch("", [], []) == ""
+        assert PatchAnchorsMiddleware._patch("hello", [], []) == "hello"
+
+    def test_replaces_image_anchor_with_local_path(self):
+        text = "look [image|ybres:abc] please"
+        out = PatchAnchorsMiddleware._patch(
+            text, ["/cache/x.jpg"], ["image/jpeg"],
+        )
+        assert out == "look [image: /cache/x.jpg] please"
+
+    def test_replaces_file_anchor_with_filename_label(self):
+        text = "see [file:doc.pdf|ybres:rid-1]"
+        out = PatchAnchorsMiddleware._patch(
+            text, ["/cache/doc.pdf"], ["application/pdf"],
+        )
+        assert "[file: doc.pdf → /cache/doc.pdf]" in out
+
+    def test_skips_non_local_paths(self):
+        """URLs not starting with '/' are left untouched."""
+        text = "[image|ybres:abc]"
+        out = PatchAnchorsMiddleware._patch(
+            text, ["https://example.com/x.jpg"], ["image/jpeg"],
+        )
+        # Anchor preserved verbatim because the resolved url is remote.
+        assert out == text
+
+    def test_anchor_kind_image_requires_image_mime(self):
+        """An [image|...] anchor with a non-image mime is left alone."""
+        text = "[image|ybres:rid]"
+        out = PatchAnchorsMiddleware._patch(
+            text, ["/cache/odd.bin"], ["application/octet-stream"],
+        )
+        assert out == text
+
+    @pytest.mark.asyncio
+    async def test_handle_writes_back_to_ctx(self):
+        adapter = make_adapter()
+        ctx = make_ctx(
+            adapter=adapter,
+            raw_text="hi [image|ybres:rid]",
+            media_urls=["/cache/y.png"],
+            media_types=["image/png"],
+        )
+        next_fn = AsyncMock()
+        await PatchAnchorsMiddleware()(ctx, next_fn)
+        assert ctx.raw_text == "hi [image: /cache/y.png]"
+        next_fn.assert_awaited_once()
+
+
+# ============================================================
+# Helpers for group interrupt / backward-pull tests
+# ============================================================
+
+def _at_bot_msg_body(bot_id="bot_123"):
+    """Build a bare @bot msg_body (mention only, no extra content)."""
+    return [{
+        "msg_type": "TIMCustomElem",
+        "msg_content": {
+            "data": json.dumps({"elem_type": 1002, "text": "@Bot", "user_id": bot_id})
+        },
+    }]
+
+
+def _make_group_source(user_id, group_code="grp-1"):
+    """Create a real SessionSource for a group context."""
+    return SessionSource(
+        platform=Platform.YUANBAO,
+        chat_id=f"group:{group_code}",
+        chat_type="group",
+        user_id=user_id,
+        thread_id="main",
+    )
+
+
+def _make_group_ctx(adapter, user_id, group_code="grp-1", text="", msg_body=None, **kw):
+    """Create a group InboundContext with the minimum required fields set."""
+    source = _make_group_source(user_id, group_code)
+    return make_ctx(
+        adapter=adapter,
+        chat_type="group",
+        chat_id=f"group:{group_code}",
+        group_code=group_code,
+        from_account=user_id,
+        sender_nickname=user_id,
+        raw_text=text,
+        msg_body=msg_body or _at_bot_msg_body(adapter._bot_id),
+        source=source,
+        **kw,
+    )
+
+
+# ============================================================
+# TestGroupAtGuardExtensions — speaker recording behaviour
+# ============================================================
+
+class TestGroupAtGuardExtensions:
+    """Tests for the speaker-recording addition to GroupAtGuardMiddleware."""
+
+    @pytest.mark.asyncio
+    async def test_speaker_recorded_for_non_at_bot(self):
+        """Non-@bot group messages are recorded in _group_recent_speakers."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        adapter._session_store = None
+        ctx = _make_group_ctx(
+            adapter, "alice", group_code="g1",
+            text="hello everyone",
+            msg_body=[{"msg_type": "TIMTextElem", "msg_content": {"text": "hello everyone"}}],
+        )
+        next_fn = AsyncMock()
+        await GroupAtGuardMiddleware()(ctx, next_fn)
+        speakers = [uid for uid, _ts in adapter._group_recent_speakers.get("g1", [])]
+        assert "alice" in speakers
+
+    @pytest.mark.asyncio
+    async def test_speaker_recorded_for_at_bot(self):
+        """@bot group messages are also recorded in _group_recent_speakers."""
+        adapter = make_adapter()
+        adapter._bot_id = "bot_123"
+        ctx = _make_group_ctx(adapter, "alice", group_code="g2")
+        next_fn = AsyncMock()
+        await GroupAtGuardMiddleware()(ctx, next_fn)
+        speakers = [uid for uid, _ts in adapter._group_recent_speakers.get("g2", [])]
+        assert "alice" in speakers
+
+
+# ============================================================
+# TestGroupInterruptInDispatch
+# ============================================================
+
+class TestGroupInterruptInDispatch:
+    """Integration tests for the interrupt gate in DispatchMiddleware's group branch.
+
+    Condition logic is covered by TestShouldInterrupt (unit). Here we only verify
+    that DispatchMiddleware correctly wires the decision to interrupt_session_activity,
+    and that DM messages bypass the gate entirely.
+    """
+
+    def _make_sk(self, user_id, group_code="grp-1"):
+        source = _make_group_source(user_id, group_code)
+        return build_session_key(source, group_sessions_per_user=True), source
+
+    @pytest.mark.asyncio
+    async def test_same_user_within_window_calls_interrupt(self):
+        """Same user re-@bots within window → interrupt_session_activity called before enqueue."""
+        adapter = make_adapter()
+        adapter._interrupt_window_seconds = 20.0
+        sk, source = self._make_sk("alice")
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 5.0
+        adapter.interrupt_session_activity = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        ctx = _make_group_ctx(adapter, "alice", group_code="grp-1")
+        ctx.source = source
+        ctx.msg_type = MagicMock()
+        ctx.media_types = []
+        ctx.media_urls = []
+        await DispatchMiddleware()(ctx, AsyncMock())
+
+        adapter.interrupt_session_activity.assert_awaited_once_with(sk, "group:grp-1")
+
+    @pytest.mark.asyncio
+    async def test_dm_never_triggers_interrupt(self):
+        """DM messages go through the else branch — interrupt logic is unreachable."""
+        adapter = make_adapter()
+        adapter.interrupt_session_activity = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        source = _make_group_source("alice", "grp-1")
+        ctx = make_ctx(
+            adapter=adapter,
+            chat_type="dm",
+            from_account="alice",
+            source=source,
+            msg_type=MagicMock(),
+            media_types=[],
+            media_urls=[],
+        )
+        await DispatchMiddleware()(ctx, AsyncMock())
+        adapter.interrupt_session_activity.assert_not_awaited()
+
+
+# ============================================================
+# TestShouldInterrupt — unit tests for the helper method
+# ============================================================
+
+class TestShouldInterrupt:
+    """Unit tests for DispatchMiddleware._should_interrupt."""
+
+    def _setup(self, window=20.0):
+        adapter = make_adapter()
+        adapter._interrupt_window_seconds = window
+        return adapter
+
+    def _call(self, adapter, ctx, sk):
+        return DispatchMiddleware._should_interrupt(adapter, ctx, sk, time.monotonic())
+
+    def _record_speaker(self, adapter, group_code, user_id, ts):
+        dq = adapter._group_recent_speakers.get(group_code)
+        if dq is None:
+            dq = collections.deque(maxlen=20)
+            adapter._group_recent_speakers[group_code] = dq
+        dq.append((user_id, ts))
+
+    def test_all_conditions_met_returns_true(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 5.0
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is True
+
+    def test_different_user_returns_false(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 5.0
+        ctx = make_ctx(adapter=adapter, from_account="bob", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
+
+    def test_window_expired_returns_false(self):
+        adapter = self._setup(window=10.0)
+        sk = "session:alice"
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = time.monotonic() - 15.0
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
+
+    def test_interleave_after_start_returns_false(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        started = time.monotonic() - 5.0
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = started
+        self._record_speaker(adapter, "g1", "bob", started + 2.0)
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
+
+    def test_interleave_before_start_ignored(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        started = time.monotonic() - 5.0
+        adapter._active_turn_user[sk] = "alice"
+        adapter._active_turn_started_at[sk] = started
+        self._record_speaker(adapter, "g1", "bob", started - 1.0)
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is True
+
+    def test_no_active_turn_returns_false(self):
+        adapter = self._setup()
+        sk = "session:alice"
+        ctx = make_ctx(adapter=adapter, from_account="alice", group_code="g1", chat_type="group")
+        assert self._call(adapter, ctx, sk) is False
