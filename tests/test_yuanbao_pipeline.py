@@ -1146,7 +1146,7 @@ class TestResolveYbresRefs:
         """Refs whose kind is outside ``_RESOLVABLE_MEDIA_KINDS`` are dropped silently."""
         adapter = make_adapter()
         refs = [
-            ("rid-v", "video", ""),       # not resolvable
+            ("rid-a", "audio", ""),       # not resolvable
             ("rid-i", "image", "ok.jpg"),  # resolvable
             ("rid-?", "unknown", ""),     # not resolvable
         ]

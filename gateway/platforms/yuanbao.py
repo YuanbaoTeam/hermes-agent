@@ -3095,41 +3095,43 @@ class DispatchMiddleware(InboundMiddleware):
 
         _from_account = ctx.from_account
 
+        # Build the MessageEvent once; reused by both the interrupt and normal paths.
+        _event = MessageEvent(
+            text=ctx.raw_text,
+            message_type=(
+                MessageType.DOCUMENT
+                if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types)
+                # Coerce yuanbao-local subtypes (e.g. CHAT_RECORD) back to a
+                # base MessageType: chat records are deep-parsed into a text
+                # prompt, so TEXT is the right kind for downstream routing.
+                else ctx.msg_type if isinstance(ctx.msg_type, MessageType)
+                else MessageType.TEXT
+            ),
+            source=ctx.source,
+            message_id=ctx.msg_id or None,
+            raw_message=ctx.push,
+            media_urls=list(ctx.media_urls),
+            media_types=list(ctx.media_types),
+            reply_to_message_id=ctx.reply_to_message_id,
+            reply_to_text=ctx.reply_to_text,
+            channel_prompt=ctx.channel_prompt,
+        )
+        if _sk and ctx.msg_id:
+            adapter._processing_msg_ids[_sk] = ctx.msg_id
+            adapter._processing_msg_texts[_sk] = ctx.raw_text or ""
+        if ctx.msg_id and ctx.raw_text:
+            cache = adapter._msg_content_cache
+            cache[ctx.msg_id] = ctx.raw_text
+            if len(cache) > 200:
+                for k in list(cache)[:len(cache) - 200]:
+                    del cache[k]
+
         async def _dispatch_inbound_event() -> None:
-            event = MessageEvent(
-                text=ctx.raw_text,
-                message_type=(
-                    MessageType.DOCUMENT
-                    if any(mt.startswith(("application/", "text/")) for mt in ctx.media_types)
-                    # Coerce yuanbao-local subtypes (e.g. CHAT_RECORD) back to a
-                    # base MessageType: chat records are deep-parsed into a text
-                    # prompt, so TEXT is the right kind for downstream routing.
-                    else ctx.msg_type if isinstance(ctx.msg_type, MessageType)
-                    else MessageType.TEXT
-                ),
-                source=ctx.source,
-                message_id=ctx.msg_id or None,
-                raw_message=ctx.push,
-                media_urls=list(ctx.media_urls),
-                media_types=list(ctx.media_types),
-                reply_to_message_id=ctx.reply_to_message_id,
-                reply_to_text=ctx.reply_to_text,
-                channel_prompt=ctx.channel_prompt,
-            )
-            if _sk and ctx.msg_id:
-                adapter._processing_msg_ids[_sk] = ctx.msg_id
-                adapter._processing_msg_texts[_sk] = ctx.raw_text or ""
-            if ctx.msg_id and ctx.raw_text:
-                cache = adapter._msg_content_cache
-                cache[ctx.msg_id] = ctx.raw_text
-                if len(cache) > 200:
-                    for k in list(cache)[:len(cache) - 200]:
-                        del cache[k]
             # Record turn owner at dispatch time (not pipeline time) to avoid queue races.
             if _sk and _from_account:
                 adapter._active_turn_user[_sk] = _from_account
                 adapter._active_turn_started_at[_sk] = time.monotonic()
-            await adapter.handle_message(event)
+            await adapter.handle_message(_event)
 
         if ctx.chat_type == "group":
             # Interrupt running turn if same user re-@bots within the window.
@@ -3141,6 +3143,11 @@ class DispatchMiddleware(InboundMiddleware):
                         adapter.name, (_sk or "")[:60], adapter._interrupt_window_seconds,
                     )
                     await adapter.interrupt_session_activity(_sk, ctx.chat_id)
+                    # Use base.py's pending-message slot: suppresses the interrupt-status
+                    # reply and drains the new message as the next turn directly.
+                    adapter._pending_messages[_sk] = _event
+                    await next_fn()
+                    return
 
             is_new = _sk not in adapter._group_queues
             queue = adapter._group_queues.setdefault(_sk, asyncio.Queue())
@@ -5085,7 +5092,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._active_turn_started_at: Dict[str, float] = {}  # sk -> monotonic ts
         self._group_recent_speakers: Dict[str, collections.deque] = {}  # group_code -> deque[(uid, ts)]
         self._interrupt_window_seconds: float = float(
-            _extra.get("interrupt_window_seconds", 20.0)
+            _extra.get("interrupt_window_seconds", 30.0)
         )
 
         # Recall support: track which msg_id is being processed per session_key
