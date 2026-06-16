@@ -162,7 +162,7 @@ _YB_RES_REF_RE = re.compile(
     r"\[(image|voice|video|file(?::[^|\]]*)?)\|ybres:([A-Za-z0-9_\-]+)\]"
 )
 
-# Patched local-media anchors once an inbound resource has been downloaded to the local cache. 
+# Patched local-media anchors once an inbound resource has been downloaded to the local cache.
 #   [image: /opt/data/image_cache/img_xxx.bmp]
 #   [file: report.pdf → /opt/data/.../report.pdf]
 #   (and any future kind, e.g. [video: /opt/.../clip.mp4])
@@ -2394,7 +2394,7 @@ class ForwardedRecordsParseMiddleware(InboundMiddleware):
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         try:
             if ctx.forwarded_records:
-                self._send_loading_heartbeat(ctx)
+                await self._send_loading_heartbeat(ctx)
                 ctx.raw_text = self.build_forward_text(ctx.forwarded_records, ctx=ctx, is_dispatch=True)
         except Exception as exc:
             # Degrade gracefully: leave ctx.raw_text as-is.
