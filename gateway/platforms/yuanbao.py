@@ -27,6 +27,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import time
@@ -99,6 +100,29 @@ from gateway.session import build_session_key
 
 logger = logging.getLogger(__name__)
 
+
+def _task_exc_name(task: Optional["asyncio.Task"]) -> Optional[str]:
+    """Best-effort name of the exception that ended a task (for logging)."""
+    if task is None or not task.done():
+        return None
+    try:
+        exc = task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        return "cancelled"
+    return type(exc).__name__ if exc else None
+
+
+class PermanentAuthError(Exception):
+    """Auth failed in a way retrying won't recover.
+
+    Examples: invalid app_key/secret, bot disabled, intent revoked. Mapped
+    from server WS close codes in ``NO_RECONNECT_CLOSE_CODES``. Raised out of
+    the reconnect path so the tiered state machine skips all retries and goes
+    straight to give-up instead of burning the retry budget (solves P-2:
+    permanent errors otherwise self-DDoS the sign-token API + WS server).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Version / platform constants (used in AUTH_BIND and sign-token headers)
 # ---------------------------------------------------------------------------
@@ -140,6 +164,61 @@ NO_RECONNECT_CLOSE_CODES = {4012, 4013, 4014, 4018, 4019, 4021}
 
 # Heartbeat timeout threshold — N consecutive missed pongs trigger reconnect.
 HEARTBEAT_TIMEOUT_THRESHOLD = 2
+
+# ---------------------------------------------------------------------------
+# Tiered-reconnect defaults (SRE hardening). All overridable via
+# config.yaml -> platforms.yuanbao.extra.reconnect / .watchdog / .logging.
+# MAX_RECONNECT_ATTEMPTS above is kept only as a compatibility constant; the
+# tiered reconnect path below does not read it.
+# ---------------------------------------------------------------------------
+RECONNECT_FAST_ATTEMPTS = 10       # Phase 1: fast retries
+RECONNECT_FAST_BASE_S = 1.0        # fast-stage backoff base
+RECONNECT_FAST_CAP_S = 60.0        # fast-stage per-attempt cap
+RECONNECT_SLOW_INTERVAL_S = 300.0  # Phase 2: fixed interval (5 min)
+RECONNECT_SLOW_MAX_HOURS = 24.0    # Phase 2: total budget
+RECONNECT_JITTER_RATIO = 0.2       # ±20% jitter, anti-thundering-herd
+
+# Give-up actions after all retries are exhausted (solves the zombie-process
+# failure mode: a process that is alive but will never reconnect again).
+GIVE_UP_ACTIONS = ("emit_only", "exit_for_supervisor", "self_restart")
+DEFAULT_GIVE_UP_ACTION = "exit_for_supervisor"
+DORMANT_PROBE_INTERVAL_S = 1800.0  # emit_only mode: low-frequency self-heal probe
+SELF_RESTART_DELAY_S = 60.0
+SELF_RESTART_MAX_PER_HOUR = 3      # cap self_restart storms (C-9)
+
+# Active watchdog: catches "WS looks alive but is dead" soft failures the
+# passive recv/heartbeat loops miss (silent recv-task death, half-open TCP, ...).
+WATCHDOG_INTERVAL_S = 30.0                 # 1× heartbeat period (C-3)
+WATCHDOG_STALE_MSG_THRESHOLD_S = 90.0      # 3× heartbeat with no server msg = suspect
+
+# ---------------------------------------------------------------------------
+# Structured observability event keys (ws.* namespace). Kept here so the whole
+# yuanbao adapter is self-contained. Business code MUST reference these
+# EV_WS_* names instead of writing raw key strings, so keys never drift across
+# call sites (C-10); a single ``grep "ws.reconnect"`` or ``grep "conn_id=<X>"``
+# pulls the whole failure chain out of the logs. These keys are the external
+# contract for log-based monitoring; renaming one goes through a deprecation
+# cycle (C-14).
+# ---------------------------------------------------------------------------
+# Connection lifecycle
+EV_WS_CONNECT_START = "ws.connect.start"
+EV_WS_CONNECT_SUCCESS = "ws.connect.success"
+EV_WS_CONNECT_FAILED = "ws.connect.failed"
+EV_WS_CLOSED = "ws.closed"
+# Reconnect state machine
+EV_WS_RECONNECT_TRIGGER = "ws.reconnect.trigger"        # any "should reconnect" signal
+EV_WS_RECONNECT_ATTEMPT = "ws.reconnect.attempt"        # the Nth concrete attempt
+EV_WS_RECONNECT_FAST_END = "ws.reconnect.fast_exhausted"
+EV_WS_RECONNECT_SLOW_END = "ws.reconnect.slow_deadline"
+EV_WS_RECONNECT_GIVE_UP = "ws.reconnect.give_up"
+EV_WS_RECONNECT_RESURRECT = "ws.reconnect.resurrect"    # dormant probe succeeded
+# Watchdog
+EV_WS_WATCHDOG_TICK = "ws.watchdog.tick"                # DEBUG level, off by default
+EV_WS_WATCHDOG_DETECT = "ws.watchdog.detect_dead"
+EV_WS_WATCHDOG_RESTART = "ws.watchdog.self_restarted"   # watchdog resurrected itself
+# Heartbeat
+EV_WS_HB_TIMEOUT = "ws.heartbeat.timeout"
+EV_WS_HB_RECOVERED = "ws.heartbeat.recovered"
 
 # Auth error code classification
 AUTH_FAILED_CODES = {4001, 4002, 4003}      # permanent auth failure, re-sign token
@@ -3321,9 +3400,81 @@ class ConnectionManager:
         self._consecutive_hb_timeouts: int = 0
         self._reconnect_attempts: int = 0
         self._reconnecting: bool = False
+        # -- SRE hardening state -------------------------------------------
+        # Client-side trace id (distinct from server _connect_id); ties
+        # together every ws.* event of one connection lifecycle for grep.
+        self._client_conn_id: Optional[str] = None
+        self._connected_at: Optional[float] = None    # monotonic, for session_age_s
+        self._last_msg_at: float = 0.0                # monotonic; refreshed on any recv
+        self._reconnect_phase: str = "idle"           # idle|fast|slow|give_up
+        self._stopping: bool = False                  # set in close() to stop loops
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._dormant_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._self_restart_times: List[float] = []    # monotonic ts of self_restart
         # Debounce buffer for aggregating multi-part inbound messages
         self._inbound_buffer: Dict[str, list] = {}  # key -> [raw_data_frames, ...]
         self._inbound_timers: Dict[str, asyncio.TimerHandle] = {}  # key -> timer
+
+    # -- Config accessor ---------------------------------------------------
+
+    def _rcfg(self, key: str, default: Any) -> Any:
+        """Read a reconnect/watchdog/logging config value with fallback."""
+        return self._adapter._cfg_get("reconnect", key, default)
+
+    def _wcfg(self, key: str, default: Any) -> Any:
+        return self._adapter._cfg_get("watchdog", key, default)
+
+    def _lcfg(self, key: str, default: Any) -> Any:
+        return self._adapter._cfg_get("logging", key, default)
+
+    # -- Observability -----------------------------------------------------
+
+    def _log_event(self, level: int, event: str, **fields: Any) -> None:
+        """Structured logger: one grep-able line + machine-readable envelope.
+
+        Always attaches the standard envelope (event/platform/conn_id/
+        session_age_s/reconnect_attempt/reconnect_phase) so every event of a
+        connection lifecycle can be pulled with a single ``grep conn_id=<X>``.
+        Envelope goes under ``extra={"hermes_event": {...}}`` (single nested
+        dict) to avoid clobbering logging's reserved LogRecord attributes
+        (name/level/message/...) which would raise KeyError (C-12).
+        """
+        base = {
+            "event": event,
+            "platform": self._adapter.name,
+            "conn_id": self._client_conn_id,
+            "session_age_s": (round(time.monotonic() - self._connected_at, 2)
+                              if self._connected_at else None),
+            "reconnect_attempt": self._reconnect_attempts,
+            "reconnect_phase": self._reconnect_phase,
+        }
+        base.update(fields)
+        # Keep the envelope in the text message too; the default formatter does
+        # not render LogRecord.extra, and ops workflows rely on plain grep.
+        msg = "[%s] %s" % (
+            self._adapter.name,
+            " ".join("%s=%s" % (k, v) for k, v in base.items()),
+        )
+        logger.log(level, msg, extra={"hermes_event": base})
+
+    async def _emit_and_log(self, level: int, event: str, **fields: Any) -> None:
+        """Write the structured log, then best-effort mirror to the event bus.
+
+        Log first, emit second: a broken event bus must never block log write
+        (C-11). If the adapter exposes no event-bus hook, the emit is skipped.
+        """
+        self._log_event(level, event, **fields)
+        emit = getattr(self._adapter, "_emit_platform_event", None)
+        if emit is None:
+            return
+        try:
+            result = emit(event, dict(fields))
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:  # emit failure degrades to debug only
+            logger.debug("[%s] emit failed for %s: %s",
+                         self._adapter.name, event, exc)
 
     # -- Properties --------------------------------------------------------
 
@@ -3394,6 +3545,12 @@ class ConnectionManager:
             return False
 
         try:
+            self._client_conn_id = uuid.uuid4().hex[:8]
+            self._reconnect_phase = "idle"
+            self._reconnect_attempts = 0
+            _connect_start = time.monotonic()
+            self._log_event(logging.INFO, EV_WS_CONNECT_START,
+                            ws_url=adapter._ws_url)
             # Step 1: Get sign token
             logger.info("[%s] Fetching sign token from %s", adapter.name, adapter._api_domain)
             token_data = await SignManager.get_token(
@@ -3420,18 +3577,24 @@ class ConnectionManager:
             # Step 3: Authenticate (AUTH_BIND + wait for BIND_ACK)
             authed = await self._authenticate(token_data)
             if not authed:
+                self._log_event(logging.WARNING, EV_WS_CONNECT_FAILED,
+                                error_class="AuthFailed", error_msg="BIND_ACK not received")
                 await self._cleanup_ws()
                 return False
 
             # Step 4: Start background tasks
             self._reconnect_attempts = 0
+            self._consecutive_hb_timeouts = 0
+            self._connected_at = time.monotonic()
+            self._last_msg_at = self._connected_at
+            self._stopping = False
             adapter._mark_connected()
             adapter._loop = asyncio.get_running_loop()
-            self._heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
-            )
-            self._recv_task = asyncio.create_task(
-                self._receive_loop(), name=f"yuanbao-recv-{self._connect_id}"
+            self._start_bg_tasks()
+            self._log_event(
+                logging.INFO, EV_WS_CONNECT_SUCCESS,
+                connect_id=self._connect_id,
+                latency_ms=round((time.monotonic() - _connect_start) * 1000, 1),
             )
             logger.info(
                 "[%s] Connected. connectId=%s botId=%s",
@@ -3443,18 +3606,64 @@ class ConnectionManager:
             return True
 
         except asyncio.TimeoutError:
-            logger.error("[%s] Connection timed out", adapter.name)
+            self._log_event(logging.ERROR, EV_WS_CONNECT_FAILED,
+                            error_class="TimeoutError", error_msg="connect timed out")
             await self._cleanup_ws()
             adapter._release_platform_lock()
             return False
         except Exception as exc:
+            self._log_event(logging.ERROR, EV_WS_CONNECT_FAILED,
+                            error_class=type(exc).__name__, error_msg=str(exc))
             logger.error("[%s] connect() failed: %s", adapter.name, exc, exc_info=True)
             await self._cleanup_ws()
             adapter._release_platform_lock()
             return False
 
+    def _start_bg_tasks(self) -> None:
+        """(Re)start heartbeat, receive and watchdog tasks for a live socket.
+
+        Shared by open() and the reconnect path so all three loops always come
+        up together and the watchdog is never left un-started after a redial.
+        """
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"yuanbao-heartbeat-{self._connect_id}"
+        )
+        if self._recv_task and not self._recv_task.done():
+            self._recv_task.cancel()
+        self._recv_task = asyncio.create_task(
+            self._receive_loop(), name=f"yuanbao-recv-{self._connect_id}"
+        )
+        if self._wcfg("enabled", True):
+            if self._watchdog_task and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
+            self._watchdog_task = asyncio.create_task(
+                self._watchdog_loop(), name=f"yuanbao-watchdog-{self._client_conn_id}"
+            )
+
     async def close(self) -> None:
         """Cancel background tasks, fail pending futures, and close the WebSocket."""
+
+        # Signal all self-guarding loops (watchdog / dormant probe) to stop
+        # before cancelling, so a mid-flight iteration exits cleanly.
+        self._stopping = True
+
+        for attr in ("_watchdog_task", "_dormant_task", "_reconnect_task"):
+            task = getattr(self, attr)
+            if task:
+                # cancel() only *requests* cancellation; the task keeps running
+                # until it hits its next await point. Await it here to let the
+                # loop run its cleanup and truly terminate (reap it, avoiding a
+                # "Task was destroyed but it is pending" warning at loop close).
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    # Expected: the task ended by responding to cancellation.
+                    pass
+                # Drop the reference so it can be GC'd and mark it as stopped.
+                setattr(self, attr, None)
 
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -3551,6 +3760,18 @@ class ConnectionManager:
         except asyncio.TimeoutError:
             logger.error("[%s] AUTH_BIND timeout", adapter.name)
             return False
+        except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
+            # Server closed mid-auth. A permanent close code means the
+            # credentials/bot are rejected — surface it so the reconnect
+            # state machine skips all retries and goes straight to give-up
+            # (P-2) instead of hammering sign-token + WS on every attempt.
+            close_code = getattr(close_exc, "code", None)
+            if close_code in NO_RECONNECT_CLOSE_CODES:
+                raise PermanentAuthError(
+                    f"auth rejected with permanent close code {close_code}"
+                ) from close_exc
+            logger.error("[%s] AUTH_BIND connection closed: code=%s", adapter.name, close_code)
+            return False
         except Exception as exc:
             logger.error("[%s] AUTH_BIND error: %s", adapter.name, exc, exc_info=True)
             return False
@@ -3597,17 +3818,24 @@ class ConnectionManager:
                     logger.debug("[%s] PING sent (msg_id=%s)", adapter.name, msg_id)
                     try:
                         await asyncio.wait_for(pong_future, timeout=10.0)
+                        if self._consecutive_hb_timeouts:
+                            self._log_event(logging.INFO, EV_WS_HB_RECOVERED,
+                                            after_timeouts=self._consecutive_hb_timeouts)
                         self._consecutive_hb_timeouts = 0
                     except asyncio.TimeoutError:
                         self._pending_acks.pop(msg_id, None)
                         self._consecutive_hb_timeouts += 1
-                        logger.warning(
-                            "[%s] PONG timeout (%d/%d)",
-                            adapter.name, self._consecutive_hb_timeouts, HEARTBEAT_TIMEOUT_THRESHOLD,
+                        _threshold_hit = (
+                            self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD
                         )
-                        if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
-                            logger.warning("[%s] Heartbeat threshold exceeded, triggering reconnect", adapter.name)
-                            self.schedule_reconnect()
+                        self._log_event(
+                            logging.ERROR if _threshold_hit else logging.WARNING,
+                            EV_WS_HB_TIMEOUT,
+                            count=self._consecutive_hb_timeouts,
+                            threshold=HEARTBEAT_TIMEOUT_THRESHOLD,
+                        )
+                        if _threshold_hit:
+                            self._trigger_reconnect("heartbeat_timeout")
                             return
                     finally:
                         self._pending_acks.pop(msg_id, None)
@@ -3621,9 +3849,21 @@ class ConnectionManager:
 
     async def _receive_loop(self) -> None:
         """Read WS frames and dispatch by cmd_type."""
-        adapter = self._adapter
         try:
             async for raw in self._ws:  # type: ignore[union-attr]
+                # Any inbound frame (incl. heartbeat ack) proves liveness; the
+                # watchdog reads this to detect half-open "silent" sockets.
+                self._last_msg_at = time.monotonic()
+                # Third layer of redundancy: if the watchdog task died, revive
+                # it here so we never silently fall back to passive-only detection.
+                if (self._watchdog_task and self._watchdog_task.done()
+                        and not self._stopping and self._wcfg("enabled", True)):
+                    self._log_event(logging.WARNING, EV_WS_WATCHDOG_RESTART,
+                                    prior_exception=_task_exc_name(self._watchdog_task))
+                    self._watchdog_task = asyncio.create_task(
+                        self._watchdog_loop(),
+                        name=f"yuanbao-watchdog-{self._client_conn_id}-restart",
+                    )
                 if not isinstance(raw, (bytes, bytearray)):
                     continue
                 await self._handle_frame(bytes(raw))
@@ -3631,21 +3871,28 @@ class ConnectionManager:
             pass
         except websockets.exceptions.ConnectionClosed as close_exc:  # type: ignore[union-attr]
             close_code = getattr(close_exc, 'code', None)
-            logger.warning(
-                "[%s] WebSocket connection closed: code=%s reason=%s",
-                adapter.name, close_code, getattr(close_exc, 'reason', ''),
+            is_permanent = bool(close_code and close_code in NO_RECONNECT_CLOSE_CODES)
+            self._log_event(
+                logging.ERROR if is_permanent else logging.WARNING,
+                EV_WS_CLOSED,
+                close_code=close_code,
+                is_permanent=is_permanent,
+                last_msg_age_s=(round(time.monotonic() - self._last_msg_at, 1)
+                                if self._last_msg_at else None),
             )
-            if close_code and close_code in NO_RECONNECT_CLOSE_CODES:
-                logger.error(
-                    "[%s] Close code %d is non-recoverable, NOT reconnecting",
-                    adapter.name, close_code,
-                )
-                adapter._mark_disconnected()
+            if is_permanent:
+                # Permanent error: no point retrying — hand straight to give-up.
+                self._track_bg(self._handle_give_up(reason="permanent_close_code"))
             else:
-                self.schedule_reconnect()
+                self._trigger_reconnect("recv_connection_closed")
         except Exception as exc:
-            logger.warning("[%s] receive_loop exited: %s", adapter.name, exc)
-            self.schedule_reconnect()
+            self._log_event(logging.WARNING, EV_WS_CLOSED,
+                            error_class=type(exc).__name__, error_msg=str(exc))
+            self._trigger_reconnect("recv_exception")
+
+    def _track_bg(self, coro) -> None:
+        """Schedule a fire-and-forget coroutine, kept alive against GC."""
+        self._adapter._track_task(asyncio.create_task(coro))
 
     async def _handle_frame(self, raw: bytes) -> None:
         """Handle a single WebSocket frame."""
@@ -3856,13 +4103,55 @@ class ConnectionManager:
 
     # -- Reconnect ---------------------------------------------------------
 
+    def _compute_backoff(self, attempt: int) -> float:
+        """Fast-stage exponential backoff with ±jitter (anti-thundering-herd)."""
+        base_s = self._rcfg("fast_base_s", RECONNECT_FAST_BASE_S)
+        cap_s = self._rcfg("fast_cap_s", RECONNECT_FAST_CAP_S)
+        ratio = self._rcfg("jitter_ratio", RECONNECT_JITTER_RATIO)
+        base = min(base_s * (2 ** attempt), cap_s)
+        jitter = random.uniform(-base * ratio, base * ratio)
+        return max(0.5, base + jitter)
+
+    def _schedule_reconnect_task(self, reason: str) -> None:
+        """Start one tracked reconnect task, unless one is already pending."""
+        if self._reconnecting or (self._reconnect_task and not self._reconnect_task.done()):
+            logger.debug("[%s] reconnect already in progress (reason=%s skipped)",
+                         self._adapter.name, reason)
+            return
+        self._log_event(logging.INFO, EV_WS_RECONNECT_TRIGGER, reason=reason)
+        task = asyncio.create_task(
+            self._reconnect_with_backoff(), name=f"yuanbao-reconnect-{reason}"
+        )
+        self._reconnect_task = task
+
+        def _clear(done_task: asyncio.Task) -> None:
+            if self._reconnect_task is done_task:
+                self._reconnect_task = None
+
+        task.add_done_callback(_clear)
+        self._adapter._track_task(task)
+
+    def _trigger_reconnect(self, reason: str) -> None:
+        """Unified reconnect entry. Idempotent under the ``_reconnecting`` guard.
+
+        Every reconnect signal (heartbeat timeout, recv exception, watchdog)
+        funnels through here so they all share one backoff state machine and
+        can never race each other into two concurrent redials (C-5).
+        """
+        if not self._adapter._running or self._stopping:
+            return
+        if self._reconnecting or (self._reconnect_task and not self._reconnect_task.done()):
+            logger.debug("[%s] reconnect already in progress (reason=%s skipped)",
+                         self._adapter.name, reason)
+            return
+        self._schedule_reconnect_task(reason)
+
     def schedule_reconnect(self) -> None:
-        """Schedule a reconnect only if running and not already reconnecting."""
-        if self._adapter._running and not self._reconnecting:
-            asyncio.create_task(self._reconnect_with_backoff())
+        """Back-compat alias for the unified reconnect entry."""
+        self._trigger_reconnect("schedule_reconnect")
 
     async def _reconnect_with_backoff(self) -> bool:
-        """Reconnect with exponential backoff (1s, 2s, 4s, … up to 60s)."""
+        """Guarded entry to the tiered reconnect state machine."""
         if self._reconnecting:
             logger.debug("[%s] Reconnect already in progress, skipping", self._adapter.name)
             return False
@@ -3871,81 +4160,331 @@ class ConnectionManager:
             return await self._do_reconnect()
         finally:
             self._reconnecting = False
+            self._reconnect_phase = "idle"
+
+    async def _attempt_single_reconnect(self) -> bool:
+        """One redial: cleanup → force-refresh token → connect → auth → loops.
+
+        Raises ``PermanentAuthError`` when the server rejects auth with a
+        permanent close code, so callers can bail out of the retry loops.
+        Returns True on success, False on transient failure.
+        """
+        adapter = self._adapter
+        await self._cleanup_ws()
+
+        token_data = await SignManager.force_refresh(
+            adapter._app_key, adapter._app_secret, adapter._api_domain,
+            route_env=adapter._route_env,
+        )
+        if token_data.get("bot_id"):
+            adapter._bot_id = str(token_data["bot_id"])
+
+        self._ws = await asyncio.wait_for(
+            websockets.connect(  # type: ignore[attr-defined]
+                adapter._ws_url,
+                ping_interval=None,
+                ping_timeout=None,
+                close_timeout=5,
+            ),
+            timeout=CONNECT_TIMEOUT_SECONDS,
+        )
+
+        authed = await self._authenticate(token_data)  # may raise PermanentAuthError
+        if not authed:
+            await self._cleanup_ws()
+            return False
+
+        self._reconnect_attempts = 0
+        self._consecutive_hb_timeouts = 0
+        self._connected_at = time.monotonic()
+        self._last_msg_at = self._connected_at
+        adapter._mark_connected()
+        self._start_bg_tasks()
+        self._log_event(logging.INFO, EV_WS_CONNECT_SUCCESS,
+                        connect_id=self._connect_id, reconnected=True)
+        return True
 
     async def _do_reconnect(self) -> bool:
-        """Internal reconnect loop, called under the _reconnecting guard."""
+        """Tiered reconnect: fast retry → slow retry → final give-up.
+
+        Fast stage: N exponential-backoff attempts (jittered). Slow stage:
+        fixed-interval retries bounded by a total budget. A ``PermanentAuthError``
+        at any point skips the rest and goes straight to give-up (P-2), so a
+        rejected credential never burns the whole retry budget.
+        """
         adapter = self._adapter
-        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+        fast_attempts = int(self._rcfg("fast_attempts", RECONNECT_FAST_ATTEMPTS))
+        slow_interval = float(self._rcfg("slow_interval_s", RECONNECT_SLOW_INTERVAL_S))
+        slow_max_hours = float(self._rcfg("slow_max_hours", RECONNECT_SLOW_MAX_HOURS))
+        jitter_ratio = float(self._rcfg("jitter_ratio", RECONNECT_JITTER_RATIO))
+        slow_log_every = int(self._lcfg("slow_attempt_log_every", 10))
+        started = time.monotonic()
+        if self._stopping:
+            return False
+
+        # Phase 1: fast retry
+        self._reconnect_phase = "fast"
+        for attempt in range(fast_attempts):
             self._reconnect_attempts = attempt + 1
-            wait = min(2 ** attempt, 60)
-            logger.info(
-                "[%s] Reconnect attempt %d/%d in %ds",
-                adapter.name, attempt + 1, MAX_RECONNECT_ATTEMPTS, wait,
-            )
+            wait = self._compute_backoff(attempt)
+            self._log_event(logging.INFO, EV_WS_RECONNECT_ATTEMPT,
+                            attempt_index=attempt + 1, phase="fast",
+                            backoff_s=round(wait, 1))
             await asyncio.sleep(wait)
-
-            await self._cleanup_ws()
-
+            if self._stopping:
+                return False
             try:
-                token_data = await SignManager.force_refresh(
-                    adapter._app_key, adapter._app_secret, adapter._api_domain,
-                    route_env=adapter._route_env,
-                )
-                if token_data.get("bot_id"):
-                    adapter._bot_id = str(token_data["bot_id"])
-
-                self._ws = await asyncio.wait_for(
-                    websockets.connect(  # type: ignore[attr-defined]
-                        adapter._ws_url,
-                        ping_interval=None,
-                        ping_timeout=None,
-                        close_timeout=5,
-                    ),
-                    timeout=CONNECT_TIMEOUT_SECONDS,
-                )
-
-                authed = await self._authenticate(token_data)
-                if not authed:
-                    logger.warning("[%s] Re-auth failed on attempt %d", adapter.name, attempt + 1)
-                    await self._cleanup_ws()
-                    continue
-
-                self._reconnect_attempts = 0
-                self._consecutive_hb_timeouts = 0
-                adapter._mark_connected()
-
-                if self._heartbeat_task and not self._heartbeat_task.done():
-                    self._heartbeat_task.cancel()
-                self._heartbeat_task = asyncio.create_task(
-                    self._heartbeat_loop(),
-                    name=f"yuanbao-heartbeat-{self._connect_id}",
-                )
-
-                if self._recv_task and not self._recv_task.done():
-                    self._recv_task.cancel()
-                self._recv_task = asyncio.create_task(
-                    self._receive_loop(),
-                    name=f"yuanbao-recv-{self._connect_id}",
-                )
-
-                logger.info(
-                    "[%s] Reconnected on attempt %d. connectId=%s",
-                    adapter.name, attempt + 1, self._connect_id,
-                )
-                return True
-
-            except asyncio.TimeoutError:
-                logger.warning("[%s] Reconnect attempt %d timed out", adapter.name, attempt + 1)
+                if await self._attempt_single_reconnect():
+                    return True
+            except PermanentAuthError as exc:
+                return await self._handle_give_up(reason="permanent_auth", detail=str(exc))
             except Exception as exc:
-                logger.warning(
-                    "[%s] Reconnect attempt %d failed: %s", adapter.name, attempt + 1, exc
-                )
+                logger.warning("[%s] fast-retry %d failed: %s",
+                               adapter.name, attempt + 1, exc)
 
-        logger.error(
-            "[%s] Giving up after %d reconnect attempts", adapter.name, MAX_RECONNECT_ATTEMPTS
+        self._log_event(logging.WARNING, EV_WS_RECONNECT_FAST_END,
+                        attempts=fast_attempts,
+                        total_elapsed_s=round(time.monotonic() - started, 1))
+
+        # Phase 2: slow retry
+        self._reconnect_phase = "slow"
+        slow_deadline = time.monotonic() + slow_max_hours * 3600
+        slow_attempt = 0
+        while time.monotonic() < slow_deadline:
+            slow_attempt += 1
+            self._reconnect_attempts = fast_attempts + slow_attempt
+            wait = slow_interval * random.uniform(1.0 - jitter_ratio, 1.0 + jitter_ratio)
+            # Throttle slow-stage logging so a 24h outage doesn't emit hundreds
+            # of INFO lines: log every Nth attempt at INFO, the rest at DEBUG.
+            level = (logging.INFO
+                     if slow_log_every <= 1 or slow_attempt % slow_log_every == 1
+                     else logging.DEBUG)
+            self._log_event(level, EV_WS_RECONNECT_ATTEMPT,
+                            attempt_index=slow_attempt, phase="slow",
+                            backoff_s=round(wait, 0),
+                            deadline_in_h=round((slow_deadline - time.monotonic()) / 3600, 1))
+            await asyncio.sleep(wait)
+            if self._stopping:
+                return False
+            try:
+                if await self._attempt_single_reconnect():
+                    return True
+            except PermanentAuthError as exc:
+                return await self._handle_give_up(reason="permanent_auth", detail=str(exc))
+            except Exception as exc:
+                logger.debug("[%s] slow-retry %d failed: %s",
+                             adapter.name, slow_attempt, exc)
+
+        # Phase 3: final give-up
+        self._log_event(logging.ERROR, EV_WS_RECONNECT_SLOW_END,
+                        total_elapsed_s=round(time.monotonic() - started, 1))
+        return await self._handle_give_up(reason="exhausted")
+
+    # -- Give-up handling --------------------------------------------------
+
+    async def _handle_give_up(self, *, reason: str, detail: str = "") -> bool:
+        """Final give-up. Never just goes quiet — always takes a fallback action
+        (configurable), so we can't end up as a live-but-dead zombie (P-4).
+
+        Returns False unconditionally (reconnect failed).
+        """
+        adapter = self._adapter
+        self._reconnect_phase = "give_up"
+        action = self._rcfg("give_up_action", DEFAULT_GIVE_UP_ACTION)
+        if action not in GIVE_UP_ACTIONS:
+            action = DEFAULT_GIVE_UP_ACTION
+        diagnosis = await self._diagnose_failure()
+
+        await self._emit_and_log(
+            logging.ERROR, EV_WS_RECONNECT_GIVE_UP,
+            reason=reason, action=action, diagnosis=diagnosis,
+            detail=detail, bot_id=adapter._bot_id,
         )
         adapter._mark_disconnected()
+
+        if action == "exit_for_supervisor":
+            from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+            logger.critical(
+                "[%s] gave up; exiting with code %d for supervisor restart",
+                adapter.name, GATEWAY_SERVICE_RESTART_EXIT_CODE,
+            )
+            await asyncio.sleep(0.5)  # let log/event handlers flush
+            os._exit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
+
+        elif action == "self_restart":
+            self._schedule_self_restart()
+
+        else:  # emit_only — enter low-frequency dormant probe (not truly dead)
+            self._start_dormant_probe()
+
         return False
+
+    async def _diagnose_failure(self) -> str:
+        """Classify the failure mode to enrich the give-up event.
+
+        Returns one of: 'sign_api_down' (sign-token API unreachable, likely
+        local network), 'auth_invalid' (API rejected credentials),
+        'ws_only_down' (API works, WS server down), or 'unknown'.
+        """
+        adapter = self._adapter
+        try:
+            await asyncio.wait_for(
+                SignManager.force_refresh(
+                    adapter._app_key, adapter._app_secret, adapter._api_domain,
+                    route_env=adapter._route_env,
+                ),
+                timeout=10.0,
+            )
+            return "ws_only_down"
+        except (asyncio.TimeoutError, ConnectionError, OSError,
+                httpx.TransportError):
+            return "sign_api_down"
+        except RuntimeError:
+            # SignManager.fetch raises RuntimeError on non-zero API code
+            # (rejected credentials) and on non-200 responses.
+            return "auth_invalid"
+        except Exception:
+            return "unknown"
+
+    def _schedule_self_restart(self) -> None:
+        """Rebuild the connection after a delay, with anti-storm rate limiting.
+
+        If self_restart fires too often it degrades to exit_for_supervisor so a
+        wedged process is escalated to the OS supervisor instead of looping (C-9).
+        """
+        now = time.monotonic()
+        self._self_restart_times = [t for t in self._self_restart_times if now - t < 3600]
+        if len(self._self_restart_times) >= SELF_RESTART_MAX_PER_HOUR:
+            logger.error("[%s] self_restart rate exceeded; escalating to supervisor exit",
+                         self._adapter.name)
+            from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+            os._exit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
+        self._self_restart_times.append(now)
+        delay = float(self._rcfg("self_restart_delay_s", SELF_RESTART_DELAY_S))
+        logger.warning("[%s] gave up; scheduling self-restart in %.0fs",
+                       self._adapter.name, delay)
+
+        async def _restart() -> None:
+            await asyncio.sleep(delay)
+            if self._stopping or self._adapter.is_connected:
+                return
+            # give_up marks the adapter disconnected (_running=False), so the
+            # normal trigger guard would skip this. Start the tracked reconnect
+            # task directly; _stopping still prevents shutdown-time redials.
+            self._schedule_reconnect_task("self_restart")
+
+        self._track_bg(_restart())
+
+    def _start_dormant_probe(self) -> None:
+        """Start (or restart) the low-frequency probe used by emit_only mode."""
+        if self._dormant_task and not self._dormant_task.done():
+            return
+        logger.warning("[%s] gave up; entering dormant probe",
+                       self._adapter.name)
+        self._dormant_task = asyncio.create_task(
+            self._dormant_probe_loop(), name=f"yuanbao-dormant-{self._client_conn_id}"
+        )
+
+    async def _dormant_probe_loop(self) -> None:
+        """Low-frequency probe after give-up; resurrect the connection on success.
+
+        emit_only is NOT truly lying down — it keeps probing so a recovered
+        upstream is picked up automatically without a supervisor restart.
+        """
+        interval = float(self._rcfg("dormant_probe_interval_s", DORMANT_PROBE_INTERVAL_S))
+        try:
+            while not self._stopping:
+                await asyncio.sleep(interval)
+                if self._stopping or self._adapter.is_connected:
+                    continue
+                try:
+                    if await self._attempt_single_reconnect():
+                        await self._emit_and_log(logging.INFO, EV_WS_RECONNECT_RESURRECT)
+                        return  # normal flow takes over
+                except PermanentAuthError:
+                    logger.error("[%s] dormant probe got permanent error, stopping",
+                                 self._adapter.name)
+                    return
+                except Exception as exc:
+                    logger.debug("[%s] dormant probe failed: %s", self._adapter.name, exc)
+        except asyncio.CancelledError:
+            pass
+
+    # -- Watchdog ----------------------------------------------------------
+
+    def _is_ws_truly_alive(self) -> bool:
+        """Multi-signal liveness check — ALL must pass (C-4).
+
+        A single signal (e.g. only ``ws.state``) can lie on a half-open TCP
+        connection, so we AND together six independent signals.
+        """
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State as WsState  # type: ignore
+            if self._ws.state != WsState.OPEN:
+                return False
+        except Exception:
+            if getattr(self._ws, "closed", True):
+                return False
+        if self._recv_task is None or self._recv_task.done():
+            return False
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            return False
+        if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
+            return False
+        stale_threshold = float(self._wcfg("stale_msg_threshold_s",
+                                           WATCHDOG_STALE_MSG_THRESHOLD_S))
+        if (self._last_msg_at
+                and time.monotonic() - self._last_msg_at > stale_threshold):
+            return False
+        return True
+
+    def _dead_ws_reason(self) -> str:
+        """Which liveness signal failed (for the detect_dead event)."""
+        if self._ws is None:
+            return "ws_none"
+        if self._recv_task is None or self._recv_task.done():
+            return "recv_task_dead"
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            return "hb_task_dead"
+        if self._consecutive_hb_timeouts >= HEARTBEAT_TIMEOUT_THRESHOLD:
+            return "hb_timeouts"
+        return "stale_msg"
+
+    async def _watchdog_loop(self) -> None:
+        """Active liveness watchdog running alongside recv/heartbeat.
+
+        MUST NEVER raise out of this loop — any exception is swallowed and
+        logged, then the loop continues; otherwise the watchdog dies silently
+        and we fall back to passive-only detection (C-1).
+        """
+        interval = float(self._wcfg("interval_s", WATCHDOG_INTERVAL_S))
+        log_tick = bool(self._lcfg("log_watchdog_tick", False))
+        while not self._stopping:
+            try:
+                await asyncio.sleep(interval)
+                if self._stopping:
+                    break
+                if log_tick:
+                    self._log_event(logging.INFO, EV_WS_WATCHDOG_TICK,
+                                    alive=self._is_ws_truly_alive())
+                # Passive channel already redialing — don't race it (C-2).
+                if self._reconnecting:
+                    continue
+                if not self._is_ws_truly_alive():
+                    self._log_event(logging.WARNING, EV_WS_WATCHDOG_DETECT,
+                                    failed_check=self._dead_ws_reason(),
+                                    hb_timeouts=self._consecutive_hb_timeouts,
+                                    last_msg_age_s=(round(time.monotonic() - self._last_msg_at, 1)
+                                                    if self._last_msg_at else None))
+                    self._trigger_reconnect("watchdog_detected_dead_ws")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("[%s] watchdog iteration error: %s",
+                             self._adapter.name, exc, exc_info=True)
+                await asyncio.sleep(5.0)  # avoid a tight error loop
 
     async def _cleanup_ws(self) -> None:
         """Close and clear the WebSocket connection, bounded by
@@ -5108,6 +5647,11 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._api_domain: str = (_extra.get("api_domain") or DEFAULT_API_DOMAIN).rstrip("/")
         self._route_env: str = (_extra.get("route_env") or "").strip()
 
+        # Reconnect / watchdog / logging tuning lives under config.yaml
+        # platforms.yuanbao.extra.{reconnect,watchdog,logging} (non-secret
+        # config in yaml, per AGENTS.md). Read lazily via _cfg_get().
+        self._extra_cfg: Dict[str, Any] = _extra
+
         # Bounded concurrency for inbound media resolve/download.
         # See _DEFAULT_RESOLVE_CONCURRENCY for rationale; clamped to [min, max]
         # so a misconfigured value cannot hammer the resource backend nor
@@ -5212,6 +5756,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    def _cfg_get(self, section: str, key: str, default: Any) -> Any:
+        """Read extra.<section>.<key> from config, falling back to default.
+
+        Backs all reconnect/watchdog/logging tuning knobs; a missing section
+        or key transparently yields the module-level default constant.
+        """
+        return (self._extra_cfg.get(section) or {}).get(key, default)
 
     # ------------------------------------------------------------------
     # Abstract method implementations
