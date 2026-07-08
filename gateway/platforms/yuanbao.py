@@ -2829,6 +2829,8 @@ class MediaResolveMiddleware(InboundMiddleware):
         for the same order-preserving / exception-isolated contract.
         """
         # Pre-filter resolvable refs, preserving input order.
+        media_urls: List[str] = []
+        media_types: List[str] = []
         active: List[Tuple[str, str, str, str]] = []
         for ref in media_refs:
             kind = str(ref.get("kind") or "").strip().lower()
@@ -2839,9 +2841,10 @@ class MediaResolveMiddleware(InboundMiddleware):
             rid = ExtractContentMiddleware._parse_resource_id(url)
             if rid and cls._append_cached_resource(adapter, rid, media_urls, media_types):
                 continue
+            active.append((kind, url, filename, rid or ""))
 
         if not active:
-            return [], []
+            return media_urls, media_types
 
         semaphore = asyncio.Semaphore(adapter.media_resolve_concurrency)
 
@@ -2874,8 +2877,6 @@ class MediaResolveMiddleware(InboundMiddleware):
         )
         _elapsed_ms = int((time.monotonic() - _t0) * 1000)
 
-        media_urls: List[str] = []
-        media_types: List[str] = []
         _failed = 0
         for (kind, url, _filename, _rid), result in zip(active, results):
             if isinstance(result, BaseException):
@@ -2920,13 +2921,18 @@ class MediaResolveMiddleware(InboundMiddleware):
         sequentially. Output order matches input; per-rid failures are isolated.
         """
         # Pre-filter resolvable kinds, preserving input order.
-        active: List[Tuple[str, str, str]] = [
-            (rid, kind, filename)
-            for rid, kind, filename in refs
-            if kind in _RESOLVABLE_MEDIA_KINDS
-        ]
+        # Cache-hit refs are served immediately and excluded from the gather.
+        media_paths: List[str] = []
+        mimes: List[str] = []
+        active: List[Tuple[str, str, str]] = []
+        for rid, kind, filename in refs:
+            if kind not in _RESOLVABLE_MEDIA_KINDS:
+                continue
+            if cls._append_cached_resource(adapter, rid, media_paths, mimes):
+                continue
+            active.append((rid, kind, filename))
         if not active:
-            return [], []
+            return media_paths, mimes
 
         semaphore = asyncio.Semaphore(adapter.media_resolve_concurrency)
 
@@ -2957,16 +2963,9 @@ class MediaResolveMiddleware(InboundMiddleware):
         )
         _elapsed_ms = int((time.monotonic() - _t0) * 1000)
 
-        media_paths: List[str] = []
-        mimes: List[str] = []
-        for rid, kind, filename in refs:
-            if kind not in _RESOLVABLE_MEDIA_KINDS:
-                continue
-            if cls._append_cached_resource(adapter, rid, media_paths, mimes):
-                continue
-            try:
-                fresh_url = await cls._fetch_resource_url(adapter, rid)
-            except Exception as exc:
+        _failed = 0
+        for (rid, kind, filename), result in zip(active, results):
+            if isinstance(result, BaseException):
                 logger.warning(
                     "[%s] %s resolve crashed: rid=%s kind=%s err=%s",
                     adapter.name, log_prefix, rid, kind, result,
