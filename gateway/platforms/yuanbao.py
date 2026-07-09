@@ -2852,6 +2852,10 @@ class MediaResolveMiddleware(InboundMiddleware):
             kind: str, url: str, filename: str, rid: str,
         ) -> Optional[Tuple[str, str]]:
             async with semaphore:
+                # Reuse in-process cached download; skip the resource-URL RPC on hit.
+                hit = cls._get_cached_resource(rid)
+                if hit is not None:
+                    return hit
                 try:
                     fetch_url = await cls._resolve_download_url(adapter, url)
                 except Exception as exc:
@@ -2938,6 +2942,10 @@ class MediaResolveMiddleware(InboundMiddleware):
 
         async def _resolve_one(rid: str, kind: str, filename: str) -> Optional[Tuple[str, str]]:
             async with semaphore:
+                # Reuse in-process cached download; skip the resource-URL RPC on hit.
+                hit = cls._get_cached_resource(rid)
+                if hit is not None:
+                    return hit
                 try:
                     fresh_url = await cls._fetch_resource_url(adapter, rid)
                 except Exception as exc:
@@ -3793,7 +3801,7 @@ class ConnectionManager:
 
     # -- Inbound dispatch ---------------------------------------------------
 
-    _DEBOUNCE_WINDOW: float = 1.5  # seconds to wait for companion messages
+    _DEBOUNCE_WINDOW: float = 2.5  # seconds to wait for companion messages
 
     def _extract_sender_key(self, raw_data: bytes) -> str:
         """Lightweight decode to extract sender key for debounce grouping.

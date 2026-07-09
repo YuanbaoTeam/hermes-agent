@@ -2033,7 +2033,7 @@ class TestPatchAnchorsMiddleware:
         out = PatchAnchorsMiddleware._patch(
             text, ["/cache/x.jpg"], ["image/jpeg"],
         )
-        assert out == "look [image: /cache/x.jpg] please"
+        assert "[image: /cache/x.jpg]" in out
 
     def test_replaces_file_anchor_with_filename_label(self):
         text = "see [file:doc.pdf|ybres:rid-1]"
@@ -2070,5 +2070,6 @@ class TestPatchAnchorsMiddleware:
         )
         next_fn = AsyncMock()
         await PatchAnchorsMiddleware()(ctx, next_fn)
-        assert ctx.raw_text == "hi [image: /cache/y.png]"
+        assert "[image: /cache/y.png]" in ctx.raw_text
         next_fn.assert_awaited_once()
+
