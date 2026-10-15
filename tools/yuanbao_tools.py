@@ -493,3 +493,6 @@ for _schema, _handler, _emoji in _TOOLS:
         name=_schema["name"], toolset="hermes-yuanbao", schema=_schema, handler=_handler,
         check_fn=_check_yuanbao, is_async=True, emoji=_emoji,
     )
+
+# Registers yb_xcard_send / yb_xcard_update on the same toolset. Imported for the side effect.
+import tools.yuanbao_xcard_tools as _yuanbao_xcard_tools

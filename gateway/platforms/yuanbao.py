@@ -1743,22 +1743,7 @@ class DispatchMiddleware(InboundMiddleware):
             adapter._group_queues.pop(session_key, None)
 
 
-class InboundPipelineBuilder:
-    """Assembles the default Yuanbao inbound pipeline (order matters)."""
-    _DEFAULT_MIDDLEWARES: list[type] = [
-        DecodeMiddleware, ExtractFieldsMiddleware, RecallGuardMiddleware, DedupMiddleware, SkipSelfMiddleware,
-        ChatRoutingMiddleware, AccessGuardMiddleware, ExtractContentMiddleware, PlaceholderFilterMiddleware,
-        OwnerCommandMiddleware, BuildSourceMiddleware, GroupAtGuardMiddleware, AutoSetHomeMiddleware,
-        GroupAttributionMiddleware, ClassifyMessageTypeMiddleware, QuoteContextMiddleware,
-        ForwardedRecordsParseMiddleware, MediaResolveMiddleware, PatchAnchorsMiddleware, DispatchMiddleware,
-    ]
-
-    @classmethod
-    def build(cls) -> InboundPipeline:
-        pipeline = InboundPipeline()
-        for mw_cls in cls._DEFAULT_MIDDLEWARES:
-            pipeline.use(mw_cls())
-        return pipeline
+from gateway.platforms.yuanbao_pipeline import InboundPipelineBuilder
 
 
 class ConnectionManager:
@@ -2660,6 +2645,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
             raw = _extra.get(f"{kind}_allow_from") or _yb_secret(f"YUANBAO_{kind.upper()}_ALLOW_FROM", "")
             return policy, [x.strip() for x in raw.split(",") if x.strip()]
         self._access_policy = AccessPolicy(*_policy("dm"), *_policy("group"))
+        # Opt-in: the xCard intercept and tools stay dormant until this is exactly true.
+        self._xcard_enabled: bool = _extra.get("xcard_enabled") is True
+        self._aio_loop: Optional[asyncio.AbstractEventLoop] = None
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
         # Auto-sethome stays open when no home is set or the home is a group (upgradable by first DM).
         _existing_home = _yb_secret("YUANBAO_HOME_CHANNEL", "") or (config.home_channel.chat_id if config.home_channel else "")
@@ -2698,6 +2686,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return policy.group_policy == "open" and policy._open_dm_opted_in()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._aio_loop = asyncio.get_running_loop()
         ok = await self._connection.open()
         if ok:
             self._wire_plugin_handlers(None)  # plugin-registered native handlers
