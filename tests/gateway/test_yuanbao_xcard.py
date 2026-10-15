@@ -104,6 +104,8 @@ class _Adapter:
         )
 
     async def handle_message(self, event) -> None:
+        # admit_internal_event requires a concrete admission receipt, not a silent return.
+        event._gateway_accepted = True
         self.wakes.append(event)
 
 
@@ -254,6 +256,7 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_click_once_closes_and_wakes_when_nobody_waits(self):
         from gateway.platforms.yuanbao_xcard_events import handle_up_event
+        from gateway.platforms.yuanbao_xcard_registry import request_key
         from gateway.platforms.yuanbao_xcard_service import create_generated_card
 
         adapter = _Adapter()
@@ -262,6 +265,7 @@ class TestLifecycle:
         await handle_up_event(adapter, group_code="g1", operator_user_id="alice", payload=payload)
         assert rec.state == "completed"
         assert rec.card_message_id == "im-9"
+        assert rec.seen[request_key("alice", "req-1")]["status"] == "completed"
         kinds = [_extend(body)["extend_type"] for _, body in adapter.sent[1:]]
         assert kinds == [EXT_DOWN, EXT_DOWN]  # ack then snapshot
         snapshot = _extend(adapter.sent[-1][1])["content"]["state_update"]["content"]
@@ -274,7 +278,7 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_waiter_consumes_click_without_a_second_turn(self):
         from gateway.platforms.yuanbao_xcard_events import handle_up_event
-        from gateway.platforms.yuanbao_xcard_registry import wait_for_surface_action
+        from gateway.platforms.yuanbao_xcard_registry import request_key, wait_for_surface_action
         from gateway.platforms.yuanbao_xcard_service import create_generated_card
 
         import asyncio
@@ -291,6 +295,36 @@ class TestLifecycle:
         assert adapter.wakes == []
         assert rec.state == "active"
         assert rec.revision == 2
+        assert rec.seen[request_key("alice", "req-2")]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_rejected_event_does_not_bind_card_message_id(self):
+        from gateway.platforms.yuanbao_xcard_events import handle_up_event
+        from gateway.platforms.yuanbao_xcard_service import create_generated_card
+
+        adapter = _Adapter()
+        rec = await create_generated_card(**_create_args(adapter))
+        assert rec.card_message_id == ""
+        foreign = parse_up_event([
+            _envelope(EXT_UP, _up_payload(
+                surface_id=rec.surface_id, event_id="req-x", card_message_id="attacker-card",
+            )),
+        ])
+        await handle_up_event(adapter, group_code="g1", operator_user_id="bob", payload=foreign)
+        ack = _extend(adapter.sent[-1][1])["content"]["action_ack"]
+        assert ack["success"] is False
+        assert ack["error_code"] == "permission_denied"
+        assert rec.card_message_id == ""
+        accepted = parse_up_event([
+            _envelope(EXT_UP, _up_payload(
+                surface_id=rec.surface_id, event_id="req-ok", card_message_id="real-card",
+            )),
+        ])
+        await handle_up_event(adapter, group_code="g1", operator_user_id="alice", payload=accepted)
+        assert rec.card_message_id == "real-card"
+        down = _extend(adapter.sent[-1][1])["content"]
+        assert down["card_message_id"] == "real-card"
+        assert "state_update" in down
 
     @pytest.mark.asyncio
     async def test_other_user_and_bad_epoch_are_rejected(self):

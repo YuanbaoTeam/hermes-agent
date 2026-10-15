@@ -144,6 +144,7 @@ async def _wake(adapter: Any, rec: Surface, result: dict) -> None:
     from gateway.config import Platform
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.session import SessionSource
+    from gateway.wake import admit_internal_event
 
     source = SessionSource(
         platform=getattr(adapter, "platform", None) or Platform.YUANBAO,
@@ -169,7 +170,8 @@ async def _wake(adapter: Any, rec: Surface, result: dict) -> None:
         internal=True,
         message_id=f"xcard:{rec.surface_id}:{result.get('requestId')}",
     )
-    await adapter.handle_message(event)
+    # Receipt means the adapter queued/started the turn; a bare handle_message return is not enough.
+    await admit_internal_event(adapter, event)
 
 
 async def _apply_renderer_error(adapter: Any, rec: Surface, payload: dict, operator: str, group_code: str) -> None:
@@ -295,9 +297,15 @@ async def handle_up_event(adapter: Any, *, group_code: str, operator_user_id: st
         except Exception:
             logger.exception("[xcard] post-accept update failed surface=%s", surface_id)
         delivered = resolve_waiter(rec, result)
-    if delivered or result is None:
+    if result is None:
+        return
+    key = request_key(operator_user_id, request_id)
+    if delivered:
+        remember_request(known, key, "completed")
         return
     try:
         await _wake(adapter, known, result)
+        remember_request(known, key, "completed")
     except Exception:
         logger.exception("[xcard] wake failed surface=%s", surface_id)
+        remember_request(known, key, "failed", "dispatch_failed")
