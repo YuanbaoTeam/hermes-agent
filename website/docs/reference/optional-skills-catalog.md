@@ -295,6 +295,12 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**yuanbao**](../user-guide/skills/optional/yuanbao/yuanbao-yuanbao.md) | Yuanbao (元宝) groups: @mention users, query info/members. |
 
+## yuanbao-xcard
+
+| Skill | Description |
+|-------|-------------|
+| [**yuanbao-xcard**](../user-guide/skills/optional/yuanbao-xcard/yuanbao-xcard-yuanbao-xcard.md) | Author and send a Yuanbao interactive group card. |
+
 ---
 
 ## Contributing Optional Skills
