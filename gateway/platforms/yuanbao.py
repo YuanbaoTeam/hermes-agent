@@ -2593,11 +2593,22 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     @classmethod
     def get_active(cls) -> Optional[YuanbaoAdapter]:
-        from hermes_constants import get_hermes_home_override, hermes_home_key
+        from hermes_constants import get_default_hermes_root, get_hermes_home_override, hermes_home_key
 
         if get_hermes_home_override() is None:
             return cls._active_instance
-        return cls._active_instances.get(hermes_home_key())
+        key = hermes_home_key()
+        if (scoped := cls._active_instances.get(key)) is not None:
+            return scoped
+        # The DEFAULT profile's adapter connects during startup with no home override, so
+        # set_active lands it in the unscoped slot only. Turns still enter
+        # _profile_runtime_scope(<root>) whenever session_authority is present (always on modern
+        # gateways) or multiplex_profiles is on — a dict-only lookup then misses and every
+        # yuanbao tool fails with "adapter is not connected" while the WS is up. Fall back to
+        # the unscoped slot for the default root ONLY; a secondary must never use the default bot.
+        if key == hermes_home_key(get_default_hermes_root()):
+            return cls._active_instance
+        return None
 
     @classmethod
     def set_active(cls, adapter: Optional[YuanbaoAdapter]) -> None:
