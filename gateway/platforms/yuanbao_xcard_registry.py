@@ -34,6 +34,9 @@ class Surface:
     fallback_text: str
     messages: list
     actions: list[str]
+    kind: str = "generated"  # generated | template
+    template: str = ""
+    data: dict = field(default_factory=dict)
     revision: int = 1
     state: str = "active"  # active | completed | cancelled | expired
     card_message_id: str = ""
@@ -113,6 +116,12 @@ def get_surface(adapter: Any, surface_id: str) -> Optional[Surface]:
     if rec is not None:
         _mark_expired(rec, time.time())
     return rec
+
+
+def list_surfaces(adapter: Any, group_code: str = "") -> list[Surface]:
+    bucket = state_of(adapter)
+    _sweep(bucket, time.time())
+    return [rec for rec in bucket.surfaces.values() if not group_code or rec.group_code == group_code]
 
 
 def lock_for(adapter: Any, surface_id: str) -> asyncio.Lock:

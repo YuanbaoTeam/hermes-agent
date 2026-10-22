@@ -78,6 +78,47 @@ def _failure(exc) -> str:
     return tool_result({"ok": False, "error": str(exc), "retryable": False})
 
 
+async def wait_extra(adapter, rec, group_code: str, args: dict) -> dict:
+    """Extra result fields from blocking on a click (shared by send and template create/update)."""
+    from gateway.platforms.yuanbao_xcard_registry import has_group_waiter, wait_for_surface_action
+    from gateway.platforms.yuanbao_xcard_service import pause_reply_heartbeat
+
+    if not args.get("waitForAction"):
+        return {}
+    if has_group_waiter(adapter, group_code):
+        return {"waitDowngraded": True, "note": "this group already has a card waiting"}
+
+    async def _wait():
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", f"group:{group_code}")
+        async with pause_reply_heartbeat(adapter, chat_id):
+            return await wait_for_surface_action(adapter, rec, _clamp_wait(args.get("waitTimeoutSec")))
+
+    try:
+        outcome = await _on_gateway(adapter, _wait())
+    except Exception as exc:
+        logger.exception("[xcard] wait failed")
+        return {"waitStatus": "cancelled", "reason": str(exc)}
+    if outcome.get("status") == "action":
+        action = outcome["result"]
+        return {
+            "waitStatus": "action_received",
+            "userAction": {
+                "action": action.get("action"),
+                "context": action.get("context"),
+                "operatorUserId": action.get("operatorUserId"),
+                "summary": action.get("summary"),
+            },
+            "note": "The click was returned here and will not also arrive as a new message.",
+        }
+    if outcome.get("status") == "timeout":
+        return {"waitStatus": "timeout", "note": "The card is still active. A later click wakes a new turn."}
+    reason = outcome.get("reason", "")
+    if isinstance(reason, str) and reason.startswith("renderer_error:"):
+        return {"waitStatus": "renderer_error", "reason": reason,
+                "note": "The client could not render the card; it was closed and replaced with plain text. Ask for a text reply."}
+    return {"waitStatus": "cancelled", "reason": reason}
+
+
 async def yb_xcard_send(args: dict, **_kw) -> str:
     group_code = _group_code()
     if not group_code:
@@ -103,12 +144,7 @@ async def yb_xcard_send(args: dict, **_kw) -> str:
     if audience == "requester" and not owner:
         return _refuse("the requesting user is unknown; pass audience=anyone")
 
-    from gateway.platforms.yuanbao_xcard_registry import has_group_waiter, wait_for_surface_action
-    from gateway.platforms.yuanbao_xcard_service import (
-        XCardSendError,
-        create_generated_card,
-        pause_reply_heartbeat,
-    )
+    from gateway.platforms.yuanbao_xcard_service import XCardSendError, create_generated_card
     from gateway.platforms.yuanbao_xcard_validate import parse_generated_messages, validate_generated_messages
 
     parsed = parse_generated_messages(args.get("messages"))
@@ -156,41 +192,7 @@ async def yb_xcard_send(args: dict, **_kw) -> str:
         "delivery": "card_already_sent",
         "assistantInstruction": "The card is already visible. Confirm briefly; do not repeat its contents.",
     }
-    if not args.get("waitForAction"):
-        return tool_result(result)
-    if has_group_waiter(adapter, group_code):
-        return tool_result({**result, "waitDowngraded": True, "note": "this group already has a card waiting"})
-
-    async def _wait():
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", f"group:{group_code}")
-        async with pause_reply_heartbeat(adapter, chat_id):
-            return await wait_for_surface_action(adapter, rec, _clamp_wait(args.get("waitTimeoutSec")))
-
-    try:
-        outcome = await _on_gateway(adapter, _wait())
-    except Exception as exc:
-        logger.exception("[xcard] wait failed")
-        return tool_result({**result, "waitStatus": "cancelled", "reason": str(exc)})
-    if outcome.get("status") == "action":
-        action = outcome["result"]
-        return tool_result({
-            **result,
-            "waitStatus": "action_received",
-            "userAction": {
-                "action": action.get("action"),
-                "context": action.get("context"),
-                "operatorUserId": action.get("operatorUserId"),
-                "summary": action.get("summary"),
-            },
-            "note": "The click was returned here and will not also arrive as a new message.",
-        })
-    if outcome.get("status") == "timeout":
-        return tool_result({
-            **result,
-            "waitStatus": "timeout",
-            "note": "The card is still active. A later click wakes a new turn.",
-        })
-    return tool_result({**result, "waitStatus": "cancelled", "reason": outcome.get("reason", "")})
+    return tool_result({**result, **await wait_extra(adapter, rec, group_code, args)})
 
 
 async def yb_xcard_update(args: dict, **_kw) -> str:

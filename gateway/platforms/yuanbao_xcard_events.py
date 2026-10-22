@@ -43,6 +43,8 @@ def _action_body(rec: Surface, result: dict) -> str:
     data = {
         "kind": "yuanbao_xcard_action",
         "surfaceId": rec.surface_id,
+        "source": rec.kind,
+        **({"template": rec.template} if rec.template else {}),
         "title": rec.title,
         "action": result.get("action"),
         "summary": result.get("summary"),
@@ -51,7 +53,12 @@ def _action_body(rec: Surface, result: dict) -> str:
         "revision": result.get("revision"),
         "cardState": rec.state,
     }
-    if rec.state == "active":
+    if rec.state == "active" and rec.kind == "template":
+        tail = (
+            f"The card is still interactive. To change it, call yb_xcard_template with action=update "
+            f"on surfaceId={rec.surface_id}. Do not create a replacement card."
+        )
+    elif rec.state == "active":
         tail = (
             f"The card is still interactive. To change it, call yb_xcard_update on surfaceId={rec.surface_id}. "
             "Do not call yb_xcard_send to create a replacement card."
@@ -137,7 +144,19 @@ def _decide(rec: Optional[Surface], payload: dict, operator: str, group_code: st
         "sourceComponentId": action.get("sourceComponentId") if isinstance(action.get("sourceComponentId"), str) else "",
         "revision": rec.revision,
     }
-    return {"kind": "accept", "rec": rec, "result": result}
+    if rec.kind != "template":
+        return {"kind": "accept", "rec": rec, "result": result}
+    from gateway.platforms.yuanbao_xcard_templates import get_template
+
+    tpl = get_template(rec.template)
+    if tpl is None or name not in tpl.events:
+        return {"kind": "reject", "status": "rejected", "reason": "invalid_action", "rec": rec}
+    verdict = tpl.decide_action(rec.data, name, context)
+    if "reject" in verdict:
+        return {"kind": "reject", "status": "rejected", "reason": verdict["reject"], "rec": rec}
+    result["context"] = verdict.get("context") or {}
+    result["summary"] = verdict.get("summary") or result["summary"]
+    return {"kind": "accept", "rec": rec, "result": result, "keepOpen": bool(verdict.get("keepOpen"))}
 
 
 async def _wake(adapter: Any, rec: Surface, result: dict) -> None:
@@ -290,7 +309,7 @@ async def handle_up_event(adapter: Any, *, group_code: str, operator_user_id: st
             adapter, group_code=group_code, surface_id=surface_id, request_id=request_id,
             card_message_id=rec.card_message_id, status="accepted",
         )
-        if rec.mode == "once":
+        if rec.mode == "once" and not decision.get("keepOpen"):
             rec.state = "completed"
         try:
             await push_surface_update(adapter, rec)

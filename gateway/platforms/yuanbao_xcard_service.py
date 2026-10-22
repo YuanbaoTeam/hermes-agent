@@ -68,20 +68,33 @@ def _extension(rec: Surface) -> dict:
         "state": rec.state,
         "fallbackText": rec.fallback_text,
         "eventTransport": "hermes",
-        "source": "generated",
+        "source": rec.kind,
+        **({"template": rec.template} if rec.template else {}),
         "actionSchemas": {name: {"type": "object"} for name in rec.actions},
     }
 
 
 def render_messages(rec: Surface, *, updates_only: bool = False) -> list:
-    messages = render_generated_messages(
-        rec.messages,
-        rec.surface_id,
-        _extension(rec),
-        state=rec.state,
-        revision=rec.revision,
-        last_result=rec.last_result,
-    )
+    if rec.kind == "template":
+        from gateway.platforms.yuanbao_xcard_template_build import build_template_messages
+        from gateway.platforms.yuanbao_xcard_templates import get_template
+
+        tpl = get_template(rec.template)
+        if tpl is None:
+            raise XCardSendError(f"unknown xcard template: {rec.template}")
+        messages = build_template_messages(
+            tpl, rec.data, closed=rec.state != "active", last=rec.last_result,
+            surface_id=rec.surface_id, extension=_extension(rec),
+        )
+    else:
+        messages = render_generated_messages(
+            rec.messages,
+            rec.surface_id,
+            _extension(rec),
+            state=rec.state,
+            revision=rec.revision,
+            last_result=rec.last_result,
+        )
     if updates_only:
         return [message for message in messages if "createSurface" not in message]
     return messages
@@ -153,6 +166,47 @@ async def create_generated_card(
     return rec
 
 
+async def create_template_card(
+    adapter: Any,
+    *,
+    group_code: str,
+    session_key: str,
+    owner_user_id: str,
+    audience: str,
+    tpl,
+    data: dict,
+) -> Surface:
+    rec = Surface(
+        surface_id=str(uuid.uuid4()),
+        group_code=group_code,
+        session_key=session_key,
+        owner_user_id=owner_user_id,
+        audience=audience,
+        mode=tpl.mode,
+        title=tpl.title(data),
+        fallback_text=tpl.fallback_text(data),
+        messages=[],
+        actions=list(tpl.events),
+        kind="template",
+        template=tpl.key,
+        data=data,
+    )
+    body = _check_size(card_messages_body(render_messages(rec)))
+    try:
+        response = await send_group_body(adapter, group_code, body)
+    except Exception as exc:
+        raise XCardSendError(f"card send failed: {exc}") from exc
+    ok, kind, message = classify_send(response)
+    if not ok:
+        fallback_sent = False
+        if kind == "rejected":
+            fallback_sent = await send_group_text(adapter, group_code, rec.fallback_text)
+        raise XCardSendError(f"card send failed: {message}", kind, fallback_sent)
+    register_surface(adapter, rec)
+    logger.info("[xcard] created template surface=%s template=%s group=%s", rec.surface_id, tpl.key, group_code)
+    return rec
+
+
 async def push_surface_update(adapter: Any, rec: Surface) -> None:
     """Re-render at revision+1. The caller holds no lock across this await; roll the revision back on failure."""
     if not rec.card_message_id:
@@ -191,6 +245,19 @@ async def update_generated_card(
         await push_surface_update(adapter, rec)
     except Exception:
         rec.messages, rec.actions, rec.title, rec.fallback_text = previous
+        raise
+
+
+async def update_template_card(adapter: Any, rec: Surface, tpl, data: dict) -> None:
+    """Swap a template card's data and push; data/title/fallback are restored on failure."""
+    previous = (rec.data, rec.title, rec.fallback_text)
+    rec.data = data
+    rec.title = tpl.title(data)
+    rec.fallback_text = tpl.fallback_text(data)
+    try:
+        await push_surface_update(adapter, rec)
+    except Exception:
+        rec.data, rec.title, rec.fallback_text = previous
         raise
 
 

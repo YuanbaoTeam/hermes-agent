@@ -46,7 +46,7 @@ _FEISHU_TOOLS = [
 ]
 _YUANBAO_TOOLS = [
     "yb_query_group_info", "yb_query_group_members", "yb_send_dm", "yb_search_sticker", "yb_send_sticker",
-    "yb_xcard_send", "yb_xcard_update",
+    "yb_xcard_send", "yb_xcard_update", "yb_xcard_template",
 ]
 
 

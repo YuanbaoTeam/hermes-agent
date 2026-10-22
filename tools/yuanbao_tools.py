@@ -496,3 +496,4 @@ for _schema, _handler, _emoji in _TOOLS:
 
 # Registers yb_xcard_send / yb_xcard_update on the same toolset. Imported for the side effect.
 import tools.yuanbao_xcard_tools as _yuanbao_xcard_tools
+import tools.yuanbao_xcard_template_tool as _yuanbao_xcard_template_tool

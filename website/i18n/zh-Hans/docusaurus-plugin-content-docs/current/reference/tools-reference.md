@@ -242,3 +242,4 @@ description: "Hermes 内置工具权威参考，按工具集分组"
 | `yb_send_sticker` | 向当前元宝聊天发送内置表情。 | 元宝凭据 |
 | `yb_xcard_send` | 向当前群发送自包含 xCard。需要 `platforms.yuanbao.extra.xcard_enabled: true`。 | 元宝凭据 |
 | `yb_xcard_update` | 更新先前由 `yb_xcard_send` 发出的 xCard。 | 元宝凭据 |
+| `yb_xcard_template` | 发送并管理内置模板 xCard（choice/form/item_list/confirm/info）：list/get_template/create/update/close/get。 | 元宝凭据 |
