@@ -271,7 +271,13 @@ platforms:
       dm_allow_from: "user1,user2"
       group_policy: open
       group_allow_from: ""
+      # 群里的交互卡片 xCard。客户端能渲染之前保持关闭。
+      xcard_enabled: false
 ```
+
+### xCard
+
+`xcard_enabled: true` 时，群会话可以使用 `yb_xcard_send`、`yb_xcard_update` 和 `yb_xcard_template`。模板工具只传数据即可渲染内置的 choice/form/item_list/confirm/info 卡片；发送工具发送自包含的 A2UI v1.0 卡片；用户点击要么回到正在等待的工具结果，要么成为新的一轮。卡片只留在内存里 30 分钟，网关重启后失效。生成规则在可选技能 `yuanbao-xcard`。私聊仍然只发文字。
 
 ## 高级配置
 

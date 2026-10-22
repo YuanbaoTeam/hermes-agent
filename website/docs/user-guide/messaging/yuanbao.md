@@ -272,7 +272,13 @@ platforms:
       dm_allow_from: "user1,user2"
       group_policy: open
       group_allow_from: ""
+      # Interactive xCard (A2UI) in groups. Off until the Yuanbao client can render it.
+      xcard_enabled: false
 ```
+
+### xCard
+
+When `xcard_enabled` is `true`, group sessions gain `yb_xcard_send`, `yb_xcard_update`, and `yb_xcard_template`. The template tool renders built-in choice/form/item_list/confirm/info cards from data alone; the send tool sends a self-contained A2UI v1.0 card; a click comes back as the tool result (if it waited) or as a new turn. Cards are kept in memory for 30 minutes and do not survive a gateway restart. Install the `yuanbao-xcard` optional skill for the authoring rules. Direct messages stay text-only.
 
 ## Advanced Configuration
 

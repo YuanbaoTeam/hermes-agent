@@ -660,6 +660,15 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/yuanbao/yuanbao-yuanbao',
                   ],
                 },
+                {
+                  type: 'category',
+                  label: 'yuanbao-xcard',
+                  key: 'skills-optional-yuanbao-xcard',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/optional/yuanbao-xcard/yuanbao-xcard-yuanbao-xcard',
+                  ],
+                },
               ],
             },
           ],

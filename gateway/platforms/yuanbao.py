@@ -1743,22 +1743,7 @@ class DispatchMiddleware(InboundMiddleware):
             adapter._group_queues.pop(session_key, None)
 
 
-class InboundPipelineBuilder:
-    """Assembles the default Yuanbao inbound pipeline (order matters)."""
-    _DEFAULT_MIDDLEWARES: list[type] = [
-        DecodeMiddleware, ExtractFieldsMiddleware, RecallGuardMiddleware, DedupMiddleware, SkipSelfMiddleware,
-        ChatRoutingMiddleware, AccessGuardMiddleware, ExtractContentMiddleware, PlaceholderFilterMiddleware,
-        OwnerCommandMiddleware, BuildSourceMiddleware, GroupAtGuardMiddleware, AutoSetHomeMiddleware,
-        GroupAttributionMiddleware, ClassifyMessageTypeMiddleware, QuoteContextMiddleware,
-        ForwardedRecordsParseMiddleware, MediaResolveMiddleware, PatchAnchorsMiddleware, DispatchMiddleware,
-    ]
-
-    @classmethod
-    def build(cls) -> InboundPipeline:
-        pipeline = InboundPipeline()
-        for mw_cls in cls._DEFAULT_MIDDLEWARES:
-            pipeline.use(mw_cls())
-        return pipeline
+from gateway.platforms.yuanbao_pipeline import InboundPipelineBuilder
 
 
 class ConnectionManager:
@@ -2608,11 +2593,22 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     @classmethod
     def get_active(cls) -> Optional[YuanbaoAdapter]:
-        from hermes_constants import get_hermes_home_override, hermes_home_key
+        from hermes_constants import get_default_hermes_root, get_hermes_home_override, hermes_home_key
 
         if get_hermes_home_override() is None:
             return cls._active_instance
-        return cls._active_instances.get(hermes_home_key())
+        key = hermes_home_key()
+        if (scoped := cls._active_instances.get(key)) is not None:
+            return scoped
+        # The DEFAULT profile's adapter connects during startup with no home override, so
+        # set_active lands it in the unscoped slot only. Turns still enter
+        # _profile_runtime_scope(<root>) whenever session_authority is present (always on modern
+        # gateways) or multiplex_profiles is on — a dict-only lookup then misses and every
+        # yuanbao tool fails with "adapter is not connected" while the WS is up. Fall back to
+        # the unscoped slot for the default root ONLY; a secondary must never use the default bot.
+        if key == hermes_home_key(get_default_hermes_root()):
+            return cls._active_instance
+        return None
 
     @classmethod
     def set_active(cls, adapter: Optional[YuanbaoAdapter]) -> None:
@@ -2660,6 +2656,9 @@ class YuanbaoAdapter(BasePlatformAdapter):
             raw = _extra.get(f"{kind}_allow_from") or _yb_secret(f"YUANBAO_{kind.upper()}_ALLOW_FROM", "")
             return policy, [x.strip() for x in raw.split(",") if x.strip()]
         self._access_policy = AccessPolicy(*_policy("dm"), *_policy("group"))
+        # Opt-in: the xCard intercept and tools stay dormant until this is exactly true.
+        self._xcard_enabled: bool = _extra.get("xcard_enabled") is True
+        self._aio_loop: Optional[asyncio.AbstractEventLoop] = None
         self._inbound_pipeline: InboundPipeline = InboundPipelineBuilder.build()
         # Auto-sethome stays open when no home is set or the home is a group (upgradable by first DM).
         _existing_home = _yb_secret("YUANBAO_HOME_CHANNEL", "") or (config.home_channel.chat_id if config.home_channel else "")
@@ -2698,6 +2697,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
         return policy.group_policy == "open" and policy._open_dm_opted_in()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._aio_loop = asyncio.get_running_loop()
         ok = await self._connection.open()
         if ok:
             self._wire_plugin_handlers(None)  # plugin-registered native handlers

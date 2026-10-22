@@ -44,7 +44,10 @@ _FEISHU_TOOLS = [
     "feishu_doc_read", "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
     "feishu_drive_reply_comment", "feishu_drive_add_comment",
 ]
-_YUANBAO_TOOLS = ["yb_query_group_info", "yb_query_group_members", "yb_send_dm", "yb_search_sticker", "yb_send_sticker"]
+_YUANBAO_TOOLS = [
+    "yb_query_group_info", "yb_query_group_members", "yb_send_dm", "yb_search_sticker", "yb_send_sticker",
+    "yb_xcard_send", "yb_xcard_update", "yb_xcard_template",
+]
 
 
 def _ts(description, tools=(), includes=(), **extra):
@@ -223,7 +226,7 @@ TOOLSETS = {
     "hermes-wecom": _bundle("WeCom bot toolset - enterprise WeChat messaging (full access)"),
     "hermes-wecom-callback": _bundle("WeCom callback toolset - enterprise self-built app messaging (full access)"),
     "hermes-yuanbao": {
-        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
+        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情、xCard",
         "tools": _HERMES_CORE_TOOLS + _YUANBAO_TOOLS,
         "module": "tools.yuanbao_tools",
         "includes": [],

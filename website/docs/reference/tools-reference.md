@@ -385,5 +385,8 @@ Registered only on the `hermes-yuanbao` platform toolset. Yuanbao is Tencent's c
 | `yb_send_dm` | Send a private/direct message to a user in a group, with optional media files. | Yuanbao credentials |
 | `yb_search_sticker` | Search the built-in Yuanbao sticker (TIM face) catalogue by keyword. | Yuanbao credentials |
 | `yb_send_sticker` | Send a built-in sticker to the current Yuanbao chat. | Yuanbao credentials |
+| `yb_xcard_send` | Send a self-contained xCard into the current group. Requires `platforms.yuanbao.extra.xcard_enabled: true`. | Yuanbao credentials |
+| `yb_xcard_update` | Update an xCard previously sent with `yb_xcard_send`. | Yuanbao credentials |
+| `yb_xcard_template` | Send and manage a built-in template xCard (choice/form/item_list/confirm/info): list/get_template/create/update/close/get. | Yuanbao credentials |
 
 
